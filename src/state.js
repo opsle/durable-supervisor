@@ -26,6 +26,24 @@ export const VALID_CHILD_STATES = new Set([
   'STALLED', 'CANCELLED', 'UNKNOWN',
 ]);
 export const REVIEW_MODES = new Set(['off', 'manual', 'risk_based', 'always']);
+export const SATISFIED_REQUIREMENT_STATES = new Set([
+  'VERIFIED',
+  'DEFERRED_WITH_JUSTIFICATION',
+  'NOT_APPLICABLE_WITH_JUSTIFICATION',
+]);
+export const NEXT_UNSATISFIED_REQUIREMENT_ACTION = 'Select the next unsatisfied requirement slice.';
+
+export function unsatisfiedRequirements(matrix) {
+  return matrix.requirements.filter((requirement) => !SATISFIED_REQUIREMENT_STATES.has(requirement.state));
+}
+
+export function derivePendingNextAction(state, matrix, fallback = state.pending_next_action) {
+  if (state.active_task_id || state.active_attempt_id) return fallback;
+  const unsatisfied = unsatisfiedRequirements(matrix);
+  if (state.phase === 'COMPLETE' && unsatisfied.length === 0) return null;
+  if (fallback == null && unsatisfied.length > 0) return NEXT_UNSATISFIED_REQUIREMENT_ACTION;
+  return fallback;
+}
 
 export function repositoryRoot(cwd = process.cwd()) {
   let candidate = resolve(cwd);
@@ -323,6 +341,13 @@ export function validateDurableState(root) {
   if (supervisor.authority_status !== 'AUTHORITATIVE') errors.push('no authoritative supervisor');
   const state = readJson(p.state);
   if (!VALID_SUPERVISOR_STATES.has(state.supervisor_state)) errors.push('invalid supervisor state');
+  if (
+    state.phase === 'COMPLETE'
+    && unsatisfiedRequirements(matrix).length === 0
+    && state.pending_next_action !== null
+  ) {
+    errors.push('complete state with no unsatisfied requirements must not have a pending next action');
+  }
   for (const file of readdirSync(p.attempts).filter((name) => name.endsWith('.json'))) {
     const attempt = readJson(join(p.attempts, file));
     if (!VALID_CHILD_STATES.has(attempt.child_state)) errors.push(`invalid child state in ${file}`);

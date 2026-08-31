@@ -11,7 +11,9 @@ import {
   writeJson,
 } from './io.js';
 import {
+  NEXT_UNSATISFIED_REQUIREMENT_ACTION,
   REVIEW_MODES,
+  derivePendingNextAction,
   emit,
   initialize,
   paths,
@@ -182,6 +184,12 @@ function setObjective(root, text, actor = 'operator-cli') {
   objective.history.push(revision);
   objective.current_revision = revision.revision;
   writeJson(p.objective, objective);
+  if (!state.active_task_id) {
+    updateState(root, {
+      phase: state.phase === 'COMPLETE' ? 'SELF_HOSTED' : state.phase,
+      pending_next_action: `Establish bounded work for objective revision ${revision.revision}.`,
+    });
+  }
   const event = emit(root, 'OBJECTIVE_CHANGED', {
     actor,
     objective_id: objective.objective_id,
@@ -336,7 +344,7 @@ function status(root, json = false) {
     `requirements: ${Object.entries(counts).map(([name, count]) => `${name}=${count}`).join(' ')}`,
     `latest accepted task: ${state.latest_accepted_task_id ?? 'none'}`,
     `unresolved: ${state.latest_unresolved_issue == null ? 'none' : displayValue(state.latest_unresolved_issue)}`,
-    `next: ${state.pending_next_action}`,
+    `next: ${state.pending_next_action ?? 'none'}`,
     '',
     'MEASUREMENT',
     `children: ${telemetry.children}`,
@@ -379,6 +387,7 @@ function recover(root) {
   const p = paths(root);
   const supervisor = readJson(p.supervisor);
   const state = readJson(p.state);
+  let stateChanged = false;
   let reconciliation = { classification: 'no_active_work', action: 'none' };
   if (state.active_attempt_id) {
     const attemptPath = join(p.attempts, `${state.active_attempt_id}.json`);
@@ -397,11 +406,17 @@ function recover(root) {
           state.supervisor_state = 'PAUSED';
           state.pause = { active: true, after_current: false, reason: 'Recovery ambiguity: prior child process is absent without terminal evidence.', changed_at: now() };
           state.latest_unresolved_issue = reconciliation;
-          writeJson(p.state, state);
+          stateChanged = true;
         }
       }
     }
   }
+  const pendingNextAction = derivePendingNextAction(state, readJson(p.requirements));
+  if (pendingNextAction !== state.pending_next_action) {
+    state.pending_next_action = pendingNextAction;
+    stateChanged = true;
+  }
+  if (stateChanged) writeJson(p.state, state);
   supervisor.generation += 1;
   supervisor.recovered_at = now();
   writeJson(p.supervisor, supervisor);
@@ -444,12 +459,23 @@ function evaluateTask(root, taskId, accept, rationale) {
   task.state = accept ? 'ACCEPTED' : 'REJECTED';
   writeJson(taskPath, task);
   if (accept) setRequirements(root, task.requirement_ids, 'IMPLEMENTED', [attempt.compact_packet, attempt.completion_handoff]);
-  updateState(root, {
+  const currentState = readJson(p.state);
+  const nextState = {
+    ...currentState,
     active_task_id: null,
     active_attempt_id: null,
-    latest_accepted_task_id: accept ? taskId : readJson(p.state).latest_accepted_task_id,
+    pending_next_action: accept
+      ? NEXT_UNSATISFIED_REQUIREMENT_ACTION
+      : `Create corrective work for ${taskId}.`,
+  };
+  updateState(root, {
+    active_task_id: nextState.active_task_id,
+    active_attempt_id: nextState.active_attempt_id,
+    latest_accepted_task_id: accept ? taskId : currentState.latest_accepted_task_id,
     latest_unresolved_issue: accept ? null : `Supervisor rejected ${taskId}: ${rationale}`,
-    pending_next_action: accept ? 'Select the next unsatisfied requirement slice.' : `Create corrective work for ${taskId}.`,
+    pending_next_action: accept
+      ? derivePendingNextAction(nextState, readJson(p.requirements))
+      : nextState.pending_next_action,
   });
   emit(root, 'SUPERVISOR_DECISION', { task_id: taskId, attempt_id: attemptId, decision_id: decision.decision_id, decision: decision.decision });
   return { decision, task, attempt };

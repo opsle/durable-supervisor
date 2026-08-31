@@ -1,0 +1,73 @@
+{
+  "task_id": "task-activate-next-action-correction",
+  "title": "Activate corrective objective revision 2",
+  "objective": "Move the newly revised objective out of the prior terminal phase and establish an explicit bounded corrective next action without changing policy or historical evidence.",
+  "scope": [
+    "current derived supervisor state for objective revision 2"
+  ],
+  "authorization": {
+    "may": [
+      "read current objective and state",
+      "mark the current objective phase SELF_HOSTED",
+      "set the bounded corrective next action",
+      "verify the resulting current state"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "modify source, tests, requirements, policy, objective history, supervisor identity, or historical events",
+      "invoke an AI provider",
+      "deploy, merge, push, or create a PR",
+      "modify sibling repositories"
+    ]
+  },
+  "required_inputs": [
+    ".opsle/objective.json",
+    ".opsle/state.json"
+  ],
+  "relevant_context": [
+    "Objective revision 2 is corrective post-V0.1 work",
+    "The old implementation did not reopen phase or derive a new action when no task was active",
+    "This lifecycle transition is not the source-code fix"
+  ],
+  "expected_deliverable": "Current phase is SELF_HOSTED with a bounded corrective next action for objective revision 2.",
+  "expected_evidence": [
+    "deterministic state assertion exits 0",
+    "no source or historical record changes"
+  ],
+  "acceptance_criteria": [
+    "phase is SELF_HOSTED",
+    "next action identifies the bounded correction",
+    "objective revision remains 2",
+    "operator policy is unchanged",
+    "Context Firewall packet is complete_for_decision"
+  ],
+  "prohibited_actions": [
+    "source implementation",
+    "history rewriting",
+    "provider invocation",
+    "release or deployment"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required"
+  ],
+  "requirement_ids": [],
+  "route_hint": "deterministic",
+  "deterministic_command": [
+    "node",
+    "--input-type=module",
+    "-e",
+    "import{readJson}from'./src/io.js';import{paths,updateState}from'./src/state.js';const root=process.cwd();const objective=readJson(paths(root).objective);if(objective.current_revision!==2)process.exit(2);updateState(root,{phase:'SELF_HOSTED',pending_next_action:'Implement and prove the bounded next-action invariant correction for objective revision 2.'})"
+  ],
+  "verification_command": [
+    "node",
+    "--input-type=module",
+    "-e",
+    "import{readJson}from'./src/io.js';import{paths}from'./src/state.js';const root=process.cwd();const objective=readJson(paths(root).objective);const state=readJson(paths(root).state);process.exit(objective.current_revision===2&&state.phase==='SELF_HOSTED'&&state.pending_next_action==='Implement and prove the bounded next-action invariant correction for objective revision 2.'?0:1)"
+  ],
+  "expects_changes": false,
+  "timeout_seconds": 60
+}

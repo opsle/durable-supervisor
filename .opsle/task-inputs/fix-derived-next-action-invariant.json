@@ -1,0 +1,96 @@
+{
+  "task_id": "task-fix-derived-next-action-invariant",
+  "parent_decision_id": "decision-27f85936-615c-4e5c-b465-0dd5a9a69af2",
+  "title": "Fix derived next-action terminal invariant",
+  "objective": "Fix the source-level defect that leaves or recreates a stale next-unsatisfied-requirement action after objective completion, while preserving recovery history and allowing later objective revisions to establish valid work again.",
+  "scope": [
+    "derived next-action lifecycle logic in src/cli.js and src/state.js",
+    "direct deterministic regression coverage in tests/operator-controls.test.js and tests/recovery-policy.test.js"
+  ],
+  "authorization": {
+    "may": [
+      "inspect current lifecycle, recovery, status, objective, evaluation, and validation code",
+      "introduce a narrow shared derivation helper if useful",
+      "modify objective revision, task evaluation, recovery, status, and validation behavior only as required by the invariant",
+      "add focused deterministic tests",
+      "run focused tests and the full deterministic verifier"
+    ],
+    "may_modify": [
+      "src/cli.js",
+      "src/state.js",
+      "tests/operator-controls.test.js",
+      "tests/recovery-policy.test.js"
+    ],
+    "may_not": [
+      "modify .opsle runtime authority, historical events, decisions, evidence, requirements, objective history, policy, or supervisor identity",
+      "modify unrelated source, tests, documentation, package scripts, or sibling repositories",
+      "weaken completion, Acceptance, recovery, claim, fencing, Gearbox, Runner, or Context Firewall behavior",
+      "invoke Claude or another provider",
+      "deploy, merge, push, create a PR, or install server-wide"
+    ]
+  },
+  "required_inputs": [
+    "src/cli.js",
+    "src/state.js",
+    "tests/operator-controls.test.js",
+    "tests/recovery-policy.test.js",
+    ".opsle/state.json",
+    ".opsle/requirements.json"
+  ],
+  "relevant_context": [
+    "evaluateTask currently writes Select the next unsatisfied requirement slice after every accepted task",
+    "task-bind-tmux-supervisor-model was accepted after phase COMPLETE and overwrote the earlier terminal action",
+    "setObjective with no active task records history but currently leaves phase COMPLETE and retains the prior derived action",
+    "Recovery correctly classified the observed state as no_active_work and must not rewrite historical event records",
+    "Canonical terminal representation should be pending_next_action null and human status should report next: none"
+  ],
+  "expected_deliverable": "Narrow source correction and regression tests enforcing that COMPLETE with zero unsatisfied requirements has no automatic next action, survives recovery/reconstruction, validates cheaply, and reopens correctly on objective revision.",
+  "expected_evidence": [
+    "focused deterministic regression tests pass",
+    "npm run verify exits 0",
+    "COMPLETE plus zero unsatisfied requirements yields pending_next_action null",
+    "fresh recover preserves null",
+    "status reconstruction reports next: none",
+    "objective revision from COMPLETE reopens a valid next action",
+    "validator rejects only contradictory current state, not historical event text",
+    "actual changed files remain authorized"
+  ],
+  "acceptance_criteria": [
+    "root cause is corrected in derivation rather than only patching .opsle/state.json",
+    "task acceptance cannot recreate the stale action in terminal state",
+    "recovery preserves canonical terminal state",
+    "fresh status reconstruction reports no automatic action",
+    "objective revision or active requirement state can derive valid work again",
+    "current-state validation cheaply detects terminal contradiction",
+    "historical events and decisions remain untouched",
+    "focused and full deterministic verification pass",
+    "Context Firewall packet is complete_for_decision",
+    "no unexpected files change"
+  ],
+  "prohibited_actions": [
+    "editing historical event or decision content",
+    "hard-coding the current repository instance",
+    "broad refactoring",
+    "provider invocation from tests",
+    "release, merge, deployment, or cross-repository initialization"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled with configured model and reasoning effort",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited",
+    "Affected Verification advisory only"
+  ],
+  "requirement_ids": [],
+  "route_hint": "codex",
+  "deterministic_command": null,
+  "verification_command": [
+    "npm",
+    "run",
+    "verify"
+  ],
+  "expects_changes": true,
+  "timeout_seconds": 1800
+}

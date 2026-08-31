@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import {
+  closeSync,
   cpSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
+  openSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -20,10 +22,13 @@ import {
 } from '../src/pipeline.js';
 import { readJson, writeJson } from '../src/io.js';
 import {
+  NEXT_UNSATISFIED_REQUIREMENT_ACTION,
   emit,
   initialize,
   paths,
+  setRequirements,
   updateState,
+  validateDurableState,
 } from '../src/state.js';
 import { runAttempt } from '../src/runner.js';
 
@@ -84,18 +89,32 @@ function handoff(overrides = {}) {
 }
 
 function runCli(root, args) {
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(process.execPath, [cliPath, ...args], {
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  const capture = mkdtempSync(join(tmpdir(), 'durable-supervisor-recovery-cli-'));
+  const stdoutPath = join(capture, 'stdout.log');
+  const stderrPath = join(capture, 'stderr.log');
+  const stdout = openSync(stdoutPath, 'w');
+  const stderr = openSync(stderrPath, 'w');
+  try {
+    const result = spawnSync(process.execPath, [cliPath, ...args], {
       cwd: root,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      env,
+      stdio: ['ignore', stdout, stderr],
     });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += chunk; });
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
-    child.once('error', reject);
-    child.once('close', (code, signal) => resolvePromise({ code, signal, stdout, stderr }));
-  });
+    closeSync(stdout);
+    closeSync(stderr);
+    return {
+      code: result.status,
+      signal: result.signal,
+      stdout: readFileSync(stdoutPath, 'utf8'),
+      stderr: readFileSync(stderrPath, 'utf8'),
+    };
+  } finally {
+    try { closeSync(stdout); } catch {}
+    try { closeSync(stderr); } catch {}
+    rmSync(capture, { recursive: true, force: true });
+  }
 }
 
 function eventLines(root) {
@@ -151,6 +170,48 @@ test('fresh-process recovery reconstructs accepted work using durable repository
     assert.equal(readFileSync(p.decisionsLog, 'utf8'), before.decisions);
     assert.equal(afterState.latest_accepted_task_id, task.task_id);
     assert.equal(afterState.pending_next_action, 'Continue with durable decision B.');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('fresh recovery preserves canonical terminal state and historical next-action text', async () => {
+  const root = fixture();
+  try {
+    const p = paths(root);
+    updateState(root, {
+      phase: 'COMPLETE',
+      pending_next_action: NEXT_UNSATISFIED_REQUIREMENT_ACTION,
+    });
+    const historical = emit(root, 'LEGACY_TERMINAL_STATE_OBSERVED', {
+      pending_next_action: NEXT_UNSATISFIED_REQUIREMENT_ACTION,
+    });
+    const historicalEvent = readFileSync(join(p.events, `${historical.event_id}.json`), 'utf8');
+
+    const recovered = await runCli(root, ['recover']);
+    assert.equal(recovered.code, 0, recovered.stderr);
+    assert.equal(JSON.parse(recovered.stdout).reconciliation.classification, 'no_active_work');
+    assert.equal(readJson(p.state).pending_next_action, null);
+    assert.equal(readFileSync(join(p.events, `${historical.event_id}.json`), 'utf8'), historicalEvent);
+    const canonicalState = readFileSync(p.state, 'utf8');
+
+    const recoveredAgain = await runCli(root, ['recover']);
+    assert.equal(recoveredAgain.code, 0, recoveredAgain.stderr);
+    assert.equal(readFileSync(p.state, 'utf8'), canonicalState);
+
+    const status = await runCli(root, ['status']);
+    assert.equal(status.code, 0, status.stderr);
+    assert.match(status.stdout, /^next: none$/m);
+    const jsonStatus = await runCli(root, ['status', '--json']);
+    assert.equal(jsonStatus.code, 0, jsonStatus.stderr);
+    assert.equal(JSON.parse(jsonStatus.stdout).progress.pending_next_action, null);
+    assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
+
+    setRequirements(root, ['DS-000'], 'IN_PROGRESS');
+    const reopened = await runCli(root, ['recover']);
+    assert.equal(reopened.code, 0, reopened.stderr);
+    assert.equal(readJson(p.state).pending_next_action, NEXT_UNSATISFIED_REQUIREMENT_ACTION);
+    assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

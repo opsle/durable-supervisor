@@ -1,0 +1,77 @@
+{
+  "task_id": "task-complete-next-action-correction",
+  "parent_decision_id": "decision-a3344aea-b6d3-4522-aa51-52319f8e89e4",
+  "title": "Complete corrective objective revision 2",
+  "objective": "Record objective revision 2 as complete with the canonical no-automatic-next-action representation after accepted implementation and deterministic verification.",
+  "scope": [
+    "current derived supervisor phase and next action"
+  ],
+  "authorization": {
+    "may": [
+      "read accepted correction evidence",
+      "set current phase COMPLETE",
+      "clear pending_next_action to null",
+      "validate current durable state"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "modify source, tests, requirements, policy, objective history, supervisor identity, or historical events",
+      "invoke an AI provider",
+      "deploy, merge, push, or initialize another repository",
+      "modify sibling repositories"
+    ]
+  },
+  "required_inputs": [
+    ".opsle/evidence/compact/task-fix-derived-next-action-invariant-attempt-001.json",
+    ".opsle/evidence/compact/task-fix-derived-next-action-invariant-attempt-001.completion.json",
+    ".opsle/state.json"
+  ],
+  "relevant_context": [
+    "The corrective implementation was accepted by decision-a3344aea-b6d3-4522-aa51-52319f8e89e4",
+    "Focused tests passed 12 of 12 and full verification passed 16 of 16",
+    "Terminal canonical state is phase COMPLETE with pending_next_action null"
+  ],
+  "expected_deliverable": "Current objective revision 2 is COMPLETE with no automatic next action.",
+  "expected_evidence": [
+    "phase COMPLETE",
+    "pending_next_action null",
+    "validateDurableState returns valid",
+    "Context Firewall packet complete_for_decision"
+  ],
+  "acceptance_criteria": [
+    "phase is COMPLETE",
+    "pending next action is null",
+    "zero unsatisfied requirements remain",
+    "durable validation exits 0",
+    "no source artifacts change",
+    "Context Firewall packet is complete_for_decision"
+  ],
+  "prohibited_actions": [
+    "history rewriting",
+    "provider invocation",
+    "release, merge, deployment, or cross-repository initialization"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required"
+  ],
+  "requirement_ids": [],
+  "route_hint": "deterministic",
+  "deterministic_command": [
+    "node",
+    "--input-type=module",
+    "-e",
+    "import{updateState}from'./src/state.js';updateState(process.cwd(),{phase:'COMPLETE',pending_next_action:null})"
+  ],
+  "verification_command": [
+    "node",
+    "--input-type=module",
+    "-e",
+    "import{readJson}from'./src/io.js';import{paths,unsatisfiedRequirements,validateDurableState}from'./src/state.js';const root=process.cwd();const state=readJson(paths(root).state);const matrix=readJson(paths(root).requirements);const valid=validateDurableState(root);process.exit(state.phase==='COMPLETE'&&state.pending_next_action===null&&unsatisfiedRequirements(matrix).length===0&&valid.valid?0:1)"
+  ],
+  "expects_changes": false,
+  "timeout_seconds": 60
+}

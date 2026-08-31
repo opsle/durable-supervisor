@@ -21,7 +21,13 @@ import {
   routeTask,
 } from '../src/pipeline.js';
 import { canonicalJson, readJson } from '../src/io.js';
-import { initialize, paths, validateDurableState } from '../src/state.js';
+import {
+  emit,
+  initialize,
+  paths,
+  updateState,
+  validateDurableState,
+} from '../src/state.js';
 import {
   measureContextPacket,
   runAttempt,
@@ -235,6 +241,73 @@ test('objective show/set preserves prior revisions and active-work redirect paus
     const event = eventLines(root).filter((item) => item.type === 'OBJECTIVE_CHANGED').at(-1);
     assert.equal(event.objective_revision, 3);
     assert.equal(event.reconciliation.required, true);
+    assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('terminal next action is derived, validated, and reopened by objective revision', async () => {
+  const root = fixture();
+  try {
+    const p = paths(root);
+    updateState(root, {
+      phase: 'COMPLETE',
+      pending_next_action: 'Select the next unsatisfied requirement slice.',
+    });
+    assert.deepEqual(validateDurableState(root), {
+      valid: false,
+      errors: ['complete state with no unsatisfied requirements must not have a pending next action'],
+    });
+
+    const historical = emit(root, 'LEGACY_TERMINAL_STATE_OBSERVED', {
+      pending_next_action: 'Select the next unsatisfied requirement slice.',
+    });
+    updateState(root, { pending_next_action: null });
+    assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
+
+    const revised = await runCli(root, [
+      'objective',
+      'set',
+      '--text',
+      'Perform bounded work after the completed fixture objective.',
+    ]);
+    assert.equal(revised.code, 0, revised.stderr);
+    const state = readJson(p.state);
+    assert.equal(state.phase, 'SELF_HOSTED');
+    assert.equal(state.pending_next_action, 'Establish bounded work for objective revision 2.');
+    assert.equal(readJson(join(p.events, `${historical.event_id}.json`)).pending_next_action,
+      'Select the next unsatisfied requirement slice.');
+    assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('accepted task cannot recreate an automatic next action after terminal completion', async () => {
+  const root = fixture();
+  try {
+    const p = paths(root);
+    updateState(root, { phase: 'COMPLETE', pending_next_action: null });
+    const task = createTask(root, handoff('task-terminal-acceptance', { requirement_ids: [] }));
+    const decision = routeTask(root, task);
+    const { attempt, claim } = createAttempt(root, task, decision);
+    const completed = await runAttempt(root, task, attempt, claim);
+    assert.equal(completed.packet.completeness, 'complete_for_decision');
+
+    const evaluated = await runCli(root, [
+      'task',
+      'evaluate',
+      task.task_id,
+      '--accept',
+      '--rationale',
+      'terminal fixture evidence is complete',
+    ]);
+    assert.equal(evaluated.code, 0, evaluated.stderr);
+    assert.equal(readJson(p.state).pending_next_action, null);
+    const status = await runCli(root, ['status']);
+    assert.equal(status.code, 0, status.stderr);
+    assert.match(status.stdout, /^next: none$/m);
     assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
   } finally {
     rmSync(root, { recursive: true, force: true });
