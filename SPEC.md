@@ -36,8 +36,10 @@ Later policy changes are prospective.
 2. Operator policy makes disabled providers ineligible.
 3. Gearbox selects an adequate permitted deterministic route or Codex.
 4. Claim acquisition fails if the task already has an active claim.
-5. The Runner launches the bounded process and makes the supervisor `DORMANT`.
-6. The OS process wait, not a model loop, detects completion.
+5. The Runner durably registers an explicit bounded wait before launch and
+   before making the supervisor `DORMANT`.
+6. The OS process wait, not a model loop, detects completion, failure, or
+   timeout and publishes a terminal event.
 7. Raw stdout, stderr, the final child message, execution metadata, and
    verification output are retained as applicable.
 8. Changed paths are compared with the task's `may_modify` envelope.
@@ -50,8 +52,16 @@ Later policy changes are prospective.
 12. A separate supervisor evaluation accepts or rejects objective advancement
     and persists the decision.
 
-Normal model-level polling is prohibited. A human can still request status or
-intervene while a child runs.
+Normal model-level polling and wait-induced automatic reasoning are prohibited.
+Healthy heartbeat, host-wrapper yield/timeout, and any other nonterminal return
+cannot make a wait model-ready. Terminal completion/failure/timeout/stall or an
+intervention-required event may wake automatic supervision. Explicit human
+interaction is separately eligible and classified as human.
+
+The Codex host must bind the terminal adapter so wrapper yields are consumed
+inside one deterministic call. Without that host binding, the repository can
+detect and report trajectory activations but cannot prevent the external host
+from initiating them.
 
 ## Return values and evidence
 
@@ -89,8 +99,9 @@ historical attempt snapshots remain unchanged.
 
 ## Compatibility and versioning
 
-Local V0.1 Gearbox, Context Firewall, handoff, decision-evidence, wakeup, and
-telemetry adapters preserve replacement boundaries. Discovery of an Opsle
+Local V0.1 Gearbox, Context Firewall, handoff, decision-evidence, wakeup,
+host-terminal, and activation-telemetry adapters preserve replacement
+boundaries. Discovery of an Opsle
 sibling repository is not an import or integration claim.
 
 Breaking schema or lifecycle semantics require a new protocol version. Optional

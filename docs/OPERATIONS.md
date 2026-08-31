@@ -47,6 +47,36 @@ Bounded watch:
 
 Status and watch read durable process state. They do not invoke a model.
 
+Activation telemetry reports terminal-event, human, and wait-induced automatic
+counts. A value is `unknown` when complete trajectory evidence is absent. The
+legacy polling-zero field is not accepted as evidence of zero inference.
+
+## Wait for a child without model reactivation
+
+The supervisor host must call the terminal adapter from one enclosing tool
+cell. That cell starts the CLI process and mechanically resumes the same
+terminal session until it receives an exit code. Its deadline must be later
+than the task's declared execution and verification windows, but must remain
+finite.
+
+Do not return a session ID to the model and ask it to wait again. Do not treat a
+30-second wrapper return, tool timeout, or fresh heartbeat as a wake event. If
+the adapter deadline arrives without a durable terminal event, fail closed and
+record an intervention requirement.
+
+The reusable deterministic contract is `consumeTerminalSession()` in
+`src/host-terminal.js`. Host integration supplies its terminal `start` and
+`resume` functions. This repository cannot enforce the rule in an external
+host that does not bind the adapter.
+
+For a read-only trajectory audit, use
+`tools/profile-codex-activations.mjs` with a trajectory path and exact child
+start/end timestamps. The tool invokes no provider and writes no runtime state.
+When task and attempt identity are included, the reviewed profile can be
+imported with `telemetry import-activation-profile --input FILE`. Import checks
+the durable attempt interval and trajectory hash, emits classified durable
+activation events, and is idempotent for an identical canonical profile.
+
 ## Pause and resume
 
 Stop new automatic launches now:

@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-be1e1205-9ac6-4276-8226-fe4edf4edf3d","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":7,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-record-wakeup-trajectory-evidence","time":"2026-08-31T22:10:33.729Z","type":"TASK_HANDOFF_CREATED"}

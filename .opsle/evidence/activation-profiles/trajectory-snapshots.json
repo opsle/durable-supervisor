@@ -1,0 +1,27 @@
+{
+  "schema": "opsle.durable-supervisor.trajectory-snapshot-manifest/v1",
+  "entries": [
+    {
+      "profile": ".opsle/evidence/activation-profiles/prior-defective.json",
+      "original_path": "/home/deploy/.codex/sessions/2026/08/31/rollout-2026-08-31T20-41-48-01a0598e-8965-76f2-beef-5282cda666cc.jsonl",
+      "snapshot_path": ".opsle/evidence/raw/trajectory-snapshots/prior-defective-522af8de2d7fd64339d945d2c29374a3fad8f4d251fbde18d83b5a62e16b99f6.jsonl",
+      "sha256": "522af8de2d7fd64339d945d2c29374a3fad8f4d251fbde18d83b5a62e16b99f6",
+      "bytes": 2821311,
+      "interval": {
+        "start": "2026-08-31T20:52:24.491Z",
+        "end": "2026-08-31T21:03:34.571Z"
+      }
+    },
+    {
+      "profile": ".opsle/evidence/activation-profiles/corrected-live.json",
+      "original_path": "/home/deploy/.codex/sessions/2026/08/31/rollout-2026-08-31T21-19-41-01a059b1-3963-7162-9d07-a72602222ae0.jsonl",
+      "snapshot_path": ".opsle/evidence/raw/trajectory-snapshots/corrected-live-16f23642c8635db372fd0931f793dbbb60bc87639f23c8ab5167aa27e236d277.jsonl",
+      "sha256": "16f23642c8635db372fd0931f793dbbb60bc87639f23c8ab5167aa27e236d277",
+      "bytes": 6259837,
+      "interval": {
+        "start": "2026-08-31T22:02:56.621Z",
+        "end": "2026-08-31T22:08:03.111Z"
+      }
+    }
+  ]
+}

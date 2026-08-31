@@ -55,12 +55,14 @@ path controls how much execution detail enters the next decision.
 | Capability Discovery | Deterministic executable and sibling-revision discovery in `src/pipeline.js`. Presence does not imply permission or integration. |
 | Gearbox | A local, inspectable routing adapter chooses a predeclared deterministic command when adequate, otherwise an enabled Codex route. Disabled providers are ineligible. |
 | Claims/fencing | One active task claim with a monotonically increasing fence generation; conflicting acquisition fails closed. |
-| Runner | `src/runner.js` launches the process, records PID and heartbeat, captures raw artifacts, enforces timeout, blocks until process close, and writes the completion event. |
+| Runner | `src/runner.js` registers a bounded wait before dormancy, launches the process, records PID and heartbeat, captures raw artifacts, enforces timeout, blocks until process close, and publishes a terminal event. |
+| Event-driven wakeup | `src/wakeup.js` is a fail-closed state machine. Terminal completion/failure/timeout/stall/intervention and explicit human interaction are eligible; heartbeat and host nonterminal returns are not. |
+| Host-terminal boundary | `src/host-terminal.js` mechanically consumes resumable wrapper returns inside one bounded deterministic call and exposes only terminal control. The host must bind this adapter. |
 | Context Firewall | A local reducer creates a bounded packet with completeness, measured bytes, changed-file scope, verification result, hashes, and raw references. |
 | Decision evidence | Completion handoff separates child claims from deterministic observations and unknowns. |
 | Acceptance | Deterministic criteria gate the attempt before a separate supervisor accept/reject decision can advance requirements. |
 | Human controls | Deterministic CLI status/watch, pause/resume, objective revisions, policy changes, evidence display, and tmux helpers. |
-| Telemetry | Durable route, wait, duration, byte, heartbeat, and polling fields; unavailable token and cost values remain unknown. |
+| Telemetry | `src/activation-telemetry.js` and the trajectory tool distinguish terminal-event, human, and wait-induced automatic activations. Missing trajectory evidence stays unknown; legacy polling zeros are untrusted. |
 
 ## State ownership
 
@@ -77,10 +79,20 @@ Supervisor and child lifecycles are independent:
 - Supervisor: `ACTIVE`, `DORMANT`, or `PAUSED`.
 - Child: `QUEUED`, `LAUNCHING`, `RUNNING`, a terminal state, or `UNKNOWN`.
 
-The Runner sets the supervisor to `DORMANT` before the bounded process runs.
-After process close it persists raw evidence, verification, the compact packet,
-completion handoff, Acceptance result, and completion event before returning the
-supervisor to `ACTIVE` or applying a requested pause.
+The Runner persists the wait registration before setting the supervisor to
+`DORMANT` and launching the bounded process. Heartbeats update liveness but do
+not change wake state. After process close it persists raw evidence,
+verification, the compact packet, completion handoff, Acceptance result, and a
+terminal completion event. Only applying that event can return automatic
+supervision to `ACTIVE` or apply a requested pause. Duplicate terminal delivery
+is idempotent.
+
+The repository Runner and the Codex host terminal are separate boundaries. A
+nonterminal tool-wrapper return can reactivate inference even while the Runner
+is correctly blocked. The host-terminal adapter therefore loops over resumable
+returns mechanically until it observes an exit code or reaches its explicit
+deadline. Reaching the host deadline without terminal evidence fails closed;
+it is not permission for automatic reasoning.
 
 ## Recovery and duplicate prevention
 
@@ -107,12 +119,12 @@ but do not pretend to import every sibling prototype:
 - sibling Gearbox, Context Firewall, wakeup, decision-evidence, handoff,
   Affected Verification, and profiler repositories are only discovered and
   revision-recorded;
-- wakeup is currently the local blocking OS close event plus durable completion
-  event, not an external notification service;
+- wakeup is a local registered-wait state machine driven by durable terminal
+  events, not an external notification service;
 - Context Firewall and Gearbox are narrow local implementations intended to be
   replaceable;
 - Affected Verification remains advisory and cannot waive established tests;
-- Semantic Edit and full trajectory-profiler integration are deferred;
+- Semantic Edit and continuous trajectory-profiler ingestion are deferred;
 - provider policy represents Claude, but current policy disables it and review
   is off;
 - multi-host, multi-repository, distributed, web, scheduler, deployment, and

@@ -4,10 +4,12 @@ import { basename, join, relative } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   appendEvent,
+  canonicalJson,
   fileSha256,
   id,
   now,
   readJson,
+  sha256,
   writeJson,
 } from './io.js';
 import {
@@ -29,6 +31,8 @@ import {
   routeTask,
 } from './pipeline.js';
 import { runAttempt } from './runner.js';
+import { activationSummary } from './activation-telemetry.js';
+import { applyWakeEvent } from './wakeup.js';
 
 function usage() {
   return `usage: opsle COMMAND
@@ -55,6 +59,7 @@ commands:
   requirements [--json]
   evidence show ATTEMPT_ID
   events consume EVENT_ID
+  telemetry import-activation-profile --input FILE
   supervisor session-name|start|attach|is-alive
 `;
 }
@@ -83,6 +88,20 @@ function attemptForState(root, state) {
   if (!state.active_attempt_id) return null;
   const path = join(paths(root).attempts, `${state.active_attempt_id}.json`);
   return existsSync(path) ? readJson(path) : null;
+}
+
+function recordHumanActivation(root, interaction) {
+  const state = readJson(paths(root).state);
+  const attempt = attemptForState(root, state);
+  if (!['LAUNCHING', 'RUNNING'].includes(attempt?.child_state)) return null;
+  return emit(root, 'SUPERVISOR_ACTIVATION', {
+    classification: 'human',
+    automatic: false,
+    interaction,
+    task_id: attempt.task_id,
+    attempt_id: attempt.attempt_id,
+    wait_id: attempt.attempt_id,
+  });
 }
 
 function measuredElapsedMs(attempt) {
@@ -217,14 +236,18 @@ function status(root, json = false) {
     ? readFileSync(p.eventsLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)) : [];
   const completionEvents = events.filter((item) => item.type === 'CHILD_COMPLETION');
   const measuredCompletions = completionEvents.filter((item) => Number.isFinite(item.execution_duration_ms));
+  const activations = activationSummary(events);
   const telemetry = {
-    supervisor_activations: events.filter((item) => item.type === 'SUPERVISOR_REACTIVATED').length,
+    activations,
+    legacy_supervisor_reactivation_events: events
+      .filter((item) => item.type === 'SUPERVISOR_REACTIVATED').length,
     children: readdirSync(p.attempts).filter((name) => name.endsWith('.json')).length,
     deterministic_routes: events.filter((item) => item.type === 'GEARBOX_ROUTED' && item.route === 'deterministic').length,
     model_routes: events.filter((item) => item.type === 'GEARBOX_ROUTED' && item.route === 'codex').length,
     policy_changes: events.filter((item) => item.type === 'POLICY_CHANGED').length,
     recovery_count: events.filter((item) => item.type === 'SUPERVISOR_RECOVERED').length,
-    model_polling_turns: events.reduce((sum, item) => sum + (item.model_turns_used_for_polling ?? 0), 0),
+    model_polling_turns: null,
+    legacy_polling_field_trusted: false,
     measured_completion_count: measuredCompletions.length,
     unmeasured_completion_count: completionEvents.length - measuredCompletions.length,
     measured_child_execution_duration_ms: measuredCompletions.length
@@ -349,7 +372,12 @@ function status(root, json = false) {
     'MEASUREMENT',
     `children: ${telemetry.children}`,
     `routes: deterministic=${telemetry.deterministic_routes} model=${telemetry.model_routes}`,
-    `model polling turns: ${telemetry.model_polling_turns}`,
+    `automatic activations: ${displayValue(activations.total_automatic)}`,
+    `terminal-event activations: ${displayValue(activations.terminal_event)}`,
+    `human activations: ${displayValue(activations.human)}`,
+    `wait-induced activations: ${displayValue(activations.wait_induced_automatic)}`,
+    `activation evidence: ${activations.evidence}`,
+    'legacy model polling field: untrusted',
     `measured child duration ms: ${displayValue(telemetry.measured_child_execution_duration_ms)}`,
     `measured raw output bytes: ${displayValue(telemetry.measured_raw_output_bytes)}`,
     `measured raw evidence bytes: ${displayValue(telemetry.measured_raw_evidence_bytes)}`,
@@ -395,12 +423,31 @@ function recover(root) {
       const attempt = readJson(attemptPath);
       if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(attempt.child_state)) {
         reconciliation = { classification: `known_${attempt.child_state.toLowerCase()}`, action: 'do_not_relaunch' };
+      } else if (attempt.child_state === 'UNKNOWN') {
+        reconciliation = {
+          classification: 'unknown_unreconciled',
+          action: 'remain_paused_and_reconcile',
+          pid: attempt.pid,
+        };
       } else if (attempt.pid) {
         let alive = true;
         try { process.kill(attempt.pid, 0); } catch { alive = false; }
         if (alive) reconciliation = { classification: 'known_running', action: 'preserve_claim_and_wait', pid: attempt.pid };
         else {
           attempt.child_state = 'UNKNOWN';
+          const intervention = emit(root, 'INTERVENTION_REQUIRED', {
+            task_id: attempt.task_id,
+            attempt_id: attempt.attempt_id,
+            wait_id: attempt.attempt_id,
+            reason: 'active child PID is absent without terminal evidence',
+          });
+          if (attempt.wait_registration) {
+            attempt.wait_registration = applyWakeEvent(attempt.wait_registration, {
+              event_id: intervention.event_id,
+              wait_id: attempt.attempt_id,
+              type: 'intervention-required',
+            });
+          }
           writeJson(attemptPath, attempt);
           reconciliation = { classification: 'unknown_unreconciled', action: 'pause_and_reconcile', pid: attempt.pid };
           state.supervisor_state = 'PAUSED';
@@ -493,6 +540,76 @@ function consumeEvent(root, eventId) {
   return { event_id: eventId, duplicate: false, action: 'recorded' };
 }
 
+function importActivationProfile(root, profile) {
+  if (profile.schema !== 'opsle.durable-supervisor.activation-profile/v1') {
+    throw new Error('unsupported activation profile schema');
+  }
+  if (!profile.task_id || !profile.attempt_id
+      || !/^[a-f0-9]{64}$/.test(profile.trajectory_evidence?.sha256 ?? '')) {
+    throw new Error('activation profile requires task, attempt, and trajectory evidence identity');
+  }
+  const classifications = ['terminal-event', 'human', 'wait-induced-automatic'];
+  if (!Array.isArray(profile.activations)
+      || profile.activations.some((item) => !classifications.includes(item.classification))) {
+    throw new Error('activation profile contains invalid activation records');
+  }
+  const observed = {
+    terminal_event: profile.activations
+      .filter((item) => item.classification === 'terminal-event').length,
+    human: profile.activations
+      .filter((item) => item.classification === 'human').length,
+    wait_induced_automatic: profile.activations
+      .filter((item) => item.classification === 'wait-induced-automatic').length,
+  };
+  observed.total_automatic = observed.terminal_event + observed.wait_induced_automatic;
+  for (const [name, count] of Object.entries(observed)) {
+    if (profile.counts?.[name] !== count) {
+      throw new Error(`activation profile count mismatch: ${name}`);
+    }
+  }
+  const attemptPath = join(paths(root).attempts, `${profile.attempt_id}.json`);
+  const durableAttempt = existsSync(attemptPath) ? readJson(attemptPath) : null;
+  if (!durableAttempt || durableAttempt.task_id !== profile.task_id) {
+    throw new Error('activation profile does not identify a durable attempt');
+  }
+  if (profile.interval?.start !== durableAttempt.started_at
+      || profile.interval?.end !== durableAttempt.completed_at) {
+    throw new Error('activation profile interval does not match the durable child interval');
+  }
+  const profileSha256 = sha256(canonicalJson(profile));
+  const existing = readFileSync(paths(root).eventsLog, 'utf8')
+    .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    .find((event) => event.type === 'ACTIVATION_PROFILED'
+      && event.profile_sha256 === profileSha256);
+  if (existing) return { duplicate: true, profile_event_id: existing.event_id };
+  const profileEvent = emit(root, 'ACTIVATION_PROFILED', {
+    task_id: profile.task_id,
+    attempt_id: profile.attempt_id,
+    interval: profile.interval,
+    counts: profile.counts,
+    trajectory_evidence: profile.trajectory_evidence,
+    profile_sha256: profileSha256,
+  });
+  const activationEventIds = profile.activations.map((activation) => emit(
+    root,
+    'SUPERVISOR_ACTIVATION',
+    {
+      classification: activation.classification,
+      automatic: activation.automatic,
+      task_id: profile.task_id,
+      attempt_id: profile.attempt_id,
+      cause_timestamp: activation.cause_timestamp,
+      activation_timestamp: activation.activation_timestamp,
+      source_profile_event_id: profileEvent.event_id,
+    },
+  ).event_id);
+  return {
+    duplicate: false,
+    profile_event_id: profileEvent.event_id,
+    activation_event_ids: activationEventIds,
+  };
+}
+
 export async function main(args) {
   if (args.length === 0 || args[0] === 'help' || args[0] === '--help') {
     print(usage());
@@ -538,6 +655,7 @@ export async function main(args) {
     return;
   }
   if (command === 'pause') {
+    recordHumanActivation(root, 'pause');
     const afterCurrent = args.includes('--after-current');
     const reason = valueAfter(args, '--reason', 'operator requested pause');
     const current = readJson(paths(root).state);
@@ -558,6 +676,7 @@ export async function main(args) {
     return;
   }
   if (command === 'resume') {
+    recordHumanActivation(root, 'resume');
     updateState(root, { supervisor_state: 'ACTIVE', pause: { active: false, after_current: false, reason: null, changed_at: now() } });
     emit(root, 'SUPERVISOR_RESUMED', { actor: 'operator-cli' });
     print(status(root));
@@ -565,7 +684,10 @@ export async function main(args) {
   }
   if (command === 'objective') {
     if (subcommand === 'show') print(readJson(paths(root).objective));
-    else if (subcommand === 'set') print(setObjective(root, valueAfter(rest, '--text')));
+    else if (subcommand === 'set') {
+      recordHumanActivation(root, 'objective-set');
+      print(setObjective(root, valueAfter(rest, '--text')));
+    }
     else throw new Error('objective requires show or set --text TEXT');
     return;
   }
@@ -580,11 +702,13 @@ export async function main(args) {
   if (command === 'policy') {
     if (subcommand === 'status') print(readJson(paths(root).policy));
     else if (['enable', 'disable'].includes(subcommand)) {
+      recordHumanActivation(root, `policy-${subcommand}`);
       const provider = rest[0];
       const policy = readJson(paths(root).policy);
       if (!policy.providers[provider]) throw new Error(`unknown provider: ${provider}`);
       print(updatePolicy(root, (next) => { next.providers[provider].enabled = subcommand === 'enable'; }));
     } else if (subcommand === 'review') {
+      recordHumanActivation(root, 'policy-review');
       const mode = rest[0];
       if (!REVIEW_MODES.has(mode)) throw new Error(`invalid review mode: ${mode}`);
       const reviewer = valueAfter(rest, '--reviewer');
@@ -642,6 +766,15 @@ export async function main(args) {
   }
   if (command === 'events' && subcommand === 'consume') {
     print(consumeEvent(root, rest[0]));
+    return;
+  }
+  if (command === 'telemetry') {
+    if (subcommand !== 'import-activation-profile') {
+      throw new Error('telemetry requires import-activation-profile --input FILE');
+    }
+    const input = valueAfter(rest, '--input');
+    if (!input) throw new Error('telemetry import requires --input FILE');
+    print(importActivationProfile(root, readJson(input)));
     return;
   }
   if (command === 'supervisor') {

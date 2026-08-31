@@ -12,9 +12,16 @@ production service or a published installable package.
 
 The supervisor may remain available in a terminal or tmux session, but an open
 session does not imply a running model turn. While a child or deterministic
-tool runs, the supervisor is logically `DORMANT`. The Runner blocks on the OS
-child process, captures its output, and emits a durable completion event. There
-is no model status-polling loop.
+tool runs, the supervisor is logically `DORMANT`. Before launch, the Runner
+persists a bounded wait registration. It blocks on the OS child process,
+captures its output, and applies only a durable terminal event to make the wait
+automatically ready.
+
+A terminal host wrapper must consume its own yields inside one deterministic
+tool invocation. A wrapper yield, wrapper timeout, nonterminal return, or
+healthy heartbeat is never an eligible automatic wake. This host binding is
+required: the repository cannot stop an unbound external host from starting a
+model turn merely because that host returned control.
 
 tmux is only a convenience for interactive attachment. The authoritative state
 is the structured data under `.opsle/`. If tmux, SSH, the Codex process, or the
@@ -60,8 +67,8 @@ The boundaries are deliberate:
   and prohibited actions.
 - Claims and monotonically increasing fence generations prevent an obvious
   duplicate attempt from acquiring the same task concurrently.
-- The Runner owns launch, heartbeat, capture, timeout, blocking wait, and the
-  durable completion event.
+- The Runner owns launch, heartbeat, capture, timeout, blocking wait, terminal
+  publication, and the durable wait transition.
 - The Context Firewall keeps raw artifacts out of the normal return path and
   emits a bounded, provenance-linked packet. Raw evidence remains available
   for targeted escalation.
@@ -115,16 +122,17 @@ or production-readiness saving is claimed.
 ## Integration status and limits
 
 V0.1 implements narrow local adapters for Gearbox routing, structured
-handoffs, Context Firewall reduction, decision evidence, completion events,
-and telemetry. Capability Discovery records the presence and revision of
+handoffs, Context Firewall reduction, decision evidence, registered wakeups,
+host-terminal yield consumption, and activation telemetry. Capability
+Discovery records the presence and revision of
 related Opsle sibling repositories, but this repository does not import their
 implementations.
 
 Affected Verification is `advisory_only` and did not authorize reduced testing.
-Semantic Edit, a dedicated wakeup service, full trajectory profiling,
-multi-repository supervision, distributed locking, a scheduler, a web UI, and
-production deployment are deferred. Codex is enabled in the recorded policy;
-Claude and independent review remained disabled.
+Semantic Edit, a dedicated external wakeup service, continuous trajectory
+ingestion, multi-repository supervision, distributed locking, a scheduler, a
+web UI, and production deployment are deferred. Codex is enabled in the
+recorded policy; Claude and independent review remained disabled.
 
 ## License
 

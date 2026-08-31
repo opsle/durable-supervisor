@@ -31,6 +31,7 @@ import {
   validateDurableState,
 } from '../src/state.js';
 import { runAttempt } from '../src/runner.js';
+import { registerWait } from '../src/wakeup.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 const cliPath = join(sourceRoot, 'bin', 'opsle.js');
@@ -314,6 +315,13 @@ test('recovery fences an absent running child as unknown without retrying it', a
     const uncertain = readJson(attemptPath);
     uncertain.child_state = 'RUNNING';
     uncertain.pid = 2147483647;
+    uncertain.wait_registration = registerWait({
+      waitId: uncertain.attempt_id,
+      taskId: uncertain.task_id,
+      attemptId: uncertain.attempt_id,
+      registeredAt: '2026-08-31T20:00:00.000Z',
+      deadlineAt: '2026-08-31T20:30:00.000Z',
+    });
     writeJson(attemptPath, uncertain);
     const generation = readJson(p.supervisor).generation;
 
@@ -325,6 +333,13 @@ test('recovery fences an absent running child as unknown without retrying it', a
     assert.equal(readJson(join(p.claims, `${claim.claim_id}.json`)).status, 'ACTIVE');
     assert.equal(readJson(join(p.tasks, `${task.task_id}.json`)).attempts.length, 1);
     assert.equal(readJson(p.supervisor).generation, generation + 1);
+    assert.equal(readJson(attemptPath).wait_registration.wake.type, 'intervention-required');
+    const interventionCount = eventLines(root)
+      .filter((event) => event.type === 'INTERVENTION_REQUIRED').length;
+    const recoveredAgain = await runCli(root, ['recover']);
+    assert.equal(recoveredAgain.code, 0, recoveredAgain.stderr);
+    assert.equal(eventLines(root)
+      .filter((event) => event.type === 'INTERVENTION_REQUIRED').length, interventionCount);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

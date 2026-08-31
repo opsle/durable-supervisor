@@ -98,7 +98,60 @@ test('Runner waits, retains raw evidence, reduces a packet, and gates acceptance
     assert.equal(result.packet.completeness, 'complete_for_decision');
     assert.ok(result.packet.raw_bytes > 0);
     assert.ok(result.packet.raw_evidence_references.length >= 4);
+    assert.equal(result.attempt.wait_registration.state, 'READY');
+    assert.equal(result.attempt.wait_registration.wake.class, 'terminal-event');
+    const events = readFileSync(paths(root).eventsLog, 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line));
+    const registeredIndex = events.findIndex((event) => event.type === 'WAIT_REGISTERED');
+    const launchingIndex = events.findIndex((event) => event.type === 'RUNNER_LAUNCHING');
+    assert.ok(registeredIndex >= 0);
+    assert.ok(registeredIndex < launchingIndex);
+    assert.equal(
+      events.filter((event) => event.type === 'SUPERVISOR_ACTIVATION'
+        && event.classification === 'terminal-event').length,
+      1,
+    );
+    const completionEvent = events.find((event) => event.type === 'CHILD_COMPLETION');
+    assert.equal(completionEvent.model_turns_used_for_polling, null);
+    assert.equal(completionEvent.activation_counts.wait_induced_automatic, null);
     assert.equal(readFileSync(join(root, 'output.txt'), 'utf8'), 'ok\n');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Runner timeout publishes a terminal wake and fails acceptance', async () => {
+  const root = fixture();
+  try {
+    const task = createTask(root, handoff({
+      task_id: 'task-timeout-fixture',
+      deterministic_command: [
+        process.execPath,
+        '-e',
+        'setTimeout(() => {}, 10000)',
+      ],
+      verification_command: null,
+      timeout_seconds: 1,
+      expects_changes: false,
+      authorization: {
+        may: ['wait for bounded timeout'],
+        may_modify: [],
+        may_not: ['invoke a provider'],
+      },
+    }));
+    const decision = routeTask(root, task);
+    const { attempt, claim } = createAttempt(root, task, decision);
+    const result = await runAttempt(root, task, attempt, claim);
+    assert.equal(result.attempt.child_state, 'FAILED');
+    assert.equal(result.attempt.acceptance.state, 'REJECTED');
+    assert.equal(result.attempt.wait_registration.state, 'READY');
+    assert.equal(result.attempt.wait_registration.wake.type, 'child-timeout');
+    const events = readFileSync(paths(root).eventsLog, 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line));
+    assert.equal(
+      events.find((event) => event.type === 'CHILD_COMPLETION').terminal_type,
+      'child-timeout',
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

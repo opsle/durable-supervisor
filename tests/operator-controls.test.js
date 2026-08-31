@@ -33,6 +33,7 @@ import {
   runAttempt,
   validateContextPacketMeasurement,
 } from '../src/runner.js';
+import { profileCodexActivations } from '../src/activation-telemetry.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 const cliPath = join(sourceRoot, 'bin', 'opsle.js');
@@ -341,6 +342,11 @@ test('pause after current lets the running child finish, then blocks the next la
     assert.equal(during.pause.active, true);
     assert.equal(during.pause.after_current, true);
     assert.equal(readJson(attemptPath).child_state, 'RUNNING');
+    assert.equal(eventLines(root).filter((event) => (
+      event.type === 'SUPERVISOR_ACTIVATION'
+      && event.classification === 'human'
+      && event.interaction === 'pause'
+    )).length, 1);
 
     const completed = await running;
     assert.equal(completed.attempt.child_state, 'COMPLETED');
@@ -404,6 +410,63 @@ test('bounded status watch is read-only and measured telemetry uses durable fact
     assert.equal(value.active_work.telemetry.cost, null);
     assert.equal(value.telemetry.measured_completion_count, 1);
     assert.equal(value.telemetry.unmeasured_completion_count, 0);
+    assert.deepEqual(value.telemetry.activations, {
+      evidence: 'partial-local-events',
+      total_automatic: null,
+      terminal_event: 1,
+      human: null,
+      wait_induced_automatic: null,
+    });
+    assert.equal(value.telemetry.model_polling_turns, null);
+    assert.equal(value.telemetry.legacy_polling_field_trusted, false);
+
+    const profile = profileCodexActivations([
+      {
+        timestamp: completed.attempt.started_at,
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call_output',
+          output: [{ text: JSON.stringify({ session_id: 11 }) }],
+        },
+      },
+      {
+        timestamp: completed.attempt.completed_at,
+        type: 'response_item',
+        payload: { type: 'custom_tool_call' },
+      },
+    ], {
+      start: completed.attempt.started_at,
+      end: completed.attempt.completed_at,
+      taskId: task.task_id,
+      attemptId: completed.attempt.attempt_id,
+      trajectoryEvidence: { path: '/fixture/trajectory.jsonl', sha256: 'a'.repeat(64) },
+    });
+    const profilePath = join(root, 'activation-profile.json');
+    writeFileSync(profilePath, canonicalJson(profile));
+    const imported = await runCli(root, [
+      'telemetry',
+      'import-activation-profile',
+      '--input',
+      profilePath,
+    ]);
+    assert.equal(imported.code, 0, imported.stderr);
+    assert.equal(JSON.parse(imported.stdout).duplicate, false);
+    const duplicate = await runCli(root, [
+      'telemetry',
+      'import-activation-profile',
+      '--input',
+      profilePath,
+    ]);
+    assert.equal(duplicate.code, 0, duplicate.stderr);
+    assert.equal(JSON.parse(duplicate.stdout).duplicate, true);
+    const profiledStatus = await runCli(root, ['status', '--json']);
+    assert.deepEqual(JSON.parse(profiledStatus.stdout).telemetry.activations, {
+      evidence: 'trajectory-profiled',
+      total_automatic: 1,
+      terminal_event: 0,
+      human: 0,
+      wait_induced_automatic: 1,
+    });
 
     const eventsBeforeWatch = readFileSync(p.eventsLog, 'utf8');
     const watch = await runCli(root, [

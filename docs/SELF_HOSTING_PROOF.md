@@ -66,19 +66,31 @@ The deterministic tests cover immutable objective revisions, fail-safe objective
 redirects, pause-after-current behavior, bounded read-only status watch, and
 telemetry that reports measured facts or explicit unknowns.
 
-## No-model-polling evidence
+## Historical wait-induced activation correction
 
-The Runner uses a blocking OS child process and its `close` event. During the
-wait it records PID/heartbeat while the supervisor is logically `DORMANT`.
-Completion events for both post-cutover tasks record
-`model_turns_used_for_polling: 0` and
-`wait_mechanism: blocking OS child process + close event`:
+The Runner used a blocking OS child process and its `close` event. During the
+wait it recorded PID/heartbeat while the supervisor was logically `DORMANT`.
+Historical completion events recorded `model_turns_used_for_polling: 0`:
 
 - [Recovery/policy completion event](../.opsle/events/event-e3fbd05d-1950-4db4-8f55-4cbe5dda2b12.json)
 - [Operator-controls completion event](../.opsle/events/event-1c1c312b-06e5-44ca-b631-990c1a4fa0c1.json)
 
-This proves what the local recorded path did. It does not estimate avoided model
-turns or claim a universal efficiency result.
+That field observed only the local Runner and was hard-coded. It does not prove
+zero supervisor inference. The prior trajectory for
+`task-fix-derived-next-action-invariant-attempt-001` shows a child interval from
+2026-08-31T20:52:24.491Z through 2026-08-31T21:03:34.571Z. The host wrapper
+first returned nonterminal control after one second and then at 30-second
+windows. Supervisor status was invoked during the still-running interval at
+20:54:51, 20:58:20, and 21:01:51 UTC.
+
+The deterministic trajectory profiler classifies 23 observable automatic
+activations inside that interval: 0 terminal-event, 0 human, and 23
+wait-induced automatic. An activation is measured at an observable tool-output
+boundary followed by model continuation; it is not a provider-recorded billing
+turn or token count. This corrects the earlier claim without rewriting the
+immutable historical events. New local completion telemetry reports unknown
+for host-level counts until trajectory evidence is present; it never converts
+absence of evidence into zero.
 
 ## Measured Context Firewall bytes
 
@@ -109,7 +121,9 @@ for that predeclared decision; it is not proof of all possible correctness.
 
 - The proof covers one local repository and single-host process claims.
 - tmux was not required for authority; `.opsle` was.
-- The local completion event is not a dedicated external wakeup service.
+- The local registered-wait adapter is not a dedicated external wakeup service.
+- Prevention of Codex wrapper-induced inference requires the host-terminal
+  adapter to be bound by the enclosing Codex tool cell.
 - Sibling Opsle repositories were discovered and revision-recorded, not imported.
 - Affected Verification remained advisory and did not reduce required tests.
 - Claude remained disabled and no independent AI review occurred.
