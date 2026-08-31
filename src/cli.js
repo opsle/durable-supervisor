@@ -629,7 +629,14 @@ export async function main(args) {
       if (tmuxAlive(name)) throw new Error(`tmux session already exists: ${name}`);
       const supervisor = readJson(paths(root).supervisor);
       const prompt = 'Read AGENTS.md and .opsle authoritative state. Run ./bin/opsle.js status and ./bin/opsle.js validate, reconcile ownership, then remain the interactive repository supervisor. Do not create a second supervisor identity.';
-      const result = spawnSync('tmux', ['new-session', '-d', '-s', name, '-c', root, 'codex', '-C', root, prompt], { encoding: 'utf8' });
+      const policy = readJson(paths(root).policy);
+      const codex = policy.providers.codex;
+      if (!codex.enabled) throw new Error('Codex provider is disabled by operator policy');
+      const result = spawnSync('tmux', [
+        'new-session', '-d', '-s', name, '-c', root,
+        'codex', '-C', root, '--model', codex.model,
+        '-c', `model_reasoning_effort="${codex.reasoning_effort}"`, prompt,
+      ], { encoding: 'utf8' });
       if (result.status !== 0) throw new Error(result.stderr.trim() || 'tmux start failed');
       supervisor.session_id = name;
       writeJson(paths(root).supervisor, supervisor);

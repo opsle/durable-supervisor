@@ -15,6 +15,7 @@
     ".opsle/evidence/compact/task-correct-context-packet-measurement-attempt-001.json",
     ".opsle/evidence/compact/task-final-reconcile-requirements-attempt-002.json",
     ".opsle/evidence/compact/task-final-reconcile-requirements-attempt-001.failure.json",
+    ".opsle/evidence/compact/task-bind-tmux-supervisor-model-attempt-001.json",
     ".opsle/events/event-9fca1322-bbe0-464f-8043-2324a10c775e.json",
     "tests/bootstrap.test.js",
     "tests/recovery-policy.test.js",

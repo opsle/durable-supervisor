@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-6c47e46d-8bf3-4d57-a6f7-a07490961c39","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":3,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-bind-tmux-supervisor-model","time":"2026-08-31T19:35:01.845Z","type":"TASK_HANDOFF_CREATED"}
