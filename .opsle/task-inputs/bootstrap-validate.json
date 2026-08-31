@@ -1,0 +1,70 @@
+{
+  "task_id": "task-bootstrap-validate",
+  "title": "Validate the durable bootstrap state",
+  "objective": "Run deterministic durable-state validation without model delegation.",
+  "scope": [
+    ".opsle durable state validation"
+  ],
+  "authorization": {
+    "may": [
+      "read repository-local durable state",
+      "run the checked-in state validator"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "modify repository files",
+      "change provider or review policy",
+      "invoke any AI provider",
+      "modify sibling repositories",
+      "deploy"
+    ]
+  },
+  "required_inputs": [
+    ".opsle/specification.md",
+    ".opsle/requirements.json",
+    ".opsle/objective.json",
+    ".opsle/policy.json",
+    ".opsle/supervisor.json",
+    ".opsle/state.json"
+  ],
+  "relevant_context": [
+    "src/state.js"
+  ],
+  "expected_deliverable": "A machine-readable valid=true result and no repository changes.",
+  "expected_evidence": [
+    "Runner exit status",
+    "validator output",
+    "actual changed-file set"
+  ],
+  "acceptance_criteria": [
+    "Runner exits 0",
+    "validator reports valid=true",
+    "no repository file changes occur",
+    "raw evidence is retained and a compact packet is produced"
+  ],
+  "prohibited_actions": [
+    "model invocation",
+    "provider fallback",
+    "repository mutation"
+  ],
+  "operator_policy_constraints": [
+    "Gearbox required",
+    "model polling prohibited",
+    "Claude disabled",
+    "review off"
+  ],
+  "requirement_ids": [
+    "DS-038",
+    "DS-058",
+    "DS-067"
+  ],
+  "route_hint": "deterministic",
+  "deterministic_command": [
+    "node",
+    "./bin/opsle.js",
+    "validate"
+  ],
+  "verification_command": null,
+  "expects_changes": false,
+  "timeout_seconds": 30
+}

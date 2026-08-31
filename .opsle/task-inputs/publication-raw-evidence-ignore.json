@@ -1,0 +1,70 @@
+{
+  "task_id": "task-publication-raw-evidence-ignore",
+  "title": "Exclude raw provider evidence from Git publication",
+  "objective": "Add the raw evidence directory to .gitignore while preserving all local raw artifacts and compact references.",
+  "scope": [
+    ".gitignore only"
+  ],
+  "authorization": {
+    "may": [
+      "read and update .gitignore"
+    ],
+    "may_modify": [
+      ".gitignore"
+    ],
+    "may_not": [
+      "delete or modify raw evidence",
+      "modify any other file",
+      "invoke an AI provider",
+      "deploy, merge, push, or create a PR"
+    ]
+  },
+  "required_inputs": [
+    ".gitignore"
+  ],
+  "relevant_context": [
+    "Raw evidence remains repository-local and addressable but may contain provider transcript material inappropriate for public source history"
+  ],
+  "expected_deliverable": ".gitignore contains exactly one .opsle/evidence/raw/ rule and raw evidence remains on disk.",
+  "expected_evidence": [
+    "deterministic command exit",
+    "changed-file scope",
+    "verification that the ignore rule exists exactly once",
+    "raw evidence directory still exists"
+  ],
+  "acceptance_criteria": [
+    "only .gitignore changes",
+    "the rule .opsle/evidence/raw/ exists exactly once",
+    "the raw evidence directory remains present",
+    "verification exits 0",
+    "packet is complete_for_decision"
+  ],
+  "prohibited_actions": [
+    "raw evidence deletion",
+    "model invocation",
+    "unrelated ignore rules"
+  ],
+  "operator_policy_constraints": [
+    "deterministic route required",
+    "Claude disabled",
+    "review off"
+  ],
+  "requirement_ids": [
+    "DS-039",
+    "DS-070",
+    "DS-073"
+  ],
+  "route_hint": "deterministic",
+  "deterministic_command": [
+    "node",
+    "-e",
+    "const fs=require('fs');const p='.gitignore';const rule='.opsle/evidence/raw/';let s=fs.readFileSync(p,'utf8');if(!s.split(/\\r?\\n/).includes(rule))s+=(s.endsWith('\\n')?'':'\\n')+rule+'\\n';fs.writeFileSync(p,s)"
+  ],
+  "verification_command": [
+    "node",
+    "-e",
+    "const fs=require('fs');const n=fs.readFileSync('.gitignore','utf8').split(/\\r?\\n/).filter(x=>x==='.opsle/evidence/raw/').length;process.exit(n===1&&fs.existsSync('.opsle/evidence/raw')?0:1)"
+  ],
+  "expects_changes": true,
+  "timeout_seconds": 30
+}

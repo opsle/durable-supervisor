@@ -1,0 +1,108 @@
+{
+  "task_id": "task-self-host-recovery-policy-tests",
+  "title": "Harden recovery and policy invariants",
+  "objective": "Add substantial deterministic integration coverage for reconstruction, pause, policy history, retries, and duplicate event delivery; fix only directly exposed substrate defects.",
+  "scope": [
+    "deterministic recovery and policy integration tests",
+    "minimal directly necessary corrections to the local V0.1 substrate"
+  ],
+  "authorization": {
+    "may": [
+      "inspect this repository",
+      "add tests under tests/",
+      "modify directly relevant local supervisor modules",
+      "modify package test/check scripts if required",
+      "run local deterministic verification"
+    ],
+    "may_modify": [
+      "tests/**",
+      "src/state.js",
+      "src/cli.js",
+      "src/pipeline.js",
+      "src/runner.js",
+      "src/io.js",
+      "package.json"
+    ],
+    "may_not": [
+      "modify .opsle runtime authority or evidence",
+      "modify AGENTS.md or project documentation",
+      "modify sibling repositories",
+      "change provider or review policy",
+      "invoke Claude or another provider",
+      "create another supervisor",
+      "deploy, merge, push, or create a PR"
+    ]
+  },
+  "required_inputs": [
+    "AGENTS.md",
+    "src/io.js",
+    "src/state.js",
+    "src/pipeline.js",
+    "src/runner.js",
+    "src/cli.js",
+    "tests/bootstrap.test.js"
+  ],
+  "relevant_context": [
+    ".opsle/specification.md DS-008, DS-009, DS-024, DS-035, DS-051, DS-052, DS-055, DS-060, DS-063, DS-068",
+    "Current policy is Codex enabled, Claude disabled, review off",
+    "No live provider invocation belongs in deterministic tests"
+  ],
+  "expected_deliverable": "A meaningful recovery/policy test suite plus the narrowest necessary substrate fixes.",
+  "expected_evidence": [
+    "tests reconstruct state using repo files only",
+    "pause survives a fresh CLI process",
+    "policy can transition to Claude enabled and risk_based review in a fixture without a provider call",
+    "prior attempt policy snapshot remains unchanged",
+    "retry creates a new attempt and does not overwrite the first",
+    "duplicate completion/event consumption is idempotent",
+    "npm test exits 0",
+    "actual changed files remain within authorization"
+  ],
+  "acceptance_criteria": [
+    "new tests cover disk-only reconstruction and simulated process loss",
+    "new tests cover pause persistence and runtime policy changes",
+    "new tests prove historical policy snapshot immutability",
+    "new tests prove retries create distinct attempts",
+    "new tests prove duplicate event handling is idempotent",
+    "no test invokes a live AI provider",
+    "npm test exits 0",
+    "no unexpected files change",
+    "Context Firewall packet is complete_for_decision"
+  ],
+  "prohibited_actions": [
+    "launching an AI child from the test suite",
+    "weakening fail-closed validation",
+    "retroactively mutating attempt history",
+    "inventing review or provider evidence",
+    "broad refactoring"
+  ],
+  "operator_policy_constraints": [
+    "Codex is the only enabled provider",
+    "Claude is disabled",
+    "independent review is off",
+    "Affected Verification is advisory only",
+    "model polling is prohibited"
+  ],
+  "requirement_ids": [
+    "DS-008",
+    "DS-009",
+    "DS-014",
+    "DS-024",
+    "DS-035",
+    "DS-051",
+    "DS-052",
+    "DS-055",
+    "DS-057",
+    "DS-060",
+    "DS-063",
+    "DS-068"
+  ],
+  "route_hint": "codex",
+  "deterministic_command": null,
+  "verification_command": [
+    "npm",
+    "test"
+  ],
+  "expects_changes": true,
+  "timeout_seconds": 1800
+}

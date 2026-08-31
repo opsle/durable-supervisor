@@ -1,0 +1,77 @@
+{
+  "task_id": "task-final-full-verify",
+  "title": "Run the full deterministic V0.1 verification",
+  "objective": "Execute the repository's complete deterministic verification suite without model delegation or repository mutation.",
+  "scope": [
+    "syntax checks",
+    "all deterministic tests",
+    "durable-state validation"
+  ],
+  "authorization": {
+    "may": [
+      "read repository files",
+      "execute npm run verify"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "modify repository files",
+      "invoke an AI provider",
+      "change policy, objective, or requirements",
+      "modify sibling repositories",
+      "deploy, merge, push, or create a PR"
+    ]
+  },
+  "required_inputs": [
+    "package.json",
+    "src/**",
+    "tests/**",
+    ".opsle durable state"
+  ],
+  "relevant_context": [
+    "Affected Verification is advisory only; run the full established suite"
+  ],
+  "expected_deliverable": "A source-bound full verification receipt with exit 0 and no changed files.",
+  "expected_evidence": [
+    "exact command",
+    "working directory",
+    "exit status",
+    "duration",
+    "raw output hashes",
+    "zero changed files",
+    "compact complete_for_decision packet"
+  ],
+  "acceptance_criteria": [
+    "npm run verify exits 0",
+    "all tests pass",
+    "durable state validates",
+    "no repository file changes occur",
+    "raw evidence remains referenced",
+    "packet is complete_for_decision"
+  ],
+  "prohibited_actions": [
+    "model invocation",
+    "verification reduction",
+    "repository mutation"
+  ],
+  "operator_policy_constraints": [
+    "Gearbox required",
+    "Claude disabled",
+    "review off",
+    "Affected Verification advisory only",
+    "model polling prohibited"
+  ],
+  "requirement_ids": [
+    "DS-028",
+    "DS-058",
+    "DS-063"
+  ],
+  "route_hint": "deterministic",
+  "deterministic_command": [
+    "npm",
+    "run",
+    "verify"
+  ],
+  "verification_command": null,
+  "expects_changes": false,
+  "timeout_seconds": 300
+}
