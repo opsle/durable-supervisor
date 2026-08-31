@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-5cce910f-8ca7-4962-bba6-f39ff811561d","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":7,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-complete-wakeup-correction","time":"2026-08-31T22:21:08.948Z","type":"TASK_HANDOFF_CREATED"}
