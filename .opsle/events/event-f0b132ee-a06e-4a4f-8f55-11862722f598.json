@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-f0b132ee-a06e-4a4f-8f55-11862722f598","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":15,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-enforce-gearbox-route-isolation","time":"2026-09-01T19:37:19.157Z","type":"TASK_HANDOFF_CREATED"}

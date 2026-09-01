@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-7a16daf4-06e6-4935-adb8-22b253c0df4a","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":15,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-correct-cli-skill-config-key","time":"2026-09-01T20:18:49.307Z","type":"TASK_HANDOFF_CREATED"}

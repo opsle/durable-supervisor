@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-634bbecb-c438-4e8c-ab2b-c0519ed12d0b","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":15,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-live-no-unselected-capabilities-proof-v3","time":"2026-09-01T20:22:51.207Z","type":"TASK_HANDOFF_CREATED"}

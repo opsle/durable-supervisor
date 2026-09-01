@@ -6,9 +6,12 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
+  symlinkSync,
 } from 'node:fs';
-import { join, relative } from 'node:path';
+import { homedir } from 'node:os';
+import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { canonicalJson, id, now, readJson, sha256, writeJson } from './io.js';
@@ -45,6 +48,23 @@ const DERIVED_MEASUREMENT_FIELDS = [
   'reduction_ratio',
   'serialized_packet_bytes',
 ];
+const CODEX_DISABLED_FEATURES = Object.freeze([
+  'apps',
+  'browser_use',
+  'browser_use_external',
+  'browser_use_full_cdp_access',
+  'computer_use',
+  'enable_mcp_apps',
+  'image_generation',
+  'in_app_browser',
+  'multi_agent',
+  'multi_agent_v2',
+  'plugin_sharing',
+  'plugins',
+  'recommended_plugins',
+  'remote_plugin',
+  'skill_search',
+]);
 
 export function detachedDormancyContract() {
   return {
@@ -101,7 +121,7 @@ function matchesAuthorized(path, patterns) {
   });
 }
 
-function childPrompt(task, attempt) {
+function legacyChildPromptForMeasurement(task, attempt) {
   return [
     'You are a bounded implementation child, not the repository supervisor.',
     'The structured handoff below is authoritative. Do only this task.',
@@ -130,12 +150,202 @@ function childPrompt(task, attempt) {
   ].join('\n');
 }
 
-function runProcess({ command, args, cwd, stdoutPath, stderrPath, timeoutSeconds, onStart, onHeartbeat }) {
+export function childPrompt(task, attempt) {
+  const route = attempt.policy_snapshot.selected_route;
+  return [
+    'You are a bounded implementation child, not the repository supervisor.',
+    'The structured route-scoped handoff below is authoritative. Do only this task.',
+    'Inspect current repository state first and preserve existing work.',
+    'Return a concise final report with changed files, verification, and unresolved issues.',
+    '',
+    JSON.stringify({
+      bounded_task: {
+        schema: task.schema,
+        task_id: task.task_id,
+        attempt_id: attempt.attempt_id,
+        title: task.title,
+        objective: task.objective,
+        scope: task.scope,
+      },
+      authorization: task.authorization,
+      selected_route: route,
+      required_context: {
+        inputs: task.required_inputs,
+        facts: task.relevant_context,
+      },
+      acceptance_criteria: task.acceptance_criteria,
+      selected_tool_instructions: route.tool_allowlist.map((tool) => ({
+        tool: tool.tool,
+        instructions: tool.instructions ?? [],
+      })),
+    }, null, 2),
+  ].join('\n');
+}
+
+export function promptByteMeasurement(task, attempt) {
+  const legacyBytes = Buffer.byteLength(legacyChildPromptForMeasurement(task, attempt));
+  const isolatedBytes = Buffer.byteLength(childPrompt(task, attempt));
+  return {
+    schema: 'opsle.durable-supervisor.child-prompt-byte-measurement/v1',
+    legacy_full_snapshot_bytes: legacyBytes,
+    isolated_route_scoped_bytes: isolatedBytes,
+    saved_bytes: legacyBytes - isolatedBytes,
+    reduction_ratio: legacyBytes === 0
+      ? null
+      : Number(((legacyBytes - isolatedBytes) / legacyBytes).toFixed(6)),
+  };
+}
+
+function assertIsolatedCodexRoute(route) {
+  if (route?.schema !== 'opsle.durable-supervisor.exact-child-route/v2'
+      || route.provider?.name !== 'codex'
+      || typeof route.provider.model !== 'string'
+      || typeof route.provider.reasoning_effort !== 'string'
+      || route.execution_class !== 'bounded_implementation'
+      || route.selected_tool !== 'none'
+      || !Array.isArray(route.tool_allowlist)
+      || !Array.isArray(route.skill_allowlist)
+      || route.web?.mode !== 'disabled'
+      || !Array.isArray(route.mcp?.server_allowlist)
+      || !Array.isArray(route.plugins?.plugin_allowlist)
+      || route.subagents?.enabled !== false
+      || route.review?.enabled !== false
+      || route.fallback?.enabled !== false
+      || !Array.isArray(route.fallback?.provider_allowlist)) {
+    throw new Error('Codex launch requires an exact Gearbox-selected Codex route');
+  }
+  const denied = [
+    route.tool_allowlist?.length,
+    route.skill_allowlist?.length,
+    route.web?.enabled,
+    route.mcp?.enabled,
+    route.mcp?.server_allowlist?.length,
+    route.plugins?.enabled,
+    route.plugins?.plugin_allowlist?.length,
+    route.subagents?.enabled,
+    route.review?.enabled,
+    route.review?.mode !== 'off',
+    route.review?.reviewer != null,
+    route.fallback?.enabled,
+    route.fallback?.provider_allowlist?.length,
+  ];
+  if (denied.some(Boolean)) {
+    throw new Error('selected Codex route requests unsupported or unisolated capabilities');
+  }
+}
+
+export function prepareIsolatedCodexHome(root, attemptId, {
+  sourceCodexHome = process.env.CODEX_HOME ?? join(homedir(), '.codex'),
+} = {}) {
+  const target = join(paths(root).raw, attemptId, 'codex-home');
+  if (existsSync(target)) throw new Error(`isolated CODEX_HOME already exists: ${attemptId}`);
+  const sourceAuth = resolve(sourceCodexHome, 'auth.json');
+  if (!existsSync(sourceAuth)) {
+    throw new Error('Codex authentication material is unavailable for isolated launch');
+  }
+  mkdirSync(target, { mode: 0o700 });
+  try {
+    symlinkSync(sourceAuth, join(target, 'auth.json'), 'file');
+  } catch (error) {
+    rmSync(target, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    path: target,
+    linked_authentication_files: ['auth.json'],
+    copied_authentication_files: [],
+    excluded_user_configuration: true,
+    excluded_global_skills: true,
+    excluded_global_plugins: true,
+  };
+}
+
+export function codexLaunchSpec(root, task, attempt, {
+  codexHome,
+  lastMessagePath,
+  inheritedEnvironment = process.env,
+} = {}) {
+  const route = attempt.policy_snapshot.selected_route;
+  assertIsolatedCodexRoute(route);
+  const decision = attempt.policy_snapshot.gearbox_decision;
+  if (attempt.policy_snapshot.schema !== 'opsle.durable-supervisor.delegation-policy-snapshot/v3'
+      || decision?.schema !== 'opsle.durable-supervisor.gearbox-decision/v3'
+      || attempt.gearbox_route !== 'codex'
+      || attempt.provider !== 'codex'
+      || attempt.model !== route.provider.model
+      || decision.selected_route !== 'codex'
+      || canonicalJson(decision.selected_route_config) !== canonicalJson(route)
+      || decision.operator_policy_sha256 !== attempt.policy_snapshot.policy_sha256
+      || decision.permitted_capabilities?.commands?.codex?.eligible !== true
+      || !Array.isArray(attempt.policy_snapshot.allowed_providers)
+      || !attempt.policy_snapshot.allowed_providers.includes('codex')
+      || attempt.policy_snapshot.review_mode !== 'off'
+      || attempt.policy_snapshot.reviewer != null
+      || attempt.policy_snapshot.independent_review !== 'none') {
+    throw new Error('Codex policy snapshot does not exactly authorize the selected isolated route');
+  }
+  if (!codexHome || !lastMessagePath) throw new Error('isolated Codex launch paths are required');
+  const command = decision.permitted_capabilities.commands.codex.path;
+  const prompt = childPrompt(task, attempt);
+  const args = [
+    'exec',
+    '--ephemeral',
+    '--ignore-user-config',
+    '--ignore-rules',
+    '--strict-config',
+    '--enable', 'skip_host_skill_discovery',
+    ...CODEX_DISABLED_FEATURES.flatMap((feature) => ['--disable', feature]),
+    '--model', route.provider.model,
+    '-c', `model_reasoning_effort="${route.provider.reasoning_effort}"`,
+    '-c', 'approval_policy="never"',
+    '-c', 'agents.enabled=false',
+    '-c', 'web_search="disabled"',
+    '-c', 'mcp_servers={}',
+    '-c', 'skills.bundled.enabled=false',
+    '-c', 'skills.config=[]',
+    '-c', 'include_apps_instructions=false',
+    '-c', 'include_collaboration_mode_instructions=false',
+    '-c', 'sandbox_workspace_write.network_access=false',
+    '--sandbox', 'workspace-write',
+    '--cd', root,
+    '--json',
+    '--color', 'never',
+    '--output-last-message', lastMessagePath,
+    prompt,
+  ];
+  const environment = { ...inheritedEnvironment, CODEX_HOME: codexHome };
+  return {
+    command,
+    args,
+    environment,
+    audit: {
+      schema: 'opsle.durable-supervisor.codex-isolated-launch/v1',
+      command: [command, ...args.slice(0, -1), '<ROUTE_SCOPED_PROMPT>'],
+      environment: { CODEX_HOME: relative(root, codexHome) },
+      selected_route: route,
+      isolation: {
+        user_config: 'ignored',
+        strict_config: true,
+        mcp_server_allowlist: [],
+        plugin_allowlist: [],
+        skill_allowlist: [],
+        web: 'disabled',
+        subagents: 'disabled',
+        review: 'off',
+        fallback_provider_allowlist: [],
+        workspace_network_access: false,
+      },
+      prompt_bytes: promptByteMeasurement(task, attempt),
+    },
+  };
+}
+
+function runProcess({ command, args, cwd, stdoutPath, stderrPath, timeoutSeconds, onStart, onHeartbeat, env = process.env }) {
   return new Promise((resolvePromise) => {
     const stdout = createWriteStream(stdoutPath, { flags: 'wx', mode: 0o600 });
     const stderr = createWriteStream(stderrPath, { flags: 'wx', mode: 0o600 });
     const started = Date.now();
-    const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout?.pipe(stdout, { end: false });
     child.stderr?.pipe(stderr, { end: false });
     if (Number.isInteger(child.pid)) onStart(child.pid);
@@ -621,52 +831,64 @@ export async function runAttempt(root, task, attempt, claim, {
   const stderrPath = join(rawDirectory, 'stderr.log');
   const lastMessagePath = join(rawDirectory, 'last-message.txt');
   const before = snapshotFiles(root);
-  const policy = attempt.policy_snapshot;
   let command;
   let args;
+  let processEnvironment = process.env;
+  let isolatedCodexHome = null;
   if (attempt.gearbox_route === 'codex') {
-    command = attempt.policy_snapshot.gearbox_decision.discovery.commands.codex.path;
-    args = [
-      'exec',
-      '--model', policy.model,
-      '-c', `model_reasoning_effort="${policy.reasoning_effort}"`,
-      '-c', 'approval_policy="never"',
-      '--sandbox', 'workspace-write',
-      '--cd', root,
-      '--json',
-      '--color', 'never',
-      '--output-last-message', lastMessagePath,
-      childPrompt(task, attempt),
-    ];
+    isolatedCodexHome = prepareIsolatedCodexHome(root, attempt.attempt_id);
+    let launch;
+    try {
+      launch = codexLaunchSpec(root, task, attempt, {
+        codexHome: isolatedCodexHome.path,
+        lastMessagePath,
+      });
+    } catch (error) {
+      rmSync(isolatedCodexHome.path, { recursive: true, force: true });
+      throw error;
+    }
+    command = launch.command;
+    args = launch.args;
+    processEnvironment = launch.environment;
+    attempt.launch_contract = launch.audit;
+    writeJson(attemptPath, attempt);
   } else {
     [command, ...args] = task.deterministic_command;
   }
-  const result = await runProcess({
-    command,
-    args,
-    cwd: root,
-    stdoutPath,
-    stderrPath,
-    timeoutSeconds: task.timeout_seconds,
-    onStart(pid) {
-      attempt.child_state = 'RUNNING';
-      attempt.pid = pid;
-      attempt.started_at = now();
-      attempt.heartbeat_at = now();
-      writeJson(attemptPath, attempt);
-      claim.pid = pid;
-      claim.heartbeat_at = attempt.heartbeat_at;
-      writeJson(join(p.claims, `${claim.claim_id}.json`), claim);
-      emit(root, 'CHILD_STARTED', { task_id: task.task_id, attempt_id: attempt.attempt_id, pid, wait_owner: 'runner-os' });
-    },
-    onHeartbeat(pid) {
-      attempt.heartbeat_at = now();
-      writeJson(attemptPath, attempt);
-      claim.pid = pid;
-      claim.heartbeat_at = attempt.heartbeat_at;
-      writeJson(join(p.claims, `${claim.claim_id}.json`), claim);
-    },
-  });
+  let result;
+  try {
+    result = await runProcess({
+      command,
+      args,
+      cwd: root,
+      env: processEnvironment,
+      stdoutPath,
+      stderrPath,
+      timeoutSeconds: task.timeout_seconds,
+      onStart(pid) {
+        attempt.child_state = 'RUNNING';
+        attempt.pid = pid;
+        attempt.started_at = now();
+        attempt.heartbeat_at = now();
+        writeJson(attemptPath, attempt);
+        claim.pid = pid;
+        claim.heartbeat_at = attempt.heartbeat_at;
+        writeJson(join(p.claims, `${claim.claim_id}.json`), claim);
+        emit(root, 'CHILD_STARTED', { task_id: task.task_id, attempt_id: attempt.attempt_id, pid, wait_owner: 'runner-os' });
+      },
+      onHeartbeat(pid) {
+        attempt.heartbeat_at = now();
+        writeJson(attemptPath, attempt);
+        claim.pid = pid;
+        claim.heartbeat_at = attempt.heartbeat_at;
+        writeJson(join(p.claims, `${claim.claim_id}.json`), claim);
+      },
+    });
+  } finally {
+    if (isolatedCodexHome) {
+      rmSync(isolatedCodexHome.path, { recursive: true, force: true });
+    }
+  }
   const executionPath = join(rawDirectory, 'execution.json');
   const executionEvidence = {
     schema: 'opsle.durable-supervisor.execution-evidence/v1',
@@ -674,6 +896,7 @@ export async function runAttempt(root, task, attempt, claim, {
     attempt_id: attempt.attempt_id,
     execution: {
       command: attempt.gearbox_route === 'deterministic' ? task.deterministic_command : ['codex', 'exec'],
+      launch_contract: attempt.launch_contract ?? null,
       exit_code: result.code,
       signal: result.signal,
       duration_ms: result.duration_ms,
@@ -777,6 +1000,7 @@ export async function runAttempt(root, task, attempt, claim, {
     reduction_ratio: packet.reduction_ratio,
     output_tokens: null,
     cost: null,
+    prompt_bytes: attempt.launch_contract?.prompt_bytes ?? null,
     activation_counts: detached ? {
       evidence: 'detached-runner-no-wait-cell',
       total_automatic: null,

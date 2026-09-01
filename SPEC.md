@@ -22,19 +22,26 @@ A bounded task handoff records:
 - required inputs and relevant context;
 - expected deliverable and evidence;
 - acceptance criteria and prohibited actions;
-- requirement IDs, operator constraints, route hint, and optional deterministic
+- requirement IDs, operator constraints, advisory route hint, and optional deterministic
   and verification commands.
 
-At attempt creation, current discovery, provider/review policy, model settings,
-authorization, Gearbox decision, claim/fence, evidence requirements, and
+At attempt creation, current discovery, provider/review policy, the exact
+Gearbox-selected route, authorization, claim/fence, evidence requirements, and
 acceptance criteria are copied into an immutable historical policy snapshot.
-Later policy changes are prospective.
+The exact route includes provider, model, effort, execution class, an explicit
+selected tool (`none` when no tool is authorized), tool/skill allowlists, and
+web/MCP/plugin/subagent/review/fallback permissions. Later policy
+changes are prospective. Newly created artifacts use exact-route v2, Gearbox
+decision v3, and policy snapshot v3 and fail closed without a valid
+`selected_tool`; immutable v1/v2 snapshots validate against their historical
+contracts.
 
 ## Execution contract
 
 1. Capability Discovery records available commands and sibling revisions.
 2. Operator policy makes disabled providers ineligible.
-3. Gearbox selects an adequate permitted deterministic route or Codex.
+3. Gearbox alone selects an adequate permitted deterministic route or Codex;
+   `route_hint` may be recorded for classification but cannot force selection.
 4. Claim acquisition fails if the task already has an active claim.
 5. The Runner durably registers an explicit bounded wait, establishes detached
    worker ownership, and makes the supervisor logically `DORMANT` before the
@@ -42,6 +49,12 @@ Later policy changes are prospective.
    compatibility flag.
 6. The detached worker's OS process wait, not a supervisor turn or model loop,
    detects completion, failure, or timeout and publishes a terminal event.
+   A tool-none Codex launch must use an attempt-local `CODEX_HOME` containing
+   only an `auth.json` symbolic link to the existing authentication file,
+   ignored user config/rules, strict config, empty allowlists, disabled web/MCP/
+   plugins/subagents/network/review/fallback, suppressed skill/app/collaboration
+   instructions, and the exact selected model and effort. Only route-scoped task
+   fields enter the child prompt.
 7. Raw stdout, stderr, the final child message, execution metadata, and
    verification output are retained as applicable.
 8. Changed paths are compared with the task's `may_modify` envelope.

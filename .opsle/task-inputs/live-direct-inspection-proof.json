@@ -1,0 +1,74 @@
+{
+  "task_id": "task-live-direct-inspection-proof",
+  "title": "Live isolated direct inspection proof",
+  "objective": "Read the exact Codex no-tool route and Runner launch isolation from current source, then return a compact factual report without changing files or invoking any optional capability.",
+  "scope": [
+    "src/pipeline.js exact Codex route fields",
+    "src/runner.js isolated launch controls",
+    "the child's visible route and capability envelope"
+  ],
+  "authorization": {
+    "may": [
+      "read src/pipeline.js and src/runner.js with direct shell, rg, or sed inspection",
+      "read the route-scoped handoff supplied to this child",
+      "report exact observed fields and whether a skill catalog or optional tool routes were advertised"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "modify any file",
+      "invoke web, MCP, plugins, skills, subagents, review, another provider, or fallback",
+      "inspect global user configuration or global capability directories",
+      "push, merge, deploy, install, or send terminal input"
+    ]
+  },
+  "required_inputs": [
+    "src/pipeline.js",
+    "src/runner.js"
+  ],
+  "relevant_context": [
+    "Use direct source inspection only.",
+    "Report the selected provider, model, effort, execution class, selected tool, and every disabled optional capability from the route in your handoff.",
+    "State whether any skill catalog, MCP/plugin route, web route, subagent route, or reviewer route was advertised to you; do not attempt to invoke an unavailable route.",
+    "Keep the final report under 250 words."
+  ],
+  "expected_deliverable": "A compact no-change source inspection report matching the exact route and visible child capability envelope.",
+  "expected_evidence": [
+    "actual isolated child stdout transcript",
+    "actual isolated launch contract",
+    "no changed files",
+    "complete Context Firewall packet",
+    "terminal wake event"
+  ],
+  "acceptance_criteria": [
+    "the child identifies the Codex provider, selected model and effort, bounded implementation class, and selected_tool none",
+    "the child reports empty skill, MCP server, plugin, and fallback allowlists",
+    "the child reports web, subagents, and review disabled",
+    "the child reports whether any unrelated skill catalog or optional route was advertised",
+    "only direct source inspection commands are invoked",
+    "no files change",
+    "Context Firewall is complete_for_decision"
+  ],
+  "prohibited_actions": [
+    "file modification",
+    "optional capability invocation",
+    "provider fallback",
+    "review",
+    "terminal input"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "tool none",
+    "no selected skills",
+    "web disabled",
+    "MCP disabled",
+    "plugins disabled",
+    "subagents disabled",
+    "fallback disabled"
+  ],
+  "requirement_ids": [],
+  "route_hint": "graphify",
+  "timeout_seconds": 600,
+  "expects_changes": false
+}

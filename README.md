@@ -97,13 +97,26 @@ The boundaries are deliberate:
 - Conversational context is a disposable reasoning cache; `.opsle` is runtime
   authority.
 - Capability Discovery records what exists. Operator policy records what may
-  be used. Gearbox selects the simplest adequate permitted route.
+  be used. Gearbox alone selects the simplest adequate permitted route. A task
+  `route_hint` is advisory classification input and cannot force selection.
+- Each Gearbox decision and attempt snapshot preserve one exact child route:
+  provider, model, effort, execution class, tool and skill allowlists, and
+  web/MCP/plugin/subagent/review/fallback permissions. New artifacts use exact
+  route v2, Gearbox decision v3, and policy snapshot v3; historical snapshots
+  retain validation under their immutable schema contract.
 - Every task has bounded authorization, required evidence, acceptance criteria,
   and prohibited actions.
 - Claims and monotonically increasing fence generations prevent an obvious
   duplicate attempt from acquiring the same task concurrently.
 - The detached Runner owns launch, heartbeat, capture, timeout, verification,
   terminal publication, wake creation, and the durable wait transition.
+- A tool-none Codex route runs with an auth-only per-attempt `CODEX_HOME`, ignores
+  user config and rules, uses strict explicit overrides, denies workspace
+  network access, suppresses skill, app, and collaboration instructions, and
+  disables unselected skills, web, MCP, plugins, subagents, review, and provider
+  fallback. Its child prompt omits discovery inventory and
+  carries only the bounded task, authorization, exact route, required context,
+  acceptance criteria, and selected tool instructions.
 - Exact failed-worker reconciliation is generation- and fence-gated, commits the
   Runner failure while preserving an unknown child outcome, then idempotently
   releases the claim as `FAILED`; it never relaunches the rejected task.

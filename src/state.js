@@ -11,6 +11,7 @@ import {
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import {
   appendEvent,
+  canonicalJson,
   fileSha256,
   id,
   now,
@@ -352,6 +353,69 @@ export function validateDurableState(root) {
     const attempt = readJson(join(p.attempts, file));
     if (!VALID_CHILD_STATES.has(attempt.child_state)) errors.push(`invalid child state in ${file}`);
     if (!existsSync(join(p.tasks, `${attempt.task_id}.json`))) errors.push(`orphan attempt ${attempt.attempt_id}`);
+    const snapshot = attempt.policy_snapshot;
+    if (![
+      'opsle.durable-supervisor.delegation-policy-snapshot/v1',
+      'opsle.durable-supervisor.delegation-policy-snapshot/v2',
+      'opsle.durable-supervisor.delegation-policy-snapshot/v3',
+    ].includes(snapshot?.schema)) {
+      errors.push(`invalid policy snapshot schema in ${file}`);
+    } else if (snapshot.schema.endsWith('/v2') || snapshot.schema.endsWith('/v3')) {
+      const route = snapshot.selected_route;
+      const decision = snapshot.gearbox_decision;
+      const currentContract = snapshot.schema.endsWith('/v3');
+      const expectedRouteSchema = currentContract
+        ? 'opsle.durable-supervisor.exact-child-route/v2'
+        : 'opsle.durable-supervisor.exact-child-route/v1';
+      const expectedDecisionSchema = currentContract
+        ? 'opsle.durable-supervisor.gearbox-decision/v3'
+        : 'opsle.durable-supervisor.gearbox-decision/v2';
+      const routeTypeKnown = ['codex', 'deterministic'].includes(decision?.selected_route);
+      const codexToolSelectionValid = decision?.selected_route !== 'codex'
+        || (route?.provider?.name === 'codex'
+          && route?.execution_class === 'bounded_implementation'
+          && (currentContract
+            ? route?.selected_tool === 'none'
+            : route?.selected_tool == null || route?.selected_tool === 'none')
+          && Array.isArray(route?.tool_allowlist)
+          && route?.tool_allowlist.length === 0);
+      const deterministicToolSelectionValid = decision?.selected_route !== 'deterministic'
+        || (route?.provider === null
+          && route?.execution_class === 'deterministic_command'
+          && Array.isArray(route?.tool_allowlist)
+          && route?.tool_allowlist.length === 1
+          && typeof route?.tool_allowlist[0]?.tool === 'string'
+          && (currentContract
+            ? route?.selected_tool === route?.tool_allowlist[0]?.tool
+            : route?.selected_tool == null
+              || route?.selected_tool === route?.tool_allowlist[0]?.tool));
+      if (route?.schema !== expectedRouteSchema
+          || decision?.schema !== expectedDecisionSchema
+          || !routeTypeKnown
+          || canonicalJson(route) !== canonicalJson(decision.selected_route_config)
+          || decision.selected_route !== attempt.gearbox_route
+          || snapshot.policy_sha256 !== decision.operator_policy_sha256
+          || !codexToolSelectionValid
+          || !deterministicToolSelectionValid
+          || !Array.isArray(route.skill_allowlist)
+          || route.web?.enabled !== false
+          || route.web?.mode !== 'disabled'
+          || route.mcp?.enabled !== false
+          || !Array.isArray(route.mcp?.server_allowlist)
+          || route.mcp.server_allowlist.length !== 0
+          || route.plugins?.enabled !== false
+          || !Array.isArray(route.plugins?.plugin_allowlist)
+          || route.plugins.plugin_allowlist.length !== 0
+          || route.subagents?.enabled !== false
+          || route.review?.enabled !== false
+          || route.review?.mode !== 'off'
+          || route.review?.reviewer != null
+          || route.fallback?.enabled !== false
+          || !Array.isArray(route.fallback?.provider_allowlist)
+          || route.fallback.provider_allowlist.length !== 0) {
+        errors.push(`invalid exact selected route in ${file}`);
+      }
+    }
   }
   const wake = join(p.opsle, 'wake');
   const sessionBinding = join(wake, 'codex-session-binding.json');

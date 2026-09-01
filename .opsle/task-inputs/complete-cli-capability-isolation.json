@@ -1,0 +1,92 @@
+{
+  "task_id": "task-complete-cli-capability-isolation",
+  "title": "Complete installed CLI capability isolation",
+  "objective": "Use proven Codex CLI 0.152.0 per-run controls to suppress unselected skill, app, and collaboration instruction surfaces, and version the exact-route contract so new selections fail closed while immutable earlier snapshots remain valid.",
+  "scope": [
+    "Codex per-run skill and instruction isolation flags",
+    "exact route, Gearbox decision, and policy snapshot schema versioning",
+    "backward-compatible immutable-attempt validation",
+    "focused deterministic tests and concise documentation"
+  ],
+  "authorization": {
+    "may": [
+      "inspect the named repository files with direct source and rg commands",
+      "modify the named route, Runner, validation, test, and documentation files",
+      "run the focused route-isolation test"
+    ],
+    "may_modify": [
+      "src/pipeline.js",
+      "src/runner.js",
+      "src/state.js",
+      "tests/gearbox-route-isolation.test.js",
+      "README.md",
+      "ARCHITECTURE.md",
+      "SPEC.md",
+      "docs/OPERATIONS.md",
+      "package.json"
+    ],
+    "may_not": [
+      "modify global configuration, global skills, plugins, Herdr, wake transport, siblings, or .opsle authority",
+      "invoke another provider, review route, web, MCP, plugin, subagent, or fallback",
+      "push, merge, deploy, or install"
+    ]
+  },
+  "required_inputs": [
+    "src/pipeline.js",
+    "src/runner.js",
+    "src/state.js",
+    "tests/gearbox-route-isolation.test.js"
+  ],
+  "relevant_context": [
+    "Installed codex-cli 0.152.0 debug prompt-input proved that skills.enabled=false, skills.include_instructions=false, include_apps_instructions=false, and include_collaboration_mode_instructions=false remove the unselected skill and app catalog from model-visible input.",
+    "features multi_agent and multi_agent_v2 remain disabled, so platform-managed team boilerplate does not expose a callable subagent tool.",
+    "An earlier immutable v2 policy snapshot used exact-child-route/v1 before selected_tool existed; later source reused that schema after adding selected_tool and now invalidates the earlier accepted attempt.",
+    "Version new exact routes, Gearbox decisions, and snapshots. Validate legacy immutable contracts compatibly, while requiring selected_tool fail closed for every newly created route."
+  ],
+  "expected_deliverable": "Per-run model-visible capability suppression plus versioned exact-route contracts that validate immutable history without weakening new-route enforcement.",
+  "expected_evidence": [
+    "source diff",
+    "focused test output",
+    "launch argument assertions for every installed CLI isolation control",
+    "legacy snapshot compatibility and new snapshot fail-closed assertions",
+    "complete Context Firewall packet"
+  ],
+  "acceptance_criteria": [
+    "tool-none Codex launches set skills.enabled=false and skills.include_instructions=false",
+    "tool-none Codex launches set include_apps_instructions=false and include_collaboration_mode_instructions=false",
+    "apps, plugins, skill search, multi_agent, and multi_agent_v2 remain disabled",
+    "new routes use incremented exact route, Gearbox decision, and policy snapshot schemas and require selected_tool",
+    "immutable earlier v1 exact-route snapshots validate under their historical contract",
+    "missing or invalid selected_tool fails validation for every newly created route",
+    "focused route-isolation tests pass",
+    "no unexpected files change"
+  ],
+  "prohibited_actions": [
+    "external capabilities",
+    "provider fallback",
+    "review",
+    "wake changes",
+    "global changes"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "tool none",
+    "web disabled",
+    "MCP disabled",
+    "plugins disabled",
+    "subagents disabled",
+    "fallback disabled"
+  ],
+  "requirement_ids": [],
+  "route_hint": "graphify",
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/gearbox-route-isolation.test.js"
+  ],
+  "timeout_seconds": 900,
+  "expects_changes": true
+}

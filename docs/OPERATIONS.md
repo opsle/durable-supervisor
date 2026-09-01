@@ -266,6 +266,33 @@ supervisor remains evaluable. After `task evaluate` records `ACCEPTED` or
 
 ## Inspect or change policy
 
+Before launching a model child, inspect the task and then the created attempt.
+The Gearbox decision's `selected_route_config` and the policy snapshot's
+`selected_route` must be byte-equivalent exact routes. `classification_inputs`
+may record `route_hint`, but its authority is `advisory_only`.
+
+A tool-none Codex exact route records `selected_tool: none`. Its attempt records
+`launch_contract` with the reviewed argv,
+attempt-local `CODEX_HOME` path (never auth contents), empty skill/MCP/plugin/
+fallback allowlists, web and subagents disabled, review off, denied workspace
+network, and prompt byte measurement. The temporary home contains only an
+`auth.json` symbolic link, never copied credential bytes; Runner removes that
+link and directory after the Codex process terminates. Any route/snapshot mismatch, missing
+auth material, unknown CLI config, requested unselected capability, or disabled
+provider stops launch.
+
+New selections are exact-route v2 inside Gearbox decision v3 and policy snapshot
+v3. The launch explicitly sets `skills.bundled.enabled=false`,
+`include_apps_instructions=false`, `agents.enabled=false`, and
+`include_collaboration_mode_instructions=false`. Validation continues to accept
+immutable snapshot v1/v2 artifacts under their historical contracts.
+
+Run the deterministic route fixture without invoking a provider:
+
+```bash
+npm run test:route-isolation
+```
+
 ```bash
 ./bin/opsle.js policy status
 ./bin/opsle.js models status

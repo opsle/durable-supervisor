@@ -53,9 +53,9 @@ path controls how much execution detail enters the next decision.
 | Authorization | `may`, `may_modify`, and `may_not` fields in every durable task handoff and attempt policy snapshot. |
 | Verifiable handoff | Task JSON is authoritative input; completion JSON distinguishes claim, deterministic observations, unknowns, provenance, and evidence references. |
 | Capability Discovery | Deterministic executable and sibling-revision discovery in `src/pipeline.js`. Presence does not imply permission or integration. |
-| Gearbox | A local, inspectable routing adapter chooses a predeclared deterministic command when adequate, otherwise an enabled Codex route. Disabled providers are ineligible. |
+| Gearbox | A local, inspectable routing adapter is the sole selector. It chooses a predeclared deterministic command when adequate, otherwise an enabled Codex route. `route_hint` is advisory only. Disabled providers are ineligible. The v3 decision contains an exact-route v2 contract with provider/model/effort, execution class, an explicit selected tool (`none` for tool-free Codex), tool and skill allowlists, and web/MCP/plugin/subagent/review/fallback permissions. Snapshot v3 requires this contract; immutable snapshot v1/v2 artifacts retain historical validation. |
 | Claims/fencing | One active task claim with a monotonically increasing fence generation; conflicting acquisition fails closed. |
-| Runner | `src/runner.js` defaults to a detached repository-local worker. A durable PID/nonce/fence handshake completes before the launcher returns; the worker then owns child PID, heartbeat, timeout, evidence, verification, Context Firewall, Acceptance, claim release, pause-after-current, terminal event, and wake creation. |
+| Runner | `src/runner.js` defaults to a detached repository-local worker. A durable PID/nonce/fence handshake completes before the launcher returns; the worker enforces the exact snapshotted route, then owns child PID, heartbeat, timeout, evidence, verification, Context Firewall, Acceptance, claim release, pause-after-current, terminal event, and wake creation. |
 | Event-driven wakeup | `src/wakeup.js` queues only terminal/intervention events and maintains one persistent detached provider-free dispatcher. Observation is registered before the receipt-free scan. Requests have no expiry and never bind a frontend. Stale/evaluated requests are obsolete without byte mutation. Session validation, activation leases, per-event decision CAS, receipts, consumption, and telemetry are durable and idempotent. Heartbeat and nonterminal progress remain ineligible. |
 | Supervisor/session boundary | Durable supervisor identity is separate from `codex-session-binding/v2`, which binds repository, generation, Codex UUID, rollout metadata/inode, CLI version, UID, and exact authoritative Herdr process/workspace/pane/terminal facts. A live old tmux authority invalidates the binding. Normal dispatch uses only plain Codex resume; Herdr and tmux input APIs remain unused. |
 | Context Firewall | A local reducer creates a bounded packet with completeness, measured bytes, changed-file scope, verification result, hashes, and raw references. |
@@ -73,6 +73,19 @@ and evidence provide reconstructable history.
 
 README prose and model context are not parsed to recover authority. Raw child
 transcripts are evidence artifacts, not routine supervisor input.
+
+For a tool-none Codex child, Runner creates an attempt-local home containing only
+an `auth.json` symbolic link to the existing authentication file, sets it as
+`CODEX_HOME`, and deletes the link and directory after process termination.
+The CLI launch uses `--ephemeral`, `--ignore-user-config`, `--ignore-rules`, and
+`--strict-config`; empty allowlists and disabled feature/config overrides remove
+global skills, skill/app/collaboration instructions, web, MCP, plugins,
+subagents, and workspace network access. The
+exact model and effort are command-line overrides, review stays off, and the
+route records `selected_tool: none` and contains no fallback provider. The
+durable launch contract records argv, non-secret environment identity, all
+denials, and old-versus-isolated prompt bytes. Authentication bytes never enter
+that contract.
 
 Supervisor and child lifecycles are independent:
 

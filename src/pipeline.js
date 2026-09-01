@@ -89,9 +89,6 @@ function validateArgv(value, field) {
 export function validateTaskCommands(task) {
   validateArgv(task.deterministic_command, 'deterministic_command');
   validateArgv(task.verification_command, 'verification_command');
-  if (task.route_hint === 'deterministic' && task.deterministic_command == null) {
-    throw new Error('deterministic route requires deterministic_command argv');
-  }
   return task;
 }
 
@@ -194,15 +191,49 @@ export function routeTask(root, task) {
     eligible: permitted.commands.claude.eligible,
     reason: permitted.commands.claude.rejected_reason,
   });
-  let selected;
-  if (task.route_hint === 'deterministic' || (task.deterministic_command && task.route_hint !== 'codex')) {
-    selected = considered.find((item) => item.route === 'deterministic' && item.eligible);
-  } else {
-    selected = considered.find((item) => item.route === 'codex' && item.eligible);
-  }
+  // route_hint is advisory classification input only. Adequacy, discovery, and
+  // policy determine the route; a hint can neither force nor veto selection.
+  const selected = task.deterministic_command
+    ? considered.find((item) => item.route === 'deterministic' && item.eligible)
+    : considered.find((item) => item.route === 'codex' && item.eligible);
   if (!selected) throw new Error('no authorized, available, policy-permitted Gearbox route');
+  const selectedRoute = selected.route === 'deterministic' ? {
+    schema: 'opsle.durable-supervisor.exact-child-route/v2',
+    provider: null,
+    execution_class: 'deterministic_command',
+    selected_tool: 'deterministic-command',
+    tool_allowlist: [{
+      tool: 'deterministic-command',
+      command: task.deterministic_command[0],
+      argv: task.deterministic_command,
+    }],
+    skill_allowlist: [],
+    web: { enabled: false, mode: 'disabled' },
+    mcp: { enabled: false, server_allowlist: [] },
+    plugins: { enabled: false, plugin_allowlist: [] },
+    subagents: { enabled: false },
+    review: { enabled: false, mode: 'off', reviewer: null },
+    fallback: { enabled: false, provider_allowlist: [] },
+  } : {
+    schema: 'opsle.durable-supervisor.exact-child-route/v2',
+    provider: {
+      name: 'codex',
+      model: policy.providers.codex.model,
+      reasoning_effort: policy.providers.codex.reasoning_effort,
+    },
+    execution_class: 'bounded_implementation',
+    selected_tool: 'none',
+    tool_allowlist: [],
+    skill_allowlist: [],
+    web: { enabled: false, mode: 'disabled' },
+    mcp: { enabled: false, server_allowlist: [] },
+    plugins: { enabled: false, plugin_allowlist: [] },
+    subagents: { enabled: false },
+    review: { enabled: false, mode: 'off', reviewer: null },
+    fallback: { enabled: false, provider_allowlist: [] },
+  };
   const decision = {
-    schema: 'opsle.durable-supervisor.gearbox-decision/v1',
+    schema: 'opsle.durable-supervisor.gearbox-decision/v3',
     decision_id: id('gearbox'),
     task_id: task.task_id,
     classified_work: task.deterministic_command ? 'bounded_command_or_implementation' : 'bounded_implementation',
@@ -211,6 +242,12 @@ export function routeTask(root, task) {
     considered_routes: considered,
     selected_route: selected.route,
     selected_capability: selected.capability,
+    selected_route_config: selectedRoute,
+    classification_inputs: {
+      route_hint: task.route_hint,
+      route_hint_authority: 'advisory_only',
+      deterministic_command_present: Boolean(task.deterministic_command),
+    },
     rationale: selected.route === 'deterministic'
       ? 'A predeclared deterministic command is adequate and authorized.'
       : 'The task requires bounded repository implementation judgment; Codex is available and enabled.',
@@ -291,12 +328,42 @@ export function createAttempt(root, task, gearbox, claimFactory = acquireClaim) 
   }
   const p = paths(root);
   const policy = readJson(p.policy);
+  const selectedRoute = gearbox.selected_route_config;
+  if (gearbox.schema !== 'opsle.durable-supervisor.gearbox-decision/v3'
+      || selectedRoute?.schema !== 'opsle.durable-supervisor.exact-child-route/v2'
+      || gearbox.operator_policy_sha256 !== policyHash(root)) {
+    throw new Error('Gearbox decision lacks a current exact selected route');
+  }
+  if (gearbox.selected_route === 'codex') {
+    if (!policy.providers.codex.enabled
+        || selectedRoute.provider?.name !== 'codex'
+        || selectedRoute.provider.model !== policy.providers.codex.model
+        || selectedRoute.provider.reasoning_effort !== policy.providers.codex.reasoning_effort
+        || selectedRoute.execution_class !== 'bounded_implementation'
+        || selectedRoute.selected_tool !== 'none'
+        || !Array.isArray(selectedRoute.tool_allowlist)
+        || selectedRoute.tool_allowlist.length !== 0) {
+      throw new Error('Gearbox Codex route is not permitted by current operator policy');
+    }
+  } else if (gearbox.selected_route === 'deterministic') {
+    const selectedCommandTool = selectedRoute.tool_allowlist?.[0];
+    if (selectedRoute.provider !== null
+        || selectedRoute.execution_class !== 'deterministic_command'
+        || selectedRoute.tool_allowlist?.length !== 1
+        || typeof selectedCommandTool?.tool !== 'string'
+        || selectedRoute.selected_tool !== selectedCommandTool?.tool
+        || JSON.stringify(selectedCommandTool?.argv) !== JSON.stringify(task.deterministic_command)) {
+      throw new Error('Gearbox deterministic route does not exactly match the task command');
+    }
+  } else {
+    throw new Error(`unsupported Gearbox selected route: ${gearbox.selected_route}`);
+  }
   const supervisor = readJson(p.supervisor);
   const attemptNumber = task.attempts.length + 1;
   const attemptId = `${task.task_id}-attempt-${String(attemptNumber).padStart(3, '0')}`;
   const claim = claimFactory(root, task, attemptId);
   const snapshot = {
-    schema: 'opsle.durable-supervisor.delegation-policy-snapshot/v1',
+    schema: 'opsle.durable-supervisor.delegation-policy-snapshot/v3',
     task_id: task.task_id,
     attempt_id: attemptId,
     parent_objective_id: task.parent_objective_id,
@@ -307,6 +374,7 @@ export function createAttempt(root, task, gearbox, claimFactory = acquireClaim) 
     model: gearbox.selected_route === 'codex' ? policy.providers.codex.model : null,
     reasoning_effort: gearbox.selected_route === 'codex' ? policy.providers.codex.reasoning_effort : null,
     gearbox_decision: gearbox,
+    selected_route: structuredClone(gearbox.selected_route_config),
     allowed_providers: Object.entries(policy.providers).filter(([, value]) => value.enabled).map(([name]) => name),
     review_mode: policy.review.mode,
     reviewer: policy.review.reviewer,
