@@ -10,9 +10,13 @@ import {
   watch,
 } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
+import {
+  CODEX_RESUME_CONFIRMATION_TIMEOUT_MS,
+  CODEX_RESUME_WORST_CASE_CLEANUP_TIMEOUT_MS,
+} from './codex-resume-transport.js';
 import {
   atomicCreateJson,
   atomicCompareAndSwapJson,
@@ -31,9 +35,15 @@ const WAKE_REQUEST_SCHEMA = 'opsle.durable-supervisor.host-wake-request/v1';
 const NATIVE_WAKE_REQUEST_SCHEMA = 'opsle.durable-supervisor.native-wake-request/v2';
 const DELIVERY_SCHEMA = 'opsle.durable-supervisor.host-wake-delivery/v1';
 const DISPATCHER_SCHEMA = 'opsle.durable-supervisor.host-wake-dispatcher/v1';
-export const CODEX_SESSION_BINDING_SCHEMA = 'opsle.durable-supervisor.codex-session-binding/v1';
+export const CODEX_SESSION_BINDING_SCHEMA = 'opsle.durable-supervisor.codex-session-binding/v2';
 export const ACTIVATION_LEASE_SCHEMA = 'opsle.durable-supervisor.activation-lease/v1';
 export const ACTIVATION_DECISION_SCHEMA = 'opsle.durable-supervisor.activation-decision/v1';
+export const CODEX_RESUME_HELPER_TIMEOUT_MS = (
+  CODEX_RESUME_CONFIRMATION_TIMEOUT_MS
+  + CODEX_RESUME_WORST_CASE_CLEANUP_TIMEOUT_MS
+  + 5_000
+);
+export const ACTIVATION_LEASE_TTL_MS = CODEX_RESUME_HELPER_TIMEOUT_MS + 45_000;
 
 export const TERMINAL_WAKE_TYPES = Object.freeze(new Set([
   'child-completed',
@@ -156,6 +166,16 @@ function sameProcess(left, right) {
     && left.executable === right.executable;
 }
 
+function positiveSortedProcessGroups(values, { allowEmpty = false } = {}) {
+  return Array.isArray(values)
+    && (allowEmpty || values.length > 0)
+    && values.every((value, index) => (
+      Number.isSafeInteger(value)
+      && value > 0
+      && (index === 0 || values[index - 1] < value)
+    ));
+}
+
 export function processIdentity(pid, procRoot = '/proc') {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   try {
@@ -263,6 +283,14 @@ function installedCodexVersion(run = spawnSync) {
   return `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().split('\n')[0] || null;
 }
 
+function legacyTmuxAuthority(sessionName, run = spawnSync) {
+  if (typeof sessionName !== 'string' || !sessionName) return false;
+  const result = run('tmux', [
+    'display-message', '-p', '-t', sessionName, '#{session_name}',
+  ], { encoding: 'utf8' });
+  return result.status === 0 && result.stdout.trim() === sessionName;
+}
+
 function bindingDependencies(overrides = {}) {
   return {
     realpath: overrides.realpath ?? realpathSync,
@@ -270,9 +298,9 @@ function bindingDependencies(overrides = {}) {
     processIdentity: overrides.processIdentity ?? processIdentity,
     rolloutMeta: overrides.rolloutMeta ?? rolloutSessionMeta,
     sessionCandidates: overrides.sessionCandidates ?? sessionCandidates,
-    tmuxIdentity: overrides.tmuxIdentity ?? tmuxPaneIdentity,
     codexVersion: overrides.codexVersion ?? installedCodexVersion,
     uid: overrides.uid ?? (() => process.getuid?.() ?? null),
+    legacyTmuxAuthority: overrides.legacyTmuxAuthority ?? legacyTmuxAuthority,
   };
 }
 
@@ -289,25 +317,22 @@ function validateSessionBindingShape(binding) {
       || !Number.isSafeInteger(binding.rollout?.inode)
       || typeof binding.sessions_root_realpath !== 'string'
       || typeof binding.codex_cli_version !== 'string'
-      || !validProcessIdentity(binding.host_process)
-      || !validProcessIdentity(binding.writer_process)
       || !Number.isSafeInteger(binding.uid)
-      || typeof binding.tmux?.session_name !== 'string'
-      || !/^%\d+$/.test(binding.tmux?.pane_id ?? '')
-      || !Number.isSafeInteger(binding.tmux?.pane_pid)
-      || typeof binding.tmux?.pane_tty !== 'string'
-      || !['standalone-embedded-writer', 'shared-app-server'].includes(binding.writer_topology?.kind)) {
+      || typeof binding.binding_id !== 'string'
+      || binding.host?.kind !== 'herdr'
+      || binding.host?.authority !== 'authoritative'
+      || !validProcessIdentity(binding.host?.process)
+      || typeof binding.host?.workspace_id !== 'string'
+      || binding.host?.workspace_cwd !== binding.repository_realpath
+      || typeof binding.host?.pane_id !== 'string'
+      || typeof binding.host?.terminal_id !== 'string'
+      || typeof binding.authority_fence?.legacy_tmux_session !== 'string') {
     throw new Error('incomplete Codex session binding');
   }
-  if (binding.writer_topology.kind === 'standalone-embedded-writer') {
-    if (binding.native_wake?.supported !== false
-        || binding.native_wake?.transport !== 'codex-resume-message') {
-      throw new Error('standalone embedded writer must fail closed for native resume');
-    }
-  } else if (binding.native_wake?.supported !== true
-      || binding.native_wake?.transport !== 'shared-app-server-rpc'
-      || !/^[a-f0-9]{64}$/.test(binding.native_wake?.proof_sha256 ?? '')) {
-    throw new Error('shared app-server binding requires explicit native wake proof');
+  if (binding.native_wake?.supported !== true
+      || binding.native_wake?.transport !== 'plain-codex-resume'
+      || binding.native_wake?.confirmation !== 'bound-rollout-exact-message-and-turn-began') {
+    throw new Error('Herdr binding requires canonical plain Codex resume transport');
   }
   return binding;
 }
@@ -317,11 +342,11 @@ export function createCodexSessionBinding(root, {
   rolloutPath,
   sessionsRoot,
   hostPid,
-  writerPid,
-  tmuxSession,
-  tmuxPane,
-  topology = 'standalone-embedded-writer',
-  nativeProofSha256 = null,
+  workspaceId,
+  workspaceCwd,
+  paneId,
+  terminalId,
+  legacyTmuxSession = null,
 }, dependencyOverrides = {}) {
   const deps = bindingDependencies(dependencyOverrides);
   const p = paths(root);
@@ -332,29 +357,33 @@ export function createCodexSessionBinding(root, {
   const rollout = deps.stat(rolloutRealpath);
   const meta = deps.rolloutMeta(rolloutRealpath);
   const hostProcess = deps.processIdentity(Number(hostPid));
-  const writerProcess = deps.processIdentity(Number(writerPid));
-  const tmux = deps.tmuxIdentity(tmuxSession, tmuxPane);
   const cliVersion = deps.codexVersion();
   const uid = deps.uid();
-  if (!hostProcess || !writerProcess || !tmux || !cliVersion || !Number.isSafeInteger(uid)) {
-    throw new Error('session binding probes did not produce exact process, tmux, CLI, and UID facts');
+  const fencedTmuxSession = legacyTmuxSession ?? supervisor.session_id;
+  if (!hostProcess || !cliVersion || !Number.isSafeInteger(uid)) {
+    throw new Error('session binding probes did not produce exact Herdr process, CLI, and UID facts');
   }
   if (meta.session_id !== sessionId || meta.repository !== repositoryRealpath) {
     throw new Error('rollout session_meta does not match the explicit session and repository');
   }
-  if (hostProcess.uid !== uid || writerProcess.uid !== uid || hostProcess.tty !== tmux.pane_tty) {
-    throw new Error('Codex process UID/TTY does not match the authoritative tmux pane');
+  if (hostProcess.uid !== uid) {
+    throw new Error('Herdr Codex process UID does not match the binding owner');
   }
   const candidates = deps.sessionCandidates(sessionsRootRealpath, sessionId);
   if (candidates.length !== 1 || candidates[0] !== rolloutRealpath) {
     throw new Error(`Codex session binding requires one exact rollout candidate; observed ${candidates.length}`);
   }
-  const shared = topology === 'shared-app-server';
-  if (shared && !/^[a-f0-9]{64}$/.test(nativeProofSha256 ?? '')) {
-    throw new Error('shared app-server topology requires an exact controlled proof hash');
+  if (workspaceCwd !== repositoryRealpath) {
+    throw new Error('Herdr workspace CWD must equal the repository realpath');
   }
+  if (deps.legacyTmuxAuthority(fencedTmuxSession)) {
+    throw new Error('old tmux supervisor authority is still live');
+  }
+  const oldPath = wakePaths(root).sessionBinding;
+  const supersedes = existsSync(oldPath) ? fileSha256(oldPath) : null;
   return validateSessionBindingShape({
     schema: CODEX_SESSION_BINDING_SCHEMA,
+    binding_id: id('codex-session-binding'),
     repository_realpath: repositoryRealpath,
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
@@ -372,34 +401,34 @@ export function createCodexSessionBinding(root, {
     },
     sessions_root_realpath: sessionsRootRealpath,
     codex_cli_version: cliVersion,
-    host_process: hostProcess,
-    writer_process: writerProcess,
     uid,
-    tmux,
-    writer_topology: {
-      kind: topology,
-      host_pid: hostProcess.pid,
-      writer_pid: writerProcess.pid,
+    host: {
+      kind: 'herdr',
+      authority: 'authoritative',
+      workspace_id: workspaceId,
+      workspace_cwd: workspaceCwd,
+      pane_id: paneId,
+      terminal_id: terminalId,
+      process: hostProcess,
     },
-    native_wake: shared ? {
+    authority_fence: {
+      legacy_tmux_session: fencedTmuxSession,
+      legacy_tmux_absent_at_bind: true,
+    },
+    native_wake: {
       supported: true,
-      transport: 'shared-app-server-rpc',
-      proof_sha256: nativeProofSha256,
+      transport: 'plain-codex-resume',
+      confirmation: 'bound-rollout-exact-message-and-turn-began',
       reason: null,
-    } : {
-      supported: false,
-      transport: 'codex-resume-message',
-      proof_sha256: null,
-      reason: 'codex-0.151.0-standalone-embedded-writer-lock',
     },
-    adoptions: [],
+    supersedes_binding_sha256: supersedes,
     bound_at: now(),
   });
 }
 
 export function codexSessionBindingStatus(root, {
   binding = null,
-  allowGenerationMismatch = false,
+  ignoreSupersession = false,
   dependencies = {},
 } = {}) {
   const deps = bindingDependencies(dependencies);
@@ -414,11 +443,15 @@ export function codexSessionBindingStatus(root, {
   try { repositoryRealpath = deps.realpath(root); } catch { reasons.push('repository-realpath-unavailable'); }
   if (record.repository_realpath !== repositoryRealpath) reasons.push('repository-mismatch');
   if (record.supervisor_id !== supervisor.supervisor_id) reasons.push('supervisor-identity-mismatch');
-  if (!allowGenerationMismatch && record.supervisor_generation !== supervisor.generation) reasons.push('supervisor-generation-stale');
+  if (record.supervisor_generation !== supervisor.generation) reasons.push('supervisor-generation-stale');
   if (deps.codexVersion() !== record.codex_cli_version) reasons.push('codex-cli-version-mismatch');
   if (deps.uid() !== record.uid) reasons.push('uid-mismatch');
-  if (!exactProcess(record.host_process, deps.processIdentity(record.host_process.pid))) reasons.push('host-process-dead-or-reused');
-  if (!exactProcess(record.writer_process, deps.processIdentity(record.writer_process.pid))) reasons.push('writer-process-dead-reused-or-topology-changed');
+  if (!exactProcess(record.host.process, deps.processIdentity(record.host.process.pid))) {
+    reasons.push('herdr-host-process-dead-or-reused');
+  }
+  if (deps.legacyTmuxAuthority(record.authority_fence.legacy_tmux_session)) {
+    reasons.push('old-tmux-authority-live');
+  }
   let rolloutRealpath = null;
   try { rolloutRealpath = deps.realpath(record.rollout.realpath); } catch { reasons.push('rollout-missing'); }
   if (rolloutRealpath && rolloutRealpath !== record.rollout.realpath) reasons.push('rollout-realpath-mismatch');
@@ -446,16 +479,13 @@ export function codexSessionBindingStatus(root, {
   } catch {
     reasons.push('rollout-candidate-scan-failed');
   }
-  const tmux = deps.tmuxIdentity(record.tmux.session_name, record.tmux.pane_id);
-  if (canonicalJson(tmux) !== canonicalJson(record.tmux)) reasons.push('tmux-pane-session-tty-mismatch');
-  if (record.host_process.tty !== record.tmux.pane_tty
-      || record.writer_topology.host_pid !== record.host_process.pid
-      || record.writer_topology.writer_pid !== record.writer_process.pid) {
-    reasons.push('writer-topology-mismatch');
+  if (!ignoreSupersession && binding && existsSync(wakePaths(root).sessionBinding)) {
+    const current = readOptional(wakePaths(root).sessionBinding);
+    if (current?.binding_id !== record.binding_id) reasons.push('session-binding-superseded');
   }
   if (reasons.length) return { classification: 'stale', valid: false, supported: false, reasons, binding: record };
   return {
-    classification: record.native_wake.supported ? 'bound-supported' : 'bound-unsupported',
+    classification: 'bound-authoritative-herdr',
     valid: true,
     supported: record.native_wake.supported,
     reason: record.native_wake.reason,
@@ -465,7 +495,11 @@ export function codexSessionBindingStatus(root, {
 
 export function bindCodexSession(root, input, options = {}) {
   const binding = createCodexSessionBinding(root, input, options.dependencies);
-  const status = codexSessionBindingStatus(root, { binding, dependencies: options.dependencies });
+  const status = codexSessionBindingStatus(root, {
+    binding,
+    ignoreSupersession: true,
+    dependencies: options.dependencies,
+  });
   if (!status.valid) throw new Error(`Codex session binding validation failed: ${status.reasons.join(', ')}`);
   writeJson(directories(root).sessionBinding, binding);
   return status;
@@ -474,26 +508,11 @@ export function bindCodexSession(root, input, options = {}) {
 export function adoptCodexSessionBinding(root, { dependencies = {} } = {}) {
   const path = directories(root).sessionBinding;
   const binding = readJson(path);
-  const status = codexSessionBindingStatus(root, {
-    binding,
-    allowGenerationMismatch: true,
-    dependencies,
-  });
-  if (!status.valid) throw new Error(`stale Codex session binding cannot be adopted: ${status.reasons.join(', ')}`);
+  const status = codexSessionBindingStatus(root, { binding, dependencies });
+  if (!status.valid) throw new Error(`stale Codex session binding must be replaced: ${status.reasons.join(', ')}`);
   const supervisor = readJson(paths(root).supervisor);
   if (binding.supervisor_generation === supervisor.generation) return { adopted: false, binding, status };
-  binding.adoptions.push({
-    from_generation: binding.supervisor_generation,
-    to_generation: supervisor.generation,
-    adopted_at: now(),
-  });
-  binding.supervisor_generation = supervisor.generation;
-  writeJson(path, binding);
-  return {
-    adopted: true,
-    binding,
-    status: codexSessionBindingStatus(root, { binding, dependencies }),
-  };
+  throw new Error('generation drift requires a fresh authoritative Herdr session binding');
 }
 
 function activationDecisionPath(root, eventId) {
@@ -515,7 +534,7 @@ function leaseExpired(lease, nowMs) {
 
 export function acquireActivationLease(root, eventId, {
   dispatcher = null,
-  ttlMs = 30_000,
+  ttlMs = ACTIVATION_LEASE_TTL_MS,
   nowMs = Date.now(),
   getProcessIdentity = processIdentity,
 } = {}) {
@@ -595,20 +614,31 @@ export function releaseActivationLease(root, lease, { nowMs = Date.now() } = {})
     : { released: false, reason: cas.reason };
 }
 
-function decisionFenceCurrent(root, lease) {
+export function decisionFenceCurrent(root, lease, { nowMs = Date.now() } = {}) {
   const supervisor = readJson(paths(root).supervisor);
   const current = readOptional(directories(root).activationLease);
-  return current?.schema === ACTIVATION_LEASE_SCHEMA
+  return Number.isFinite(nowMs)
+    && current?.schema === ACTIVATION_LEASE_SCHEMA
     && current.status === 'OWNED'
+    && current.expires_at === lease?.expires_at
+    && !leaseExpired(current, nowMs)
     && current.lease_id === lease?.lease_id
     && current.fencing_token === lease?.fencing_token
     && current.event_id === lease?.event_id
+    && current.supervisor_id === lease?.supervisor_id
+    && current.supervisor_generation === lease?.supervisor_generation
     && current.supervisor_id === supervisor.supervisor_id
-    && current.supervisor_generation === supervisor.generation;
+    && current.supervisor_generation === supervisor.generation
+    && current.owner?.dispatcher_id === lease?.owner?.dispatcher_id
+    && current.owner?.dispatcher_generation === lease?.owner?.dispatcher_generation
+    && sameProcess(current.owner?.process, lease?.owner?.process);
 }
 
-export function claimActivationDecision(root, eventId, lease, { message = null } = {}) {
-  if (!decisionFenceCurrent(root, lease)) {
+export function claimActivationDecision(root, eventId, lease, {
+  message = null,
+  nowMs = Date.now(),
+} = {}) {
+  if (!decisionFenceCurrent(root, lease, { nowMs })) {
     return { claimed: false, classification: 'stale-generation', reason: 'activation-lease-fence-no-longer-current' };
   }
   const request = readJson(requestPath(root, eventId));
@@ -633,6 +663,23 @@ export function claimActivationDecision(root, eventId, lease, { message = null }
   };
   const path = activationDecisionPath(root, eventId);
   if (atomicCreateJson(path, decision)) return { claimed: true, duplicate: false, decision };
+  const current = readJson(path);
+  if (current.status === 'BUSY' && decisionFenceCurrent(root, lease)) {
+    const expected = sha256(canonicalJson(current));
+    decision.prior_attempts = [
+      ...(Array.isArray(current.prior_attempts) ? current.prior_attempts : []),
+      {
+        decision_id: current.decision_id,
+        lease_id: current.lease_id,
+        fencing_token: current.fencing_token,
+        status: current.status,
+        claimed_at: current.claimed_at,
+        failure: current.failure,
+      },
+    ];
+    const cas = atomicCompareAndSwapJson(path, expected, decision);
+    if (cas.swapped) return { claimed: true, duplicate: false, retry: true, decision };
+  }
   return {
     claimed: false,
     duplicate: true,
@@ -665,7 +712,7 @@ export function constructWakeMessage(eventId, generation) {
   if (typeof eventId !== 'string' || !eventId || !Number.isSafeInteger(generation) || generation <= 0) {
     throw new Error('wake message requires event ID and positive supervisor generation');
   }
-  return `OPSLE_WAKE v1 event=${eventId} gen=${generation}; read durable repository state.`;
+  return `OPSLE_WAKE v1 event=${eventId} gen=${generation}; read durable state.`;
 }
 
 export function classifyQueuedWake(root, request, supervisor = readJson(paths(root).supervisor)) {
@@ -689,6 +736,13 @@ export function classifyQueuedWake(root, request, supervisor = readJson(paths(ro
   }
   if (existsSync(activationDecisionPath(root, request.event_id))) {
     const decision = readJson(activationDecisionPath(root, request.event_id));
+    if (decision.status === 'BUSY') {
+      return {
+        classification: 'queued',
+        reason: 'awaiting-supported-native-transport',
+        prior_decision: decision,
+      };
+    }
     return {
       classification: decision.status === 'DELIVERED' ? 'duplicate' : 'queued',
       reason: `activation-decision-${decision.status.toLowerCase()}`,
@@ -827,15 +881,62 @@ function readOptional(path) {
   return existsSync(path) ? readJson(path) : null;
 }
 
-function validateDeliveryFence(root, eventId, expectedQueueVersion, dispatcher) {
+export function plainCodexResumeTransport({
+  run = spawnSync,
+  helper = fileURLToPath(new URL('../bin/opsle-codex-resume.js', import.meta.url)),
+} = {}) {
+  return {
+    kind: 'plain-codex-resume',
+    resume({ session_id: sessionId, message, binding }) {
+      const result = run(process.execPath, [
+        helper,
+        '--session', sessionId,
+        '--message', message,
+        '--rollout', binding.rollout.realpath,
+        '--host-pid', String(binding.host.process.pid),
+        '--host-start', binding.host.process.start_time_ticks,
+        '--host-executable', binding.host.process.executable,
+      ], {
+        encoding: 'utf8',
+        maxBuffer: 256 * 1024,
+        timeout: CODEX_RESUME_HELPER_TIMEOUT_MS,
+      });
+      if (result.error) {
+        return {
+          classification: 'uncertain',
+          reason: `resume-helper-outcome-uncertain: ${result.error.message}`,
+        };
+      }
+      try {
+        const parsed = JSON.parse(result.stdout.trim());
+        if (!parsed || typeof parsed.classification !== 'string') throw new Error('missing classification');
+        return parsed;
+      } catch (error) {
+        return {
+          classification: 'uncertain',
+          reason: `resume-helper-result-invalid: ${error.message}`,
+        };
+      }
+    },
+  };
+}
+
+function validateDeliveryFence(root, eventId, expected, dispatcher) {
   const request = readJson(requestPath(root, eventId));
   const supervisor = readJson(paths(root).supervisor);
+  if (supervisor.supervisor_id !== expected.supervisorId
+      || supervisor.generation !== expected.supervisorGeneration) {
+    return { current: false, reason: 'supervisor-delivery-fence-changed' };
+  }
   if (request.target.supervisor_id !== supervisor.supervisor_id
       || request.target.supervisor_generation !== supervisor.generation) {
     return { current: false, reason: 'wake-target-does-not-match-current-supervisor' };
   }
-  if (request.queue_version !== expectedQueueVersion) {
+  if (request.queue_version !== expected.queueVersion) {
     return { current: false, reason: 'wake-queue-version-changed' };
+  }
+  if (sha256(canonicalJson(request)) !== expected.requestSha256) {
+    return { current: false, reason: 'wake-request-changed' };
   }
   if (request.target.host_binding
       && (request.target.host_binding.supervisor_id !== supervisor.supervisor_id
@@ -854,10 +955,17 @@ export function deliverWake(root, eventId, {
   bindingDependencies = {},
   dispatcher = null,
   expectedQueueVersion = null,
+  getActivationNowMs = Date.now,
 } = {}) {
   const wake = directories(root);
   const request = readJson(requestPath(root, eventId));
   const queueVersion = expectedQueueVersion ?? request.queue_version;
+  const deliveryFence = {
+    queueVersion,
+    requestSha256: sha256(canonicalJson(request)),
+    supervisorId: request.target.supervisor_id,
+    supervisorGeneration: request.target.supervisor_generation,
+  };
   const existingPath = receiptPath(root, eventId);
   if (existsSync(existingPath)) {
     let existing;
@@ -896,8 +1004,9 @@ export function deliverWake(root, eventId, {
       delivered: false,
     };
   }
-  if (nativeTransport?.kind !== bindingStatus.binding.native_wake.transport
-      || typeof nativeTransport.resume !== 'function') {
+  const transport = nativeTransport ?? plainCodexResumeTransport();
+  if (transport?.kind !== bindingStatus.binding.native_wake.transport
+      || typeof transport.resume !== 'function') {
     return {
       classification: 'queued',
       reason: 'proven-native-transport-adapter-unavailable',
@@ -909,11 +1018,14 @@ export function deliverWake(root, eventId, {
   if (!currentDispatcher.current) {
     return { classification: 'stale-generation', reason: 'dispatcher-fence-no-longer-current', delivered: false };
   }
-  const fence = validateDeliveryFence(root, eventId, queueVersion, dispatcher);
+  const fence = validateDeliveryFence(root, eventId, deliveryFence, dispatcher);
   if (!fence.current) {
     return { classification: 'stale-generation', reason: fence.reason, event_id: eventId, delivered: false };
   }
-  const leaseResult = acquireActivationLease(root, eventId, { dispatcher });
+  const leaseResult = acquireActivationLease(root, eventId, {
+    dispatcher,
+    nowMs: getActivationNowMs(),
+  });
   if (!leaseResult.acquired) {
     return {
       classification: leaseResult.classification ?? 'queued',
@@ -924,7 +1036,10 @@ export function deliverWake(root, eventId, {
   }
   const lease = leaseResult.lease;
   const message = constructWakeMessage(eventId, supervisor.generation);
-  const claim = claimActivationDecision(root, eventId, lease, { message });
+  const claim = claimActivationDecision(root, eventId, lease, {
+    message,
+    nowMs: getActivationNowMs(),
+  });
   if (!claim.claimed) {
     releaseActivationLease(root, lease);
     return {
@@ -935,7 +1050,7 @@ export function deliverWake(root, eventId, {
       delivered: false,
     };
   }
-  if (!decisionFenceCurrent(root, lease)) {
+  if (!decisionFenceCurrent(root, lease, { nowMs: getActivationNowMs() })) {
     updateActivationDecision(root, claim.decision, 'UNCERTAIN', 'activation lease changed before native transport');
     releaseActivationLease(root, lease);
     return { classification: 'stale-generation', reason: 'activation-lease-fence-no-longer-current', delivered: false };
@@ -954,7 +1069,7 @@ export function deliverWake(root, eventId, {
     activation_fencing_token: lease.fencing_token,
     activation_decision_id: claim.decision.decision_id,
     codex_session_binding_sha256: fileSha256(wake.sessionBinding),
-    host_kind: 'codex-native',
+    host_kind: 'herdr',
     native_transport: bindingStatus.binding.native_wake.transport,
     codex_session_uuid: bindingStatus.binding.codex_session_uuid,
     message_sha256: sha256(message),
@@ -964,31 +1079,139 @@ export function deliverWake(root, eventId, {
     consumed_at: null,
     failure: null,
   };
-  const finalFence = validateDeliveryFence(root, eventId, queueVersion, dispatcher);
-  if (!finalFence.current || !decisionFenceCurrent(root, lease)) {
-    updateActivationDecision(root, claim.decision, 'UNCERTAIN', 'delivery fence changed before native transport');
+  const finalFence = validateDeliveryFence(root, eventId, deliveryFence, dispatcher);
+  const finalLeaseFenceCurrent = decisionFenceCurrent(root, lease, {
+    nowMs: getActivationNowMs(),
+  });
+  if (!finalFence.current || !finalLeaseFenceCurrent) {
+    const reason = finalFence.current
+      ? 'activation lease changed before native transport'
+      : 'delivery fence changed before native transport';
+    updateActivationDecision(root, claim.decision, 'UNCERTAIN', reason);
     releaseActivationLease(root, lease);
-    return { classification: 'stale-generation', reason: finalFence.reason, delivered: false };
+    return {
+      classification: 'stale-generation',
+      reason: finalFence.current ? 'activation-lease-fence-no-longer-current' : finalFence.reason,
+      delivered: false,
+    };
   }
   try {
-    const committed = nativeTransport.resume({
+    const committed = transport.resume({
       session_id: bindingStatus.binding.codex_session_uuid,
       event_id: eventId,
       generation: supervisor.generation,
       message,
       binding: bindingStatus.binding,
     });
-    if (committed?.submitted !== true) {
-      updateActivationDecision(root, claim.decision, 'UNCERTAIN', committed?.reason ?? 'native transport did not confirm submission');
+    if (['busy', 'rejected'].includes(committed?.classification)) {
+      updateActivationDecision(root, claim.decision, 'BUSY', committed.reason);
       releaseActivationLease(root, lease);
       emit(root, 'HOST_WAKE_DEFERRED', {
         source_event_id: eventId,
-        classification: 'queued',
-        reason: committed?.reason ?? 'native-transport-unconfirmed',
+        classification: committed.classification,
+        reason: committed.reason,
       });
       return {
-        classification: 'queued',
-        reason: committed?.reason ?? 'native-transport-unconfirmed',
+        classification: committed.classification,
+        reason: committed.reason,
+        delivered: false,
+        replayed: false,
+      };
+    }
+    const confirmationComplete = Number.isSafeInteger(committed?.accepted_ordinal)
+      && /^[a-f0-9]{64}$/.test(committed?.accepted_record_sha256 ?? '')
+      && Number.isSafeInteger(committed?.turn_began_ordinal)
+      && /^[a-f0-9]{64}$/.test(committed?.turn_began_record_sha256 ?? '')
+      && typeof committed?.turn_id === 'string'
+      && Number.isSafeInteger(committed?.turn_started_at_ms)
+      && canonicalJson(committed?.argv) === canonicalJson([
+        'codex', 'resume', bindingStatus.binding.codex_session_uuid, message,
+      ])
+      && Number.isSafeInteger(committed?.process_group)
+      && committed.process_group > 0
+      && committed?.launcher_exit_observed === true
+      && committed?.frontend_exit_observed === true
+      && positiveSortedProcessGroups(committed?.tracked_process_groups)
+      && committed.tracked_process_groups.includes(committed.process_group)
+      && positiveSortedProcessGroups(committed?.frontend_process_groups, { allowEmpty: true })
+      && committed.frontend_process_groups.every((group) => (
+        committed.tracked_process_groups.includes(group)
+      ))
+      && positiveSortedProcessGroups(committed?.signaled_process_groups, { allowEmpty: true })
+      && committed.signaled_process_groups.every((group) => (
+        committed.tracked_process_groups.includes(group)
+      ))
+      && Array.isArray(committed?.process_group_member_counts)
+      && committed.process_group_member_counts.length === committed.tracked_process_groups.length
+      && committed.process_group_member_counts.every((entry, index) => (
+        entry?.process_group === committed.tracked_process_groups[index]
+        && entry?.member_count === 0
+      ))
+      && committed?.process_group_member_count === 0
+      && committed?.duplicate_frontend_count === 0
+      && committed?.invalid_frontend_identity_count === 0
+      && Array.isArray(committed?.blocked_process_groups)
+      && committed.blocked_process_groups.length === 0
+      && Number.isSafeInteger(committed?.authoritative_host_process_group)
+      && committed.authoritative_host_process_group > 0
+      && !committed.tracked_process_groups.includes(committed.authoritative_host_process_group)
+      && committed?.authoritative_host_signaled === false;
+    if (committed?.classification !== 'confirmed'
+        || committed.cleanup_proven !== true
+        || committed.authoritative_host_continuity_proven !== true
+        || !confirmationComplete) {
+      updateActivationDecision(root, claim.decision, 'UNCERTAIN', committed?.reason ?? 'native transport confirmation or cleanup unproven');
+      releaseActivationLease(root, lease);
+      return {
+        classification: 'uncertain',
+        reason: committed?.reason ?? 'native-transport-confirmation-or-cleanup-unproven',
+        delivered: false,
+        replayed: false,
+      };
+    }
+    receipt.rollout_confirmation = {
+      accepted_ordinal: committed.accepted_ordinal,
+      accepted_record_sha256: committed.accepted_record_sha256,
+      turn_began_ordinal: committed.turn_began_ordinal,
+      turn_began_record_sha256: committed.turn_began_record_sha256,
+      turn_id: committed.turn_id,
+      turn_started_at_ms: committed.turn_started_at_ms,
+    };
+    receipt.temporary_frontend = {
+      argv: committed.argv,
+      process_group: committed.process_group,
+      launcher_exit_observed: committed.launcher_exit_observed,
+      frontend_exit_observed: committed.frontend_exit_observed,
+      tracked_process_groups: committed.tracked_process_groups,
+      frontend_process_groups: committed.frontend_process_groups,
+      signaled_process_groups: committed.signaled_process_groups,
+      process_group_member_counts: committed.process_group_member_counts,
+      process_group_member_count: committed.process_group_member_count,
+      duplicate_frontend_count: committed.duplicate_frontend_count,
+      invalid_frontend_identity_count: committed.invalid_frontend_identity_count,
+      authoritative_host_process_group: committed.authoritative_host_process_group,
+      authoritative_host_signaled: committed.authoritative_host_signaled,
+      cleanup_proven: committed.cleanup_proven,
+      authoritative_host_continuity_proven: committed.authoritative_host_continuity_proven,
+    };
+    const postTransportFence = validateDeliveryFence(
+      root,
+      eventId,
+      deliveryFence,
+      dispatcher,
+    );
+    const leaseFenceCurrent = decisionFenceCurrent(root, lease, {
+      nowMs: getActivationNowMs(),
+    });
+    if (!postTransportFence.current || !leaseFenceCurrent) {
+      const reason = postTransportFence.current
+        ? 'activation-lease-fence-changed-after-native-transport'
+        : `${postTransportFence.reason}-after-native-transport`;
+      updateActivationDecision(root, claim.decision, 'UNCERTAIN', reason);
+      releaseActivationLease(root, lease);
+      return {
+        classification: 'uncertain',
+        reason,
         delivered: false,
         replayed: false,
       };
@@ -1003,7 +1226,16 @@ export function deliverWake(root, eventId, {
     });
     return { classification: 'queued', reason: 'crash-uncertain-delivery', receipt, delivered: false, replayed: false };
   }
-  updateActivationDecision(root, claim.decision, 'DELIVERED');
+  const deliveredDecision = updateActivationDecision(root, claim.decision, 'DELIVERED');
+  if (!deliveredDecision.updated) {
+    releaseActivationLease(root, lease);
+    return {
+      classification: 'uncertain',
+      reason: deliveredDecision.reason ?? 'activation-decision-fence-changed-before-delivery',
+      delivered: false,
+      replayed: false,
+    };
+  }
   receipt.status = 'DELIVERED';
   receipt.delivered_at = now();
   if (!atomicCreateJson(existingPath, receipt)) {
@@ -1042,7 +1274,7 @@ export function deliverWake(root, eventId, {
     attempt_id: request.attempt_id,
     classification: 'terminal-event',
     delivery_id: receipt.delivery_id,
-    resulting_state: state.pause?.active ? 'PAUSED' : 'ACTIVE',
+    resulting_state: state.pause?.active && !state.pause.after_current ? 'PAUSED' : 'ACTIVE',
   });
   emit(root, 'HOST_WAKE_DELIVERED', {
     source_event_id: eventId,
@@ -1260,13 +1492,86 @@ export function registerWakeObservation(root, { watchFactory = watch } = {}) {
     for (const watcher of watchers.splice(0)) watcher.close();
     resolveSignal(value);
   };
-  for (const directory of [wake.base, wake.requests]) {
+  const binding = readOptional(wake.sessionBinding);
+  const observedDirectories = [...new Set([
+    wake.base,
+    wake.requests,
+    binding?.rollout?.realpath ? dirname(binding.rollout.realpath) : null,
+  ].filter(Boolean))];
+  for (const directory of observedDirectories) {
     if (settled) break;
     try {
       const watcher = watchFactory(directory, () => finish({ type: 'filesystem-event', directory }));
       watcher.on?.('error', (error) => finish({ type: 'watch-error', error: error.message }));
       if (settled) watcher.close();
       else watchers.push(watcher);
+    } catch (error) {
+      finish({ type: 'watch-error', error: error.message });
+    }
+  }
+  return {
+    wait: () => signal,
+    close: () => finish({ type: 'observation-closed' }),
+  };
+}
+
+function boundRolloutState(root, { statFile = statSync } = {}) {
+  const binding = readOptional(directories(root).sessionBinding);
+  if (typeof binding?.rollout?.realpath !== 'string') return null;
+  try {
+    const stats = statFile(binding.rollout.realpath);
+    return {
+      path: binding.rollout.realpath,
+      device: stats.dev,
+      inode: stats.ino,
+      size_bytes: stats.size,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function registerBoundRolloutOpportunity(root, baseline, {
+  watchFactory = watch,
+  state = boundRolloutState,
+} = {}) {
+  let settled = false;
+  let watcher;
+  let resolveSignal;
+  const signal = new Promise((resolve) => { resolveSignal = resolve; });
+  const finish = (value) => {
+    if (settled) return;
+    settled = true;
+    watcher?.close();
+    resolveSignal(value);
+  };
+  const inspect = () => {
+    const current = state(root);
+    if (current
+        && current.path === baseline?.path
+        && current.device === baseline.device
+        && current.inode === baseline.inode
+        && current.size_bytes > baseline.size_bytes) {
+      finish({
+        type: 'bound-rollout-state-change',
+        path: current.path,
+        previous_size_bytes: baseline.size_bytes,
+        size_bytes: current.size_bytes,
+      });
+    }
+  };
+  if (!baseline) {
+    finish({ type: 'bound-rollout-unavailable' });
+  } else {
+    try {
+      watcher = watchFactory(dirname(baseline.path), (_event, filename) => {
+        if (filename == null || String(filename) === baseline.path.split('/').at(-1)) inspect();
+      });
+      watcher.on?.('error', (error) => finish({ type: 'watch-error', error: error.message }));
+      if (settled) watcher.close();
+      // Close the baseline-to-subscription race, including a change made by
+      // watchFactory while the watcher is being registered.
+      else inspect();
     } catch (error) {
       finish({ type: 'watch-error', error: error.message });
     }
@@ -1298,9 +1603,9 @@ export async function runWakeDispatcher(root, {
   bindingDependencies = {},
   getProcessIdentity = processIdentity,
   registerObservation = registerWakeObservation,
+  observeBoundRollout = registerBoundRolloutOpportunity,
+  readBoundRolloutState = boundRolloutState,
   delay = sleep,
-  minimumRetryMs = 100,
-  maximumRetryMs = 5000,
   handshakeTimeoutMs = 5000,
   maxCycles = Number.POSITIVE_INFINITY,
 } = {}) {
@@ -1341,7 +1646,6 @@ export async function runWakeDispatcher(root, {
     supervisor_generation: record.supervisor_generation,
   });
 
-  let retryMs = minimumRetryMs;
   for (let cycle = 0; cycle < maxCycles; cycle += 1) {
     let current;
     try { current = readJson(wake.dispatcher); } catch {
@@ -1367,7 +1671,6 @@ export async function runWakeDispatcher(root, {
       current.last_observed_at = now();
       current.last_result = { classification: 'idle', queued: 0 };
       writeJson(wake.dispatcher, current);
-      retryMs = minimumRetryMs;
       if (cycle + 1 >= maxCycles) {
         observation.close();
         return { status: 'OWNED', reason: 'test-cycle-limit', results: [] };
@@ -1375,6 +1678,12 @@ export async function runWakeDispatcher(root, {
       try { await observation.wait(); } finally { observation.close(); }
       continue;
     }
+    // Capture the exact bound-rollout state while the pre-scan observation is
+    // still open, then subscribe before delivery. The watcher's immediate
+    // check closes the baseline-to-subscription race without observing Opsle's
+    // own wake-file writes.
+    const rolloutBaseline = readBoundRolloutState(root);
+    const opportunity = observeBoundRollout(root, rolloutBaseline);
     observation.close();
     const results = queued.map((request) => deliverWake(root, request.event_id, {
       nativeTransport,
@@ -1395,15 +1704,35 @@ export async function runWakeDispatcher(root, {
     };
     if (sameDispatcher(readOptional(wake.dispatcher), current)) writeJson(wake.dispatcher, current);
     if (results.some((result) => result.classification === 'stale-generation')) {
+      opportunity.close();
       return { status: 'RETIRED', reason: 'dispatcher-delivery-fence-changed', results };
     }
-    if (cycle + 1 >= maxCycles) return { status: 'OWNED', reason: 'test-cycle-limit', results };
+    if (cycle + 1 >= maxCycles) {
+      opportunity.close();
+      return { status: 'OWNED', reason: 'test-cycle-limit', results };
+    }
     if (results.some((result) => result.delivered)) {
-      retryMs = minimumRetryMs;
+      opportunity.close();
       continue;
     }
-    await delay(retryMs);
-    retryMs = Math.min(maximumRetryMs, Math.max(minimumRetryMs, retryMs * 2));
+    if (results.some((result) => (
+      result.classification === 'uncertain'
+      || result.reason?.includes('uncertain')
+    ))) {
+      opportunity.close();
+      return { status: 'OWNED', reason: 'delivery-not-replayable', results };
+    }
+    if (results.some((result) => result.classification === 'busy')) {
+      let signal;
+      try { signal = await opportunity.wait(); } finally { opportunity.close(); }
+      if (signal.type !== 'bound-rollout-state-change') {
+        return { status: 'OWNED', reason: 'bound-rollout-observation-unavailable', results };
+      }
+      continue;
+    }
+    opportunity.close();
+    const nextObservation = registerObservation(root);
+    try { await nextObservation.wait(); } finally { nextObservation.close(); }
   }
   return { status: 'OWNED', reason: 'dispatcher-loop-ended' };
 }

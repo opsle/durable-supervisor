@@ -1,0 +1,85 @@
+{
+  "task_id": "task-correct-busy-confirmation-window",
+  "title": "Bound busy-session confirmation safely",
+  "objective": "Correct the live busy-session confirmation window. For event event-0027a459-968d-4ccd-afc1-99dfd0df9444, plain codex resume attached while the authoritative session was inside a bounded tool call; the unique wake was accepted at the next safe message boundary just after the fixed 30-second deadline, causing a false UNCERTAIN result. Extend the bounded transport and helper deadlines coherently so the temporary frontend remains only until deterministic rollout acceptance during ordinary busy/reasoning periods, while preserving exact evidence, cleanup, and fail-closed timeout behavior.",
+  "scope": [
+    "src/codex-resume-transport.js default confirmation bound",
+    "src/wakeup.js helper process bound",
+    "tests/wakeup.test.js deadline coordination and busy-boundary regression",
+    "minimal operations documentation"
+  ],
+  "required_inputs": [
+    "src/codex-resume-transport.js",
+    "src/wakeup.js",
+    "tests/wakeup.test.js",
+    ".opsle/wake/activation-decisions/event-0027a459-968d-4ccd-afc1-99dfd0df9444.json"
+  ],
+  "relevant_context": [
+    "The event was claimed at 17:37:51.892Z, timed out at the 30-second bound, and its exact message was accepted at the next safe boundary immediately afterward.",
+    "A confirmation deadline is a safety bound, not delivery evidence; only exact rollout records may confirm delivery.",
+    "The helper spawn timeout must exceed transport confirmation plus cleanup escalation bounds, or it can kill a valid proof attempt prematurely.",
+    "Busy output classified before acceptance still returns BUSY and retries only after a bound-rollout state change; UNCERTAIN remains non-replayable."
+  ],
+  "acceptance_criteria": [
+    "default confirmation bound is explicit, finite, and materially covers ordinary busy supervisor turns",
+    "helper timeout exceeds confirmation plus worst-case cleanup bounds",
+    "no sleep or elapsed time can create positive delivery confirmation",
+    "exact response_item plus matching turn-began UserMessage remains mandatory",
+    "busy rejection behavior and deterministic opportunity retry remain unchanged",
+    "deadline expiry remains UNCERTAIN and non-replayable",
+    "focused and full verification pass",
+    "Context Firewall packet is complete_for_decision"
+  ],
+  "expected_deliverable": "A coherent bounded confirmation/helper deadline correction with regression coverage.",
+  "expected_evidence": [
+    "source diff",
+    "deadline coordination regression",
+    "positive evidence remains record-only",
+    "focused and full test output",
+    "git diff --check",
+    "complete Context Firewall packet"
+  ],
+  "authorization": {
+    "may": [
+      "read repository and named durable evidence",
+      "modify transport/helper deadline configuration, directly related tests, and minimal docs",
+      "run focused and full local verification"
+    ],
+    "may_modify": [
+      "src/codex-resume-transport.js",
+      "src/wakeup.js",
+      "tests/wakeup.test.js",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "invoke live wake, signal live runtime, replay or rewrite uncertain events",
+      "change canonical argv/message, policy, objective, identity, binding, pause behavior, or host configuration",
+      "modify siblings, push, merge, deploy, install, or initialize a repository"
+    ]
+  },
+  "prohibited_actions": [
+    "live wake",
+    "uncertain-event replay",
+    "terminal input",
+    "model polling",
+    "release or deployment"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "route_hint": "codex",
+  "expects_changes": true,
+  "timeout_seconds": 900,
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/wakeup.test.js"
+  ],
+  "requirement_ids": []
+}

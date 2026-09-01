@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-c46a7214-25d0-4cc9-a323-d6fc44e1cb24","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":13,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-correct-busy-confirmation-window","time":"2026-09-01T17:39:21.901Z","type":"TASK_HANDOFF_CREATED"}

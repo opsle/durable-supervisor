@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-6beb560f-006b-4089-b4a0-5df468cbb9b6","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":13,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-correct-resume-busy-observation","time":"2026-09-01T17:00:24.619Z","type":"TASK_HANDOFF_CREATED"}

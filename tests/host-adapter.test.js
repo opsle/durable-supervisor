@@ -80,7 +80,7 @@ test('SupervisorHostAdapter selection is explicit and preserves tmux authority',
     sessionId: 'opsle-durable-supervisor',
   });
   const tmux = adapter('tmux', 'authoritative');
-  const herdr = adapter('herdr', 'candidate-only');
+  const herdr = adapter('herdr', 'authoritative');
   assert.strictEqual(selectSupervisorHostAdapter(tmuxBinding, { tmux, herdr }), tmux);
   assert.strictEqual(selectSupervisorHostAdapter(herdrBinding(), { tmux, herdr }), herdr);
   assert.throws(

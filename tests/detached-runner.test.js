@@ -20,7 +20,11 @@ import { createAttempt, createTask, routeTask } from '../src/pipeline.js';
 import { readJson, writeJson } from '../src/io.js';
 import { initialize, paths } from '../src/state.js';
 import { recover } from '../src/cli.js';
-import { runAttempt, runDetachedWorker } from '../src/runner.js';
+import {
+  detachedDormancyContract,
+  runAttempt,
+  runDetachedWorker,
+} from '../src/runner.js';
 import { registerWait } from '../src/wakeup.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
@@ -112,6 +116,22 @@ async function waitFor(check, message, timeoutMs = 8000) {
   throw new Error(message);
 }
 
+function processAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+async function cleanupDetachedFixture(root) {
+  const dispatcherPath = join(root, '.opsle', 'wake', 'dispatcher.json');
+  if (existsSync(dispatcherPath)) {
+    const pid = readJson(dispatcherPath).process?.pid;
+    if (Number.isSafeInteger(pid) && processAlive(pid)) {
+      try { process.kill(pid, 'SIGTERM'); } catch {}
+      await waitFor(() => !processAlive(pid), 'fixture dispatcher did not exit before cleanup');
+    }
+  }
+  rmSync(root, { recursive: true, force: true });
+}
+
 function events(root) {
   const text = readFileSync(paths(root).eventsLog, 'utf8').trim();
   return text ? text.split('\n').map((line) => JSON.parse(line)) : [];
@@ -200,6 +220,7 @@ test('detached worker failure durably separates Runner failure and intervention 
       registeredAt,
       deadlineAt: new Date(Date.now() + 60_000).toISOString(),
     });
+    attempt.wait_registration.detached_dormancy = detachedDormancyContract();
     writeJson(join(paths(root).attempts, `${attempt.attempt_id}.json`), attempt);
     const supervisor = readJson(paths(root).supervisor);
     const launchNonce = 'runner-launch-fixture';
@@ -294,10 +315,10 @@ test('recovery preserves only a live exact detached Runner owner across generati
   }
 });
 
-test('task run defaults to a detached worker that outlives the launcher and owns terminal lifecycle', async () => {
+test('detached ownership ends the launcher turn and only a queued terminal event permits reactivation', async () => {
   const root = fixture();
   try {
-    const task = createTask(root, handoff('task-detached-default', 700));
+    const task = createTask(root, handoff('task-detached-default', 2400));
     const started = Date.now();
     const launched = runCli(root, ['task', 'run', task.task_id]);
     const elapsed = Date.now() - started;
@@ -305,19 +326,50 @@ test('task run defaults to a detached worker that outlives the launcher and owns
     assert.ok(launched.stdout.trim(), JSON.stringify(launched));
     const launch = JSON.parse(launched.stdout);
     assert.equal(launch.launch_mode, 'detached');
+    assert.equal(launch.action, 'END_TURN_IMMEDIATELY');
+    assert.equal(launch.monitoring_owner, 'RUNNER_ONLY');
     assert.ok(['LAUNCHING', 'RUNNING'].includes(launch.child_state));
-    assert.ok(elapsed < 600, `detached launch took ${elapsed}ms`);
+    assert.ok(elapsed < 1200, `detached launch took ${elapsed}ms`);
     assert.equal(readJson(paths(root).state).supervisor_state, 'DORMANT');
+    assert.deepEqual(launch.dormancy_contract.prohibited_automatic_supervisor_checks, [
+      'child', 'status', 'heartbeat', 'watch', 'wait',
+    ]);
+    assert.deepEqual(launch.dormancy_contract.eligible_automatic_reactivation, {
+      event_types: [
+        'child-completed',
+        'child-failed',
+        'child-timeout',
+        'child-stall',
+        'intervention-required',
+      ],
+      queue: 'durable-wake-queue',
+      transport: 'plain-codex-resume',
+    });
 
     const recordPath = join(root, '.opsle', 'workers', `${launch.attempt_id}.json`);
     const owned = readJson(recordPath);
     assert.ok(['OWNED', 'TERMINAL'].includes(owned.status));
     assert.equal(owned.worker_pid, launch.worker_pid);
+    assert.equal(owned.dormancy_contract.monitoring_owner, 'RUNNER_ONLY');
     await waitFor(() => {
       try { process.kill(owned.launcher_pid, 0); return false; } catch { return true; }
     }, 'initiating CLI launcher remained alive');
 
     const attemptPath = join(paths(root).attempts, `${launch.attempt_id}.json`);
+    const initialHeartbeat = readJson(attemptPath).heartbeat_at;
+    await waitFor(() => {
+      const value = readJson(attemptPath);
+      return value.child_state === 'RUNNING' && value.heartbeat_at !== initialHeartbeat;
+    }, 'Runner did not publish nonterminal heartbeat progress');
+    const running = readJson(attemptPath);
+    assert.equal(running.wait_registration.detached_dormancy.supervisor_action, 'END_TURN_IMMEDIATELY');
+    assert.equal(readJson(paths(root).state).supervisor_state, 'DORMANT');
+    assert.equal(events(root).filter((event) => (
+      event.type === 'SUPERVISOR_ACTIVATION'
+      && event.attempt_id === launch.attempt_id
+    )).length, 0);
+    assert.equal(existsSync(join(root, '.opsle', 'wake', 'requests')), false);
+
     const completed = await waitFor(() => {
       const value = readJson(attemptPath);
       return value.child_state === 'COMPLETED' ? value : null;
@@ -344,8 +396,12 @@ test('task run defaults to a detached worker that outlives the launcher and owns
     )).length, 0);
     assert.equal(activationSummary(events(root)).wait_induced_automatic, 0);
     assert.ok(existsSync(join(root, '.opsle', 'wake', 'requests', `${completion.event_id}.json`)));
+    assert.equal(events(root).filter((event) => (
+      event.type === 'HOST_WAKE_QUEUED'
+      && event.source_event_id === completion.event_id
+    )).length, 1);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    await cleanupDetachedFixture(root);
   }
 });
 
@@ -361,6 +417,7 @@ test('foreground waiting is available only through the explicit compatibility fl
     const value = JSON.parse(result.stdout);
     assert.equal(value.launch_mode, 'foreground-wait');
     assert.equal(value.child_state, 'COMPLETED');
+    assert.equal(value.action, undefined);
     assert.ok(elapsed >= 200);
     assert.equal(readJson(paths(root).state).supervisor_state, 'ACTIVE');
   } finally {
@@ -368,7 +425,88 @@ test('foreground waiting is available only through the explicit compatibility fl
   }
 });
 
-test('detached pause-after-current survives recovery, evaluates, then prevents a new launch', async () => {
+test('task run atomically arms pause-after-current before detached ownership returns', async () => {
+  for (const evaluation of ['accept', 'reject']) {
+    const root = fixture();
+    try {
+      const task = createTask(root, handoff(`task-atomic-pause-${evaluation}`, 650));
+      const reason = `atomic ${evaluation} fixture boundary`;
+      const launched = runCli(root, [
+        'task', 'run', task.task_id,
+        '--pause-after-current', '--reason', reason,
+      ]);
+      assert.equal(launched.code, 0, launched.stderr);
+      const launch = JSON.parse(launched.stdout);
+      assert.equal(launch.action, 'END_TURN_IMMEDIATELY');
+      assert.equal(launch.monitoring_owner, 'RUNNER_ONLY');
+      assert.deepEqual(launch.pause_after_current, {
+        armed: true,
+        reason,
+        event_id: launch.pause_after_current.event_id,
+      });
+      assert.match(launch.pause_after_current.event_id, /^event-/);
+
+      const armed = readJson(paths(root).state);
+      assert.equal(armed.supervisor_state, 'DORMANT');
+      assert.equal(armed.pause.active, true);
+      assert.equal(armed.pause.after_current, true);
+      assert.equal(armed.pause.reason, reason);
+      const armedEvent = events(root).find((event) => (
+        event.event_id === launch.pause_after_current.event_id
+      ));
+      assert.equal(armedEvent.type, 'SUPERVISOR_PAUSED');
+      assert.equal(armedEvent.source, 'task-run');
+
+      const attemptPath = join(paths(root).attempts, `${launch.attempt_id}.json`);
+      await waitFor(() => readJson(attemptPath).child_state === 'COMPLETED', 'atomic child did not finish');
+      await waitFor(() => !processAlive(launch.worker_pid), 'atomic detached Runner did not exit');
+      const awaiting = readJson(paths(root).state);
+      assert.equal(awaiting.supervisor_state, 'DORMANT');
+      assert.equal(awaiting.pause.active, true);
+      assert.equal(awaiting.pause.after_current, true);
+      assert.equal(readJson(join(paths(root).tasks, `${task.task_id}.json`)).state, 'AWAITING_SUPERVISOR');
+      assert.equal(events(root).some((event) => event.type === 'PAUSE_AFTER_CURRENT_APPLIED'), false);
+
+      const evaluated = runCli(root, [
+        'task', 'evaluate', task.task_id,
+        `--${evaluation}`, '--rationale', `${evaluation} atomic pause ordering`,
+      ]);
+      assert.equal(evaluated.code, 0, evaluated.stderr);
+      const result = JSON.parse(evaluated.stdout);
+      const recordedEvents = events(root);
+      const decisionIndex = recordedEvents.findIndex((event) => (
+        event.type === 'SUPERVISOR_DECISION'
+        && event.decision_id === result.decision.decision_id
+      ));
+      const appliedIndex = recordedEvents.findIndex((event) => (
+        event.type === 'PAUSE_AFTER_CURRENT_APPLIED'
+        && event.decision_id === result.decision.decision_id
+      ));
+      assert.ok(decisionIndex >= 0);
+      assert.ok(appliedIndex > decisionIndex);
+      const decisions = readFileSync(paths(root).decisionsLog, 'utf8')
+        .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      assert.ok(decisions.some((decision) => decision.decision_id === result.decision.decision_id));
+
+      const terminal = readJson(paths(root).state);
+      assert.equal(terminal.supervisor_state, 'PAUSED');
+      assert.equal(terminal.pause.active, true);
+      assert.equal(terminal.pause.after_current, false);
+      assert.equal(
+        readJson(join(paths(root).tasks, `${task.task_id}.json`)).state,
+        evaluation === 'accept' ? 'ACCEPTED' : 'REJECTED',
+      );
+      const next = createTask(root, handoff(`task-after-atomic-${evaluation}`, 50));
+      const blocked = runCli(root, ['task', 'run', next.task_id]);
+      assert.equal(blocked.code, 1);
+      assert.match(blocked.stderr, /automatic progression is paused/);
+    } finally {
+      await cleanupDetachedFixture(root);
+    }
+  }
+});
+
+test('compatibility pause command remains available for an existing detached launch', async () => {
   const root = fixture();
   try {
     const task = createTask(root, handoff('task-detached-pause', 650));
@@ -410,6 +548,6 @@ test('detached pause-after-current survives recovery, evaluates, then prevents a
     assert.match(blocked.stderr, /automatic progression is paused/);
     assert.deepEqual(readJson(join(paths(root).tasks, `${next.task_id}.json`)).attempts, []);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    await cleanupDetachedFixture(root);
   }
 });

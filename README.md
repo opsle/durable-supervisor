@@ -32,28 +32,31 @@ queue independently of Runner and supervisor turns. It registers filesystem
 observation before every receipt-free queue check, so an event cannot be lost
 between the empty decision and watcher registration.
 
-Automatic delivery now fails closed unless a separate versioned Codex session
-binding proves the exact repository, supervisor generation, Codex UUID, rollout
-`session_meta` and inode, installed CLI, UID, host/writer processes, tmux
-session/pane/TTY, and a supported writer topology. Installed Codex 0.151.0 uses
-a standalone embedded writer: a second `codex resume` loses the thread writer
-lock while the persistent TUI is open. That topology is recorded as unsupported,
-so events remain receipt-free and queued. Normal dispatch neither spawns resume
-nor calls tmux paste/send. A future supported shared-app-server binding requires
-an explicit controlled proof hash and a native transport adapter.
+Automatic delivery fails closed unless `codex-session-binding/v2` proves the
+exact repository, supervisor generation, Codex UUID, rollout `session_meta` and
+inode, installed CLI, UID, authoritative Herdr process/workspace/pane/terminal,
+and absence of the old authoritative tmux session. The canonical transport is
+plain `codex resume SESSION_ID MESSAGE` in a temporary process group. A
+repository-local PTY launcher keeps that frontend alive only until the bound
+rollout contains one exact accepted message and its matching turn-began record.
+It then terminates the temporary group and proves no new matching frontend
+remains. Normal dispatch never calls tmux input or a Herdr prompt primitive.
 
 Before any supported native send, a provider-free activation lease fences the
 supervisor generation, dispatcher/process, event, expiry, and monotonic token.
-An atomic per-event activation decision is the exactly-once boundary; uncertain
-decisions are never replayed. The transmitted message contains only event ID,
-generation, and an instruction to read durable state. Historical wake request
-bytes are immutable. Stale-generation and already-evaluated requests are
-classified obsolete rather than adopted.
+An atomic per-event activation decision is the exactly-once boundary. Live PTY
+stdout and stderr classify a resume rejected before rollout acceptance as busy;
+it remains queued and may be reclaimed only after the already-registered watcher
+observes an append to that exact bound rollout. Any outcome uncertain after
+spawn is durably `UNCERTAIN` and is never automatically replayed. The transmitted
+message contains only event ID, generation, and an instruction to read durable
+state. Historical wake request bytes are immutable. Stale-generation and
+already-evaluated requests are classified obsolete rather than adopted.
 
-`SupervisorHostAdapter`, the tmux host implementation, the foreground mechanical
-wait, and Herdr structured discovery remain explicit compatibility/candidate
-boundaries. They are not called by the normal automatic dispatcher. Herdr 0.8.2
-still cannot prove an exclusive input transaction and never authorizes input.
+Herdr is the authoritative host, but the Herdr adapter remains read-only: it
+never submits prompt or terminal input. `codex resume` is a session transport,
+separate from host input. The tmux host and foreground mechanical wait remain
+explicit fallbacks and are not selected by the normal automatic dispatcher.
 
 tmux is only a convenience for interactive attachment. The authoritative state
 is the structured data under `.opsle/`. If tmux, SSH, the Codex process, or the
@@ -158,17 +161,15 @@ or production-readiness saving is claimed.
 
 V0.1 implements narrow local adapters for Gearbox routing, structured
 handoffs, Context Firewall reduction, decision evidence, detached execution,
-generation-fenced queued wakeups, session binding, activation leases, and
-activation telemetry. Native automatic wake remains disabled for the installed
-standalone writer topology. Tmux is an interactive/compatibility host and Herdr
-support is deterministic read-only discovery/status only. Capability
+generation-fenced queued wakeups, authoritative Herdr session binding, plain
+Codex resume delivery, activation leases, and activation telemetry. Tmux is an
+interactive/compatibility host; Herdr prompt APIs remain unused. Capability
 Discovery records the presence and revision of
 related Opsle sibling repositories, but this repository does not import their
 implementations.
 
 Affected Verification is `advisory_only` and did not authorize reduced testing.
-Semantic Edit, controlled migration to one shared app-server, a proven native
-session transport, an external wakeup service, continuous trajectory
+Semantic Edit, an external wakeup service, continuous trajectory
 ingestion, multi-repository supervision, distributed locking, a scheduler, a
 web UI, and production deployment are deferred. Codex is enabled in the
 recorded policy; Claude and independent review remained disabled.
@@ -178,10 +179,10 @@ dispatcher ID/generation, supervisor ID/generation, exact PID/start/executable,
 and each request queue version. Recovery supersedes stale ownership, starts one
 current dispatcher, and leaves prior-generation requests immutable and obsolete.
 
-Verdict for native wake is intentionally PARTIAL: queueing, identity validation,
-lease fencing, idempotency, and fail-closed behavior are implemented and tested;
-live automatic delivery requires a separately authorized shared-app-server
-migration and controlled proof.
+The repository-local transport is deterministically covered for binding,
+rollout confirmation, cleanup, busy, uncertainty, fencing, idempotency, and
+pause-after-current ordering. A live binding must still be created explicitly;
+the intentionally stale v1 record is not adopted or rewritten automatically.
 
 ## License
 

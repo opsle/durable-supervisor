@@ -357,7 +357,10 @@ export function validateDurableState(root) {
   const sessionBinding = join(wake, 'codex-session-binding.json');
   if (existsSync(sessionBinding)) {
     const binding = readJson(sessionBinding);
-    if (binding.schema !== 'opsle.durable-supervisor.codex-session-binding/v1') {
+    if (![
+      'opsle.durable-supervisor.codex-session-binding/v1',
+      'opsle.durable-supervisor.codex-session-binding/v2',
+    ].includes(binding.schema)) {
       errors.push('invalid Codex session binding schema');
     }
     if (binding.supervisor_id !== supervisor.supervisor_id) {

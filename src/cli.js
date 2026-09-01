@@ -66,7 +66,7 @@ commands:
   policy review MODE [--reviewer PROVIDER]
   models status|enable|disable [PROVIDER]
   task create --input FILE
-  task run TASK_ID [--foreground-wait]
+  task run TASK_ID [--pause-after-current] [--foreground-wait]
   task evaluate TASK_ID --accept|--reject --rationale TEXT
   task show TASK_ID
   requirements [--json]
@@ -76,9 +76,8 @@ commands:
   wake status
   wake drain
   session bind --session UUID --rollout PATH --sessions-root PATH
-    --host-pid PID --writer-pid PID --tmux-session NAME --tmux-pane PANE
-    [--topology standalone-embedded-writer|shared-app-server]
-    [--native-proof SHA256]
+    --host-pid PID --workspace-id ID --workspace-cwd PATH
+    --pane-id ID --terminal-id ID [--legacy-tmux-session NAME]
   session status
   session adopt
   telemetry import-activation-profile --input FILE
@@ -112,7 +111,7 @@ export function sessionCommand(root, subcommand, args, { dependencies = {} } = {
   if (subcommand !== 'bind') throw new Error('session requires bind, status, or adopt');
   const required = [
     '--session', '--rollout', '--sessions-root', '--host-pid',
-    '--writer-pid', '--tmux-session', '--tmux-pane',
+    '--workspace-id', '--workspace-cwd', '--pane-id', '--terminal-id',
   ];
   for (const flag of required) {
     if (!valueAfter(args, flag)) throw new Error(`session bind requires ${flag}`);
@@ -122,11 +121,11 @@ export function sessionCommand(root, subcommand, args, { dependencies = {} } = {
     rolloutPath: valueAfter(args, '--rollout'),
     sessionsRoot: valueAfter(args, '--sessions-root'),
     hostPid: integerOption(args, '--host-pid', null),
-    writerPid: integerOption(args, '--writer-pid', null),
-    tmuxSession: valueAfter(args, '--tmux-session'),
-    tmuxPane: valueAfter(args, '--tmux-pane'),
-    topology: valueAfter(args, '--topology', 'standalone-embedded-writer'),
-    nativeProofSha256: valueAfter(args, '--native-proof'),
+    workspaceId: valueAfter(args, '--workspace-id'),
+    workspaceCwd: valueAfter(args, '--workspace-cwd'),
+    paneId: valueAfter(args, '--pane-id'),
+    terminalId: valueAfter(args, '--terminal-id'),
+    legacyTmuxSession: valueAfter(args, '--legacy-tmux-session'),
   }, { dependencies });
 }
 
@@ -1022,11 +1021,16 @@ export async function main(args) {
     } else if (subcommand === 'run') {
       const state = readJson(paths(root).state);
       if (state.pause.active) throw new Error('automatic progression is paused');
+      const foregroundWait = rest.includes('--foreground-wait');
+      const pauseAfterCurrent = rest.includes('--pause-after-current');
+      if (foregroundWait && pauseAfterCurrent) {
+        throw new Error('--pause-after-current requires canonical detached task execution');
+      }
       const task = readJson(join(paths(root).tasks, `${rest[0]}.json`));
       const gearbox = routeTask(root, task);
       emit(root, 'GEARBOX_ROUTED', { task_id: task.task_id, decision_id: gearbox.decision_id, route: gearbox.selected_route, rationale: gearbox.rationale });
       const { attempt, claim } = createAttempt(root, task, gearbox);
-      if (rest.includes('--foreground-wait')) {
+      if (foregroundWait) {
         const result = await runAttempt(root, task, attempt, claim);
         print({
           launch_mode: 'foreground-wait',
@@ -1039,7 +1043,12 @@ export async function main(args) {
           completion_event_id: result.completion_event.event_id,
         });
       } else {
-        print(await launchDetachedAttempt(root, task, attempt, claim));
+        print(await launchDetachedAttempt(root, task, attempt, claim, {
+          pauseAfterCurrent: pauseAfterCurrent ? {
+            actor: 'operator-cli',
+            reason: valueAfter(rest, '--reason', 'task run requested pause after current'),
+          } : null,
+        }));
       }
     } else if (subcommand === 'evaluate') {
       const taskId = rest[0];

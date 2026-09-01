@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-64c34e5d-70da-4f8f-a48d-b1183d33a508","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":13,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-correct-activation-lease-expiry","time":"2026-09-01T18:09:11.774Z","type":"TASK_HANDOFF_CREATED"}

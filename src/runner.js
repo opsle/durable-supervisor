@@ -30,6 +30,13 @@ const BYTE_MEASUREMENT = Object.freeze({
 });
 const SERIALIZED_PACKET_BYTES_WIDTH = 16;
 const TERMINATION_GRACE_MS = 1000;
+const ELIGIBLE_DETACHED_REACTIVATION_EVENTS = Object.freeze([
+  'child-completed',
+  'child-failed',
+  'child-timeout',
+  'child-stall',
+  'intervention-required',
+]);
 const DERIVED_MEASUREMENT_FIELDS = [
   'compact_bytes',
   'retained_bytes',
@@ -38,6 +45,22 @@ const DERIVED_MEASUREMENT_FIELDS = [
   'reduction_ratio',
   'serialized_packet_bytes',
 ];
+
+export function detachedDormancyContract() {
+  return {
+    schema: 'opsle.durable-supervisor.detached-dormancy/v1',
+    supervisor_action: 'END_TURN_IMMEDIATELY',
+    supervisor_state: 'DORMANT',
+    monitoring_owner: 'RUNNER_ONLY',
+    runner_owned_monitoring: ['child', 'status', 'heartbeat', 'watch'],
+    prohibited_automatic_supervisor_checks: ['child', 'status', 'heartbeat', 'watch', 'wait'],
+    eligible_automatic_reactivation: {
+      event_types: [...ELIGIBLE_DETACHED_REACTIVATION_EVENTS],
+      queue: 'durable-wake-queue',
+      transport: 'plain-codex-resume',
+    },
+  };
+}
 
 function snapshotFiles(root) {
   const ignored = new Set(['.git', 'node_modules', 'coverage', 'graphify-out']);
@@ -266,7 +289,9 @@ function rawReference(path, root) {
   return { path: relative(root, path), bytes, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') };
 }
 
-function prepareAttemptLaunch(root, task, attempt, mode) {
+function prepareAttemptLaunch(root, task, attempt, mode, {
+  pauseAfterCurrent = null,
+} = {}) {
   const p = paths(root);
   const attemptPath = join(p.attempts, `${attempt.attempt_id}.json`);
   if (attempt.wait_registration || attempt.child_state !== 'QUEUED') {
@@ -286,6 +311,10 @@ function prepareAttemptLaunch(root, task, attempt, mode) {
     registeredAt: waitRegisteredAt,
     deadlineAt: waitDeadlineAt,
   });
+  const detached = mode.startsWith('detached');
+  if (detached) {
+    attempt.wait_registration.detached_dormancy = detachedDormancyContract();
+  }
   attempt.child_state = 'LAUNCHING';
   writeJson(attemptPath, attempt);
   emit(root, 'WAIT_REGISTERED', {
@@ -293,22 +322,43 @@ function prepareAttemptLaunch(root, task, attempt, mode) {
     attempt_id: attempt.attempt_id,
     wait_id: attempt.wait_registration.wait_id,
     deadline_at: waitDeadlineAt,
-    eligible_automatic_wakes: [
-      'child-completed',
-      'child-failed',
-      'child-timeout',
-      'child-stall',
-      'intervention-required',
-    ],
+    eligible_automatic_wakes: [...ELIGIBLE_DETACHED_REACTIVATION_EVENTS],
+    ...(detached ? {
+      detached_dormancy: attempt.wait_registration.detached_dormancy,
+    } : {}),
   });
-  updateState(root, { supervisor_state: 'DORMANT' });
+  const armedPause = pauseAfterCurrent ? {
+    active: true,
+    after_current: true,
+    reason: pauseAfterCurrent.reason,
+    changed_at: now(),
+  } : null;
+  updateState(root, {
+    supervisor_state: 'DORMANT',
+    ...(armedPause ? { pause: armedPause } : {}),
+  });
+  const pauseEvent = armedPause ? emit(root, 'SUPERVISOR_PAUSED', {
+    actor: pauseAfterCurrent.actor,
+    source: 'task-run',
+    after_current: true,
+    requested_after_current: true,
+    active_attempt_id: attempt.attempt_id,
+    reason: armedPause.reason,
+  }) : null;
   emit(root, 'RUNNER_LAUNCHING', {
     task_id: task.task_id,
     attempt_id: attempt.attempt_id,
     route: attempt.gearbox_route,
     launch_mode: mode,
   });
-  return attempt;
+  return {
+    attempt,
+    pause_after_current: armedPause ? {
+      armed: true,
+      reason: armedPause.reason,
+      event_id: pauseEvent.event_id,
+    } : null,
+  };
 }
 
 function workerDirectory(root) {
@@ -397,8 +447,11 @@ function persistDetachedWorkerFailure(root, record, message) {
 export async function launchDetachedAttempt(root, task, attempt, claim, {
   handshakeTimeoutMs = 5000,
   workerScript = fileURLToPath(new URL('../bin/opsle-runner-worker.js', import.meta.url)),
+  pauseAfterCurrent = null,
 } = {}) {
-  prepareAttemptLaunch(root, task, attempt, 'detached');
+  const prepared = prepareAttemptLaunch(root, task, attempt, 'detached', {
+    pauseAfterCurrent,
+  });
   const supervisor = readJson(paths(root).supervisor);
   const launchNonce = id('runner-launch');
   const recordPath = workerPath(root, attempt.attempt_id);
@@ -450,13 +503,21 @@ export async function launchDetachedAttempt(root, task, attempt, claim, {
   while (Date.now() <= deadline) {
     const current = readJson(recordPath);
     if (['OWNED', 'TERMINAL'].includes(current.status)) {
+      if (current.dormancy_contract?.supervisor_action !== 'END_TURN_IMMEDIATELY'
+          || current.dormancy_contract?.monitoring_owner !== 'RUNNER_ONLY') {
+        throw new Error('detached Runner ownership lacks the durable dormancy contract');
+      }
       return {
         launch_mode: 'detached',
+        action: 'END_TURN_IMMEDIATELY',
         task_id: task.task_id,
         attempt_id: attempt.attempt_id,
         child_state: readJson(join(paths(root).attempts, `${attempt.attempt_id}.json`)).child_state,
         worker_pid: current.worker_pid,
         ownership: current.status,
+        monitoring_owner: 'RUNNER_ONLY',
+        dormancy_contract: current.dormancy_contract,
+        pause_after_current: prepared.pause_after_current,
       };
     }
     if (current.status === 'FAILED' || !processAlive(worker.pid)) {
@@ -511,6 +572,14 @@ export async function runDetachedWorker(root, attemptId, launchNonce, {
   }
   record.status = 'OWNED';
   record.owned_at = now();
+  record.dormancy_contract = attempt.wait_registration?.detached_dormancy;
+  if (record.dormancy_contract?.supervisor_action !== 'END_TURN_IMMEDIATELY') {
+    throw persistDetachedWorkerFailure(
+      root,
+      record,
+      'detached Runner attempt lacks the durable dormancy contract',
+    );
+  }
   writeJson(recordPath, record);
   emit(root, 'DETACHED_RUNNER_OWNED', {
     task_id: task.task_id,
@@ -519,6 +588,8 @@ export async function runDetachedWorker(root, attemptId, launchNonce, {
     claim_id: claim.claim_id,
     fence_generation: claim.fence_generation,
     supervisor_generation: record.supervisor_generation,
+    supervisor_action: record.dormancy_contract.supervisor_action,
+    monitoring_owner: record.dormancy_contract.monitoring_owner,
   });
   try {
     const result = await runAttemptImpl(root, task, attempt, claim, {

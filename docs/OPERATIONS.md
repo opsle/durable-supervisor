@@ -59,10 +59,30 @@ Canonical task execution is detached:
 ./bin/opsle.js task run TASK_ID
 ```
 
+To launch one task and atomically pause after its supervisor evaluation:
+
+```bash
+./bin/opsle.js task run TASK_ID \
+  --pause-after-current
+```
+
+The pause is durable before successful detached Runner ownership returns. The
+launch result reports `pause_after_current.armed: true` together with
+`action: END_TURN_IMMEDIATELY`; no follow-up pause command or status check is
+required. Runner publishes the terminal child result as `AWAITING_SUPERVISOR`
+while the pause remains pending. `task evaluate` records `ACCEPTED` or
+`REJECTED` before applying `PAUSED`, so no next child can launch.
+
 The command returns only after a repository-local worker has durably accepted
 the exact attempt, claim fence, supervisor generation, nonce, and worker PID.
-It does not wait for the child. Use deterministic status while the worker owns
-the lifecycle:
+Its result says `action: END_TURN_IMMEDIATELY`, `monitoring_owner: RUNNER_ONLY`,
+and records the matching durable dormancy contract. The initiating supervisor
+must end the current turn immediately. Runner alone owns child, status,
+heartbeat, and watch monitoring. The supervisor must not automatically check
+child state, status, heartbeat, filesystem watches, timeouts, or waits while the
+attempt is running.
+
+Manual operator inspection remains separate and provider-free:
 
 ```bash
 ./bin/opsle.js status
@@ -78,6 +98,12 @@ The old enclosing wait-cell path is compatibility-only and must be requested:
 
 Do not use that flag for canonical supervision. Never treat a wrapper return,
 tool timeout, heartbeat, or nonterminal progress as a wake event.
+
+The next automatic supervisor activation is permitted only after Runner queues
+an eligible durable child-completed, child-failed, child-timeout, child-stall, or
+intervention-required event and the canonical dispatcher delivers it through
+plain `codex resume`. DORMANT is a turn boundary, not an instruction to remain
+active while inspecting durable state.
 
 The detached Runner persists the terminal request and ensures one persistent
 repository-local dispatcher. The dispatcher has no model/provider activity and
@@ -98,8 +124,8 @@ observation before it checks the receipt-free queue. If an event arrives at that
 boundary, it is either found by the recheck or wakes the registered observation;
 there is no polling window. When the queue is empty the dispatcher waits on the
 notification. While receipt-free work exists but the exact Codex binding is
-unbound, stale, or unsupported, it re-evaluates durable state with bounded
-provider-free backoff.
+unbound or stale, it waits for a repository or bound-rollout filesystem change
+before re-evaluating. There is no model polling.
 No wait-induced model activation is used.
 
 Inspect queued, delivered, uncertain, or consumed events without model use:
@@ -114,18 +140,34 @@ Inspect queued, delivered, uncertain, or consumed events without model use:
 ./bin/opsle.js wake drain
 ```
 
-Installed Codex 0.151.0 standalone resume starts another embedded app-server and
-loses the thread writer lock while the persistent standalone TUI is open. This
-topology is unsupported. Normal dispatch does not spawn `codex resume`, call
-tmux `paste-buffer`/`send-keys`, or call Herdr input. The event remains
-receipt-free and queued. The operator Desktop result is positive evidence only
-for its observed shared-app-server condition.
+For a valid authoritative Herdr v2 binding, normal dispatch spawns plain
+`codex resume SESSION_ID MESSAGE` under a repository-local PTY launcher. It
+confirms one exact accepted-message record and its matching turn-began record in
+the bound rollout and hashes their complete raw JSONL line bytes. Live PTY output
+detects a busy rejection without waiting for the stdin keeper to exit; an exact
+confirmation already present in the rollout remains authoritative. Before
+delivery, the dispatcher registers a watcher for only that bound rollout and
+checks its exact file-size baseline immediately. A busy retry occurs only after
+that watcher observes an append to the same inode, so Opsle's wake-file writes
+cannot trigger a retry. Because filesystem notifications may be coalesced before
+both acceptance records are complete, the default 120-second confirmation
+deadline makes one final exact rollout-state check before recording uncertainty.
+The helper's 135-second process bound exceeds confirmation plus both bounded
+5-second cleanup phases. The records, not either timeout or elapsed time, remain
+the only positive proof. Cleanup compares exact session
+UUID and wake-message frontend identities with the pre-spawn baseline, then
+terminates the detached launcher group and every newly discovered frontend
+group. The authoritative Herdr host group is excluded explicitly. Delivery is
+proven only after the launcher exits, every tracked group is empty, and a final
+exact scan finds no new matching frontend. It never calls tmux input or Herdr
+input.
 
 ### Bind and inspect the exact Codex session
 
 Binding is separate from the durable supervisor identity. Obtain the exact
-current host/writer PIDs and tmux pane from read-only inspection, then run this
-reviewed command with those literal values. Do not run it from this child task:
+current Herdr Codex process and workspace facts from read-only inspection, then
+run this reviewed command with those literal values. Do not run it from a child
+task:
 
 ```bash
 ./bin/opsle.js session bind \
@@ -134,18 +176,18 @@ reviewed command with those literal values. Do not run it from this child task:
   --rollout ROLLOUT_JSONL \
   --sessions-root CODEX_SESSIONS_DIR \
   --host-pid HOST_PID \
-  --writer-pid WRITER_PID \
-  --tmux-session TMUX_SESSION \
-  --tmux-pane TMUX_PANE \
-  --topology standalone-embedded-writer
+  --workspace-id WORKSPACE_ID \
+  --workspace-cwd REPOSITORY_PATH \
+  --pane-id PANE_ID \
+  --terminal-id TERMINAL_ID
 ```
 
 Every token above is explicit; replace the uppercase placeholders before one
 copy/paste. The command sends no input and does not resume Codex. It records and
 validates repository realpath, supervisor identity/generation, Codex UUID,
 rollout `session_meta` hashes and file device/inode, installed CLI version,
-UID, exact process start/executable/TTY/command hash, tmux session/pane/TTY,
-unique rollout candidate, and writer topology.
+UID, exact process start/executable/TTY/command hash, Herdr workspace/pane/
+terminal identity, unique rollout candidate, and absence of old tmux authority.
 
 Inspect without model use:
 
@@ -154,34 +196,33 @@ Inspect without model use:
 ./bin/opsle.js wake status
 ```
 
-After an authorized recovery changes only the supervisor generation, explicitly
-adopt the binding only if every other fact still validates:
+Generation or session drift requires a fresh authoritative Herdr binding; v2
+bindings are never adopted across a generation change. Missing/replaced rollout,
+duplicate candidate, metadata mismatch, dead/reused process,
+CLI/UID/repository/host mismatch, supersession, or live old tmux authority fails
+closed. Valid status is `bound-authoritative-herdr`.
 
-```bash
-./bin/opsle.js session adopt
-```
-
-Missing/replaced rollout, duplicate candidate, metadata mismatch, dead/reused
-process, CLI/UID/repository/tmux mismatch, or writer-topology change fails closed.
-For the current standalone topology, valid status is `bound-unsupported`.
-
-Only a separately authorized controlled migration to one shared app-server may
-bind `shared-app-server`, and it additionally requires a reviewed proof hash and
-native transport adapter. Before any future supported send, the activation lease
-CAS fences generation, owner/process, event, expiry, and monotonic token. The
-per-event decision record is the exactly-once boundary; uncertainty is never
-replayed. The tiny message contains only event ID, generation, and an instruction
-to read durable state.
+Before a send, the 180-second activation lease safely exceeds the bounded
+135-second plain-resume helper lifecycle. Its CAS fences generation,
+owner/process, event, expiry, and monotonic token, and expiry at or before a
+decision fence is stale. The
+per-event decision record is the exactly-once boundary. Busy rejection before
+acceptance remains queued until an observed state change. Uncertainty after
+spawn is never replayed. After confirmed transport cleanup, the exact request,
+queue version, supervisor, dispatcher process/generation, and activation lease
+token are revalidated before delivery is committed; any drift records a
+non-replayable uncertain decision and no delivered receipt. The tiny message
+contains only event ID, generation, and an instruction to read durable state.
 
 ### Compatibility hosts and Herdr
 
 `src/host-terminal.js` retains the tmux host and its guarded commit method as
 explicit compatibility code, but normal automatic dispatch never selects it.
-Herdr remains candidate-only. Its read-only adapter can report exact socket,
+Herdr is authoritative. Its read-only adapter can report exact socket,
 repository/workspace, pane, terminal, process, Codex-session, agent-status,
 attached-client, and event facts when all identities match. Missing, duplicate,
-or mismatched facts reject discovery. Herdr 0.8.2 cannot prove an empty human
-composer or exclusive input transaction, so Opsle never calls input primitives.
+or mismatched facts reject discovery. Opsle never calls Herdr input primitives;
+plain Codex resume is the separate canonical session transport.
 
 ```bash
 ./bin/opsle.js wake status
@@ -207,7 +248,7 @@ Stop new automatic launches now:
 ./bin/opsle.js pause
 ```
 
-Let the current child finish, then stay paused:
+For compatibility, an operator may still arm the pause after a detached launch:
 
 ```bash
 ./bin/opsle.js pause --after-current

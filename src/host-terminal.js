@@ -40,8 +40,8 @@ export function validateHostBinding(binding) {
     }
     return binding;
   }
-  if (binding.authority !== 'candidate-only') {
-    throw new Error('Herdr supervisor host must remain candidate-only');
+  if (binding.authority !== 'authoritative') {
+    throw new Error('Herdr supervisor host must be authoritative');
   }
   if (!absolutePath(binding.socket_path)
       || !nonempty(binding.workspace_id)
@@ -92,7 +92,7 @@ export function createHerdrHostBinding({
   return validateHostBinding({
     schema: HOST_BINDING_SCHEMA,
     host: 'herdr',
-    authority: 'candidate-only',
+    authority: 'authoritative',
     repository,
     supervisor_id: supervisorId,
     supervisor_generation: supervisorGeneration,
@@ -433,7 +433,7 @@ function codexDescendant(panePid, procRoot = '/proc') {
 function herdrRejected(reason, details = {}) {
   return {
     host_kind: 'herdr',
-    authority: 'candidate-only',
+    authority: 'authoritative',
     available: details.available ?? true,
     session_alive: details.session_alive ?? false,
     discovery_status: 'rejected',
@@ -461,7 +461,7 @@ export function inspectHerdrBinding({ binding, snapshot, supervisor }) {
     return herdrRejected('herdr-binding-invalid', { binding_error: error.message });
   }
   if (binding.host !== 'herdr') return herdrRejected('herdr-binding-host-mismatch');
-  if (binding.authority !== 'candidate-only') return herdrRejected('herdr-binding-authority-mismatch');
+  if (binding.authority !== 'authoritative') return herdrRejected('herdr-binding-authority-mismatch');
   if (binding.supervisor_id !== supervisor?.supervisor_id
       || binding.supervisor_generation !== supervisor?.generation) {
     return herdrRejected('herdr-supervisor-generation-mismatch');
@@ -516,7 +516,7 @@ export function inspectHerdrBinding({ binding, snapshot, supervisor }) {
   ));
   return {
     host_kind: 'herdr',
-    authority: 'candidate-only',
+    authority: 'authoritative',
     available: true,
     session_alive: true,
     discovery_status: 'matched',
@@ -553,7 +553,7 @@ export function createHerdrHost({
   return assertSupervisorHostAdapter({
     schema: HOST_ADAPTER_SCHEMA,
     host_kind: 'herdr',
-    authority: 'candidate-only',
+    authority: 'authoritative',
     inspect({ binding, supervisor }) {
       let snapshot;
       try { snapshot = readSnapshot({ binding }); } catch (error) {

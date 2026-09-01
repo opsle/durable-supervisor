@@ -384,6 +384,43 @@ test('pause after current evaluates and terminalizes the task before PAUSED bloc
   }
 });
 
+test('pause after current is also applied only after an explicit rejection', async () => {
+  const root = fixture();
+  try {
+    const p = paths(root);
+    const task = createTask(root, handoff('task-rejected-before-pause', {
+      deterministic_command: [
+        process.execPath,
+        '-e',
+        "setTimeout(() => require('fs').writeFileSync('task-rejected-before-pause.txt','done\\n'), 200)",
+      ],
+    }));
+    const route = routeTask(root, task);
+    const { attempt, claim } = createAttempt(root, task, route);
+    const running = runAttempt(root, task, attempt, claim);
+    const attemptPath = join(p.attempts, `${attempt.attempt_id}.json`);
+    await waitFor(() => readJson(attemptPath).child_state === 'RUNNING', 'rejection fixture did not run');
+    assert.equal((await runCli(root, [
+      'pause', '--after-current', '--reason', 'reject then pause',
+    ])).code, 0);
+    await running;
+    assert.equal(readJson(p.state).pause.after_current, true);
+    const evaluated = await runCli(root, [
+      'task', 'evaluate', task.task_id,
+      '--reject', '--rationale', 'fixture rejection',
+    ]);
+    assert.equal(evaluated.code, 0, evaluated.stderr);
+    assert.equal(readJson(join(p.tasks, `${task.task_id}.json`)).state, 'REJECTED');
+    const state = readJson(p.state);
+    assert.equal(state.supervisor_state, 'PAUSED');
+    assert.equal(state.pause.after_current, false);
+    const ordered = eventLines(root).map((event) => event.type);
+    assert.ok(ordered.lastIndexOf('SUPERVISOR_DECISION') < ordered.lastIndexOf('PAUSE_AFTER_CURRENT_APPLIED'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('bounded status watch is read-only and measured telemetry uses durable facts or unknowns', async () => {
   const root = fixture();
   try {

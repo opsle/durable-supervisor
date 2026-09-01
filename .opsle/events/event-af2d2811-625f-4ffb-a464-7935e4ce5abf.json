@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-af2d2811-625f-4ffb-a464-7935e4ce5abf","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":13,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-canonical-herdr-codex-resume","time":"2026-09-01T16:37:16.721Z","type":"TASK_HANDOFF_CREATED"}

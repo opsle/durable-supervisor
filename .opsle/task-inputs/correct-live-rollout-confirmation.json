@@ -1,0 +1,85 @@
+{
+  "task_id": "task-correct-live-rollout-confirmation",
+  "title": "Correct live rollout acceptance observation",
+  "objective": "Diagnose and correct the deterministic rollout observation gap exposed by live event event-84daed36-4011-4ef1-8cbf-9758fadaac1b: the exact wake message was durably recorded at ordinals 828 and 829 in the bound rollout and processed by the original Herdr session, but the dispatcher timed out and recorded UNCERTAIN. Preserve that historical uncertain event and make future exact acceptance evidence reliably observable without sleep-based confirmation or replay.",
+  "scope": [
+    "src/codex-resume-transport.js rollout file observation and parsing",
+    "focused regression tests for coalesced or early filesystem notifications followed by complete records",
+    "minimal documentation clarification if behavior changes"
+  ],
+  "required_inputs": [
+    "src/codex-resume-transport.js",
+    "src/wakeup.js",
+    "tests/wakeup.test.js",
+    ".opsle/wake/activation-decisions/event-84daed36-4011-4ef1-8cbf-9758fadaac1b.json",
+    ".opsle/wake/codex-session-binding.json"
+  ],
+  "relevant_context": [
+    "The bound rollout contains the exact response_item user message at ordinal 828 and item_completed UserMessage with the same turn at ordinal 829.",
+    "The transport registered fs.watch on dirname(rolloutPath), then timed out after 30 seconds despite later writes to the same rollout.",
+    "The original wake arrived and was processed, but no DELIVERED receipt exists; activation decision is UNCERTAIN and must never be replayed or rewritten.",
+    "Plain codex resume, exact message format, process-group cleanup, Herdr host continuity, and rollout evidence requirements remain fixed."
+  ],
+  "acceptance_criteria": [
+    "root cause is explained from source and live evidence",
+    "observation is attached directly to the exact bound rollout file or an equivalently deterministic file-state mechanism",
+    "no arbitrary sleep is used as delivery confirmation",
+    "exact response_item plus matching item_completed UserMessage remains the only positive delivery proof",
+    "a regression test proves a notification that occurs before a complete pair cannot cause a false timeout when the complete pair is subsequently durable",
+    "uncertain decisions remain non-replayable",
+    "focused tests and full npm verification pass",
+    "Context Firewall packet is complete_for_decision"
+  ],
+  "expected_deliverable": "A minimal tested correction to rollout observation, with root-cause evidence and no change to canonical plain codex resume semantics.",
+  "expected_evidence": [
+    "source diff",
+    "new deterministic watcher regression",
+    "focused test output",
+    "full verification output",
+    "git diff --check",
+    "complete Context Firewall packet"
+  ],
+  "authorization": {
+    "may": [
+      "read repository and durable evidence",
+      "modify src/codex-resume-transport.js, directly related tests, and minimal related docs",
+      "run focused and full local verification"
+    ],
+    "may_modify": [
+      "src/codex-resume-transport.js",
+      "tests/wakeup.test.js",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "rewrite, delete, retry, consume, or mark delivered event-84daed36-4011-4ef1-8cbf-9758fadaac1b",
+      "invoke codex resume or any wake transport",
+      "change policy, objective, supervisor identity, session binding, pause behavior, or host configuration",
+      "modify siblings, push, merge, deploy, install, or initialize a repository"
+    ]
+  },
+  "prohibited_actions": [
+    "manual or live wake",
+    "uncertain-event replay",
+    "terminal input",
+    "model polling",
+    "release or deployment"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "route_hint": "codex",
+  "expects_changes": true,
+  "timeout_seconds": 1200,
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/wakeup.test.js"
+  ],
+  "requirement_ids": []
+}

@@ -1,0 +1,81 @@
+{
+  "task_id": "task-correct-activation-lease-expiry",
+  "title": "Fence delivery against activation lease expiry",
+  "objective": "Correct the activation-lease defect found by task-final-live-resume-proof-2. The lease must remain valid for the complete bounded plain codex resume confirmation and cleanup interval, and the post-transport delivery fence must reject a lease whose expires_at has passed even when no takeover changed its token.",
+  "scope": [
+    "src/wakeup.js activation lease duration and decision fence",
+    "tests/wakeup.test.js expiry and boundary regressions",
+    "minimal operations documentation if needed"
+  ],
+  "required_inputs": [
+    "src/wakeup.js",
+    "tests/wakeup.test.js",
+    ".opsle/evidence/compact/task-final-live-resume-proof-2-attempt-001.json"
+  ],
+  "relevant_context": [
+    "The transport confirmation bound is 120 seconds and helper lifecycle bound is 135 seconds.",
+    "The current default activation lease is 30 seconds and decisionFenceCurrent checks identity but not expires_at.",
+    "A lease that expires during a transport makes delivery uncertain and must not produce a delivered receipt or be blindly replayed.",
+    "Canonical argv, exact rollout evidence, temporary process cleanup, Herdr continuity, busy behavior, post-transport fence validation, and pause semantics remain fixed."
+  ],
+  "acceptance_criteria": [
+    "the activation lease duration safely exceeds the complete 135-second helper lifecycle bound",
+    "decisionFenceCurrent deterministically rejects malformed, expired, and exact-boundary expires_at values",
+    "post-transport expiry without takeover records UNCERTAIN and produces no delivered receipt, state activation, telemetry, or HOST_WAKE_DELIVERED event",
+    "the uncertain decision is non-replayable",
+    "normal unchanged unexpired delivery still succeeds exactly once",
+    "focused and full verification pass",
+    "Context Firewall packet is complete_for_decision"
+  ],
+  "expected_deliverable": "A minimal activation-lease duration and expiry correction with deterministic regressions.",
+  "expected_evidence": [
+    "source diff",
+    "expiry-without-takeover and boundary tests",
+    "unchanged-fence positive test",
+    "focused and full test output",
+    "git diff --check",
+    "complete Context Firewall packet"
+  ],
+  "authorization": {
+    "may": [
+      "read repository and named compact evidence",
+      "modify src/wakeup.js, directly related tests, and minimal docs",
+      "run focused and full local verification"
+    ],
+    "may_modify": [
+      "src/wakeup.js",
+      "tests/wakeup.test.js",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "invoke live wake, signal live runtime, replay or rewrite historical events",
+      "change canonical message or argv, policy, objective, identity, binding, pause behavior, or host configuration",
+      "modify siblings, push, merge, deploy, install, or initialize a repository"
+    ]
+  },
+  "prohibited_actions": [
+    "live wake",
+    "uncertain-event replay",
+    "terminal input",
+    "model polling",
+    "release or deployment"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "route_hint": "codex",
+  "expects_changes": true,
+  "timeout_seconds": 900,
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/wakeup.test.js"
+  ],
+  "requirement_ids": []
+}

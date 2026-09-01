@@ -1,0 +1,79 @@
+{
+  "task_id": "task-final-live-resume-proof",
+  "title": "Final live canonical resume and pause proof",
+  "objective": "Perform a final meaningful read-only audit and focused verification of the completed canonical plain codex resume transport. This detached child completion must automatically produce a terminal event, provider-free dispatch, exact rollout confirmation, complete temporary frontend cleanup, original Herdr continuity, supervisor evaluation, and only then PAUSED via pause-after-current.",
+  "scope": [
+    "read-only audit of canonical argv, exact live record shape, busy window, all temporary process groups, generation and duplicate fences",
+    "focused wake and operator-control verification",
+    "compact complete Context Firewall handoff"
+  ],
+  "required_inputs": [
+    "src/codex-resume-transport.js",
+    "src/wakeup.js",
+    "src/cli.js",
+    "tests/wakeup.test.js",
+    "tests/operator-controls.test.js",
+    "docs/OPERATIONS.md",
+    ".opsle/wake/deliveries/event-f342114b-4785-4592-bbc7-4a20c819648b.json"
+  ],
+  "relevant_context": [
+    "Event event-f342114b-4785-4592-bbc7-4a20c819648b is the first fully confirmed and consumed live delivery under generation 13.",
+    "The final run must not invoke wake; Runner publication and the provider-free dispatcher own automatic wake after packet finalization.",
+    "The supervisor will arm pause-after-current immediately after launch. The current completion must be evaluated before PAUSED and no next child may launch.",
+    "No source or durable authority changes are authorized for this child."
+  ],
+  "acceptance_criteria": [
+    "audit finds no unresolved correctness defect or precisely reports one",
+    "focused verification passes",
+    "no repository files change",
+    "Context Firewall packet is complete_for_decision",
+    "completion is ready for distinct supervisor evaluation"
+  ],
+  "expected_deliverable": "A concise read-only final audit result with focused verification and no changed artifacts.",
+  "expected_evidence": [
+    "source-bound invariant audit",
+    "focused test output",
+    "git diff --check",
+    "no changed artifacts",
+    "complete Context Firewall packet"
+  ],
+  "authorization": {
+    "may": [
+      "read repository source, tests, docs, and named delivery receipt",
+      "run the predeclared focused verification command",
+      "report defects or confirm bounded invariants"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "modify source, .opsle authority, policy, objective, session binding, wake records, or host configuration",
+      "invoke codex resume, terminal input, tmux send-keys, Herdr agent.prompt, or another provider",
+      "modify siblings, push, merge, deploy, install, or initialize a repository"
+    ]
+  },
+  "prohibited_actions": [
+    "repository mutation",
+    "manual wake or terminal input",
+    "provider nesting",
+    "model polling",
+    "release or infrastructure action"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "route_hint": "codex",
+  "expects_changes": false,
+  "timeout_seconds": 900,
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/wakeup.test.js",
+    "tests/operator-controls.test.js"
+  ],
+  "requirement_ids": []
+}

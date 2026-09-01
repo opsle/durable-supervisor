@@ -65,27 +65,34 @@ supervisor identity/generation, and request queue version. Receipt-free requests
 have no expiry. Filesystem observation is registered before the queue scan.
 
 New requests bind only durable supervisor identity/generation, not a frontend.
-A separate `codex-session-binding/v1` records repository realpath, Codex UUID,
-rollout `session_meta` hashes and inode, installed CLI version, UID, exact host
-and writer process identities, tmux session/pane/TTY, and writer topology. Every
-fact is revalidated before transport selection. Missing, replaced, duplicated,
-dead/reused, mismatched, or stale facts fail closed.
+A separate `codex-session-binding/v2` records repository realpath, Codex UUID,
+rollout `session_meta` hashes and inode, installed CLI version, UID, and exact
+authoritative Herdr process/workspace/pane/terminal identity. It also fences the
+old tmux authority. Every fact is revalidated before transport selection.
+Missing, replaced, duplicated, dead/reused, superseded, mismatched, or stale
+facts fail closed.
 
-Codex 0.151.0 standalone embedded-writer topology is explicitly unsupported:
-normal dispatch calls neither `codex resume` nor terminal input and retains the
-event. Only a separately proven shared-app-server topology may select the native
-transport. Before selection crosses the transport boundary, an activation lease
+The canonical transport is plain `codex resume SESSION_ID MESSAGE` in its own
+temporary process group; normal dispatch calls neither tmux input nor Herdr
+prompt APIs. Before selection crosses the transport boundary, an activation lease
 CAS fences generation, owner, process, event, expiry, and monotonic token; a
 per-event decision record provides the non-replayable exactly-once boundary.
 The message contains only event ID, generation, and a durable-state instruction.
+Delivery requires one exact accepted-message rollout record and its matching
+turn-began record, hashed from their complete raw JSONL line bytes. Confirmed
+delivery terminates and verifies the temporary process group. Live PTY output
+detects busy rejection before frontend exit, while an already-observed exact
+rollout confirmation remains authoritative. Busy remains queued for retry only
+after the pre-registered exact-bound-rollout watcher observes an append;
+uncertainty after spawn is never replayed.
 
 Legacy tmux request bytes remain readable and immutable. Prior-generation and
 already-evaluated requests are obsolete, not adopted. `SupervisorHostAdapter`,
-the tmux commit implementation, Herdr candidate discovery, and foreground
+the tmux commit implementation, Herdr read-only discovery, and foreground
 terminal wait remain explicit compatibility boundaries and are never called by
 normal automatic dispatch.
 
-Herdr is a candidate-only read-only host. Deterministic discovery requires one
+Herdr is the authoritative read-only host. Deterministic discovery requires one
 exact socket, repository/workspace, pane, terminal, Codex session, process
 identity, and current supervisor generation. Structured workspace, pane,
 process, agent-status, attached-client, and event facts may be reported without

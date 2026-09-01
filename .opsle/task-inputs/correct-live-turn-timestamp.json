@@ -1,0 +1,83 @@
+{
+  "task_id": "task-correct-live-turn-timestamp",
+  "title": "Correct live turn-start evidence field",
+  "objective": "Correct the rollout acceptance parser to match the authoritative live Codex item_completed record shape. Live events event-84daed36-4011-4ef1-8cbf-9758fadaac1b and event-7e4371d3-a05b-489d-a7f6-bf9fb123e11d each have an exact response_item user message plus matching event_msg item_completed UserMessage and same turn ID, but started_at_ms is payload.started_at_ms, not payload.item.started_at_ms. Add a real-shape regression and retain all other delivery and cleanup fences.",
+  "scope": [
+    "src/codex-resume-transport.js rolloutAcceptance field path",
+    "tests/wakeup.test.js live Codex record-shape fixtures",
+    "minimal documentation only if needed"
+  ],
+  "required_inputs": [
+    "src/codex-resume-transport.js",
+    "tests/wakeup.test.js",
+    ".opsle/wake/activation-decisions/event-84daed36-4011-4ef1-8cbf-9758fadaac1b.json",
+    ".opsle/wake/activation-decisions/event-7e4371d3-a05b-489d-a7f6-bf9fb123e11d.json"
+  ],
+  "relevant_context": [
+    "Direct parser execution against the bound rollout returned null for both unique live messages.",
+    "The live item_completed records have payload.started_at_ms and payload.completed_at_ms; payload.item contains type, id, and content but no timestamps.",
+    "The response_item and item_completed records have identical unique message text and matching turn IDs.",
+    "The exact bound rollout, positive two-record proof, canonical argv, cleanup, host continuity, generation fences, and UNCERTAIN no-replay semantics remain fixed."
+  ],
+  "acceptance_criteria": [
+    "rolloutAcceptance recognizes the authoritative live item_completed shape",
+    "turn_started_at_ms is taken from payload.started_at_ms and remains a safe integer",
+    "missing or malformed top-level started_at_ms fails closed",
+    "matching message and same turn remain mandatory",
+    "regression fixtures mirror live response_item and event_msg shapes",
+    "focused and full verification pass",
+    "Context Firewall packet is complete_for_decision"
+  ],
+  "expected_deliverable": "A minimal parser/test correction for the live Codex record shape.",
+  "expected_evidence": [
+    "source diff",
+    "real-shape positive and malformed negative tests",
+    "focused test output",
+    "full verification output",
+    "git diff --check",
+    "complete Context Firewall packet"
+  ],
+  "authorization": {
+    "may": [
+      "read repository and named durable evidence",
+      "modify src/codex-resume-transport.js and directly related tests",
+      "run focused and full local verification"
+    ],
+    "may_modify": [
+      "src/codex-resume-transport.js",
+      "tests/wakeup.test.js",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "rewrite, delete, retry, consume, or mark delivered either historical uncertain event",
+      "invoke codex resume or any wake transport",
+      "change policy, objective, supervisor identity, binding, pause behavior, or host configuration",
+      "modify siblings, push, merge, deploy, install, or initialize a repository"
+    ]
+  },
+  "prohibited_actions": [
+    "live wake",
+    "uncertain-event replay",
+    "terminal input",
+    "model polling",
+    "release or deployment"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "route_hint": "codex",
+  "expects_changes": true,
+  "timeout_seconds": 900,
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/wakeup.test.js"
+  ],
+  "requirement_ids": []
+}

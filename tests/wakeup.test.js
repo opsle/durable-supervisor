@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import {
   cpSync,
   existsSync,
@@ -21,10 +22,19 @@ import {
   createTmuxHost,
   registerAtomicReplaceWait,
 } from '../src/host-terminal.js';
-import { readJson, writeJson } from '../src/io.js';
+import { readJson, sha256, writeJson } from '../src/io.js';
 import { emit, initialize, paths, validateDurableState } from '../src/state.js';
 import {
+  canonicalResumeArgv,
+  CODEX_RESUME_CLEANUP_TIMEOUT_MS,
+  CODEX_RESUME_CONFIRMATION_TIMEOUT_MS,
+  CODEX_RESUME_WORST_CASE_CLEANUP_TIMEOUT_MS,
+  rolloutAcceptance,
+  runCodexResumeTransport,
+} from '../src/codex-resume-transport.js';
+import {
   acquireActivationLease,
+  ACTIVATION_LEASE_TTL_MS,
   adoptCodexSessionBinding,
   adoptQueuedWakes,
   applyWakeEvent,
@@ -35,9 +45,14 @@ import {
   constructWakeMessage,
   consumeWakeDelivery,
   deliverWake,
+  decisionFenceCurrent,
   drainWakeQueue,
   enqueueTerminalWake,
   ensureWakeDispatcher,
+  CODEX_RESUME_HELPER_TIMEOUT_MS,
+  plainCodexResumeTransport,
+  processIdentity,
+  registerBoundRolloutOpportunity,
   registerWait,
   releaseActivationLease,
   runWakeDispatcher,
@@ -118,6 +133,48 @@ function stageDispatcher(root, {
   return record;
 }
 
+function stageCurrentDispatcher(root, overrides = {}) {
+  const owner = processIdentity(process.pid);
+  const dispatcher = stageDispatcher(root, {
+    status: 'OWNED',
+    pid: owner.pid,
+    startTime: owner.start_time_ticks,
+    ...overrides,
+  });
+  dispatcher.process.executable = owner.executable;
+  writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
+  return dispatcher;
+}
+
+function confirmedResumeResult(sessionId, message, processGroup, overrides = {}) {
+  return {
+    classification: 'confirmed',
+    cleanup_proven: true,
+    authoritative_host_continuity_proven: true,
+    argv: canonicalResumeArgv(sessionId, message),
+    process_group: processGroup,
+    launcher_exit_observed: true,
+    frontend_exit_observed: true,
+    tracked_process_groups: [processGroup],
+    frontend_process_groups: [],
+    signaled_process_groups: [processGroup],
+    process_group_member_counts: [{ process_group: processGroup, member_count: 0 }],
+    process_group_member_count: 0,
+    duplicate_frontend_count: 0,
+    invalid_frontend_identity_count: 0,
+    blocked_process_groups: [],
+    authoritative_host_process_group: processGroup + 1000,
+    authoritative_host_signaled: false,
+    accepted_ordinal: 10,
+    accepted_record_sha256: 'a'.repeat(64),
+    turn_began_ordinal: 11,
+    turn_began_record_sha256: 'b'.repeat(64),
+    turn_id: 'turn-1',
+    turn_started_at_ms: 1,
+    ...overrides,
+  };
+}
+
 function terminalEvent(root, suffix = 'one') {
   return emit(root, 'CHILD_COMPLETION', {
     task_id: `task-${suffix}`,
@@ -127,11 +184,7 @@ function terminalEvent(root, suffix = 'one') {
   });
 }
 
-function bindingFixture(root, {
-  topology = 'standalone-embedded-writer',
-  duplicate = false,
-  bind = true,
-} = {}) {
+function bindingFixture(root, { duplicate = false, bind = true } = {}) {
   const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
   const sessionsRoot = join(root, 'codex-sessions');
   mkdirSync(sessionsRoot, { recursive: true });
@@ -155,26 +208,18 @@ function bindingFixture(root, {
       tty: '/dev/pts/7',
       command_line_sha256: 'a'.repeat(64),
     }],
-    [701, {
-      pid: 701,
-      start_time_ticks: '7010',
-      executable: '/opt/codex',
-      uid: 1000,
-      tty: '/dev/pts/7',
-      command_line_sha256: 'b'.repeat(64),
-    }],
   ]);
-  const tmux = {
-    session_name: 'opsle-wake-fixture',
-    pane_id: '%7',
-    pane_pid: 699,
-    pane_tty: '/dev/pts/7',
+  const host = {
+    workspace_id: 'workspace-1',
+    workspace_cwd: root,
+    pane_id: 'pane-1',
+    terminal_id: 'terminal-1',
   };
   const dependencies = {
     processIdentity: (pid) => structuredClone(processes.get(pid) ?? null),
-    tmuxIdentity: () => structuredClone(tmux),
-    codexVersion: () => 'codex-cli 0.151.0',
+    codexVersion: () => 'codex-cli 0.152.0',
     uid: () => 1000,
+    legacyTmuxAuthority: () => false,
   };
   if (!duplicate && bind) {
     bindCodexSession(root, {
@@ -182,14 +227,13 @@ function bindingFixture(root, {
       rolloutPath,
       sessionsRoot,
       hostPid: 700,
-      writerPid: 701,
-      tmuxSession: tmux.session_name,
-      tmuxPane: tmux.pane_id,
-      topology,
-      nativeProofSha256: topology === 'shared-app-server' ? 'c'.repeat(64) : null,
+      workspaceId: host.workspace_id,
+      workspaceCwd: host.workspace_cwd,
+      paneId: host.pane_id,
+      terminalId: host.terminal_id,
     }, { dependencies });
   }
-  return { sessionId, sessionsRoot, rolloutPath, processes, tmux, dependencies };
+  return { sessionId, sessionsRoot, rolloutPath, processes, host, dependencies };
 }
 
 function events(root) {
@@ -206,6 +250,654 @@ function wait() {
     deadlineAt: '2026-08-31T20:30:00.000Z',
   });
 }
+
+test('rollout confirmation accepts authoritative live Codex item-completed records', () => {
+  const sessionId = '01a05dd0-0773-79a2-83b9-4fa2cf7c8ec3';
+  const records = [
+    {
+      ordinal: 828,
+      timestamp: '2026-09-01T17:15:35.786Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        id: 'msg_01a05df8-19e9-7460-a525-b40dc2c616e9',
+        role: 'user',
+        content: [{
+          type: 'input_text',
+          text: 'OPSLE_WAKE v1 event=event-84daed36-4011-4ef1-8cbf-9758fadaac1b gen=13; read durable state.',
+        }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: '01a05dd0-2eb7-7bd1-9145-efcc9aa55b3e',
+          create_time: 1788282935.7859228,
+          content_item_kinds: ['user.text'],
+        },
+      },
+    },
+    {
+      ordinal: 829,
+      timestamp: '2026-09-01T17:15:35.788Z',
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        thread_id: sessionId,
+        turn_id: '01a05dd0-2eb7-7bd1-9145-efcc9aa55b3e',
+        item: {
+          type: 'UserMessage',
+          id: '01a05df8-19eb-7062-9628-074ad767dcda',
+          content: [{
+            type: 'text',
+            text: 'OPSLE_WAKE v1 event=event-84daed36-4011-4ef1-8cbf-9758fadaac1b gen=13; read durable state.',
+            text_elements: [],
+          }],
+        },
+        started_at_ms: 1788282935787,
+        completed_at_ms: 1788282935787,
+      },
+    },
+    {
+      ordinal: 968,
+      timestamp: '2026-09-01T17:21:58.907Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        id: 'msg_01a05dfd-f27b-7712-8070-6d4f9265ac96',
+        role: 'user',
+        content: [{
+          type: 'input_text',
+          text: 'OPSLE_WAKE v1 event=event-7e4371d3-a05b-489d-a7f6-bf9fb123e11d gen=13; read durable state.',
+        }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: '01a05dd0-2eb7-7bd1-9145-efcc9aa55b3e',
+          create_time: 1788283318.9072254,
+          content_item_kinds: ['user.text'],
+        },
+      },
+    },
+    {
+      ordinal: 969,
+      timestamp: '2026-09-01T17:21:58.909Z',
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        thread_id: sessionId,
+        turn_id: '01a05dd0-2eb7-7bd1-9145-efcc9aa55b3e',
+        item: {
+          type: 'UserMessage',
+          id: '01a05dfd-f27d-7302-ad4a-a7b71b3a0dd3',
+          content: [{
+            type: 'text',
+            text: 'OPSLE_WAKE v1 event=event-7e4371d3-a05b-489d-a7f6-bf9fb123e11d gen=13; read durable state.',
+            text_elements: [],
+          }],
+        },
+        started_at_ms: 1788283318909,
+        completed_at_ms: 1788283318909,
+      },
+    },
+  ];
+
+  const firstMessage = records[0].payload.content[0].text;
+  const first = rolloutAcceptance(records, {
+    sessionId, message: firstMessage, baselineOrdinal: 827,
+  });
+  assert.equal(first.classification, 'confirmed');
+  assert.equal(first.turn_id, '01a05dd0-2eb7-7bd1-9145-efcc9aa55b3e');
+  assert.equal(first.turn_started_at_ms, 1788282935787);
+
+  const secondMessage = records[2].payload.content[0].text;
+  const second = rolloutAcceptance(records, {
+    sessionId, message: secondMessage, baselineOrdinal: 967,
+  });
+  assert.equal(second.classification, 'confirmed');
+  assert.equal(second.turn_started_at_ms, 1788283318909);
+  assert.equal(rolloutAcceptance(records, {
+    sessionId, message: firstMessage, baselineOrdinal: 828,
+  }), null);
+  assert.equal(rolloutAcceptance([...records, records[0]], {
+    sessionId, message: firstMessage, baselineOrdinal: 827,
+  }).classification, 'ambiguous');
+
+  const missingStartedAt = structuredClone(records.slice(0, 2));
+  delete missingStartedAt[1].payload.started_at_ms;
+  missingStartedAt[1].payload.item.started_at_ms = 1788282935787;
+  assert.equal(rolloutAcceptance(missingStartedAt, {
+    sessionId, message: firstMessage, baselineOrdinal: 827,
+  }), null);
+  for (const startedAt of ['1788282935787', Number.MAX_SAFE_INTEGER + 1]) {
+    const malformed = structuredClone(records.slice(0, 2));
+    malformed[1].payload.started_at_ms = startedAt;
+    assert.equal(rolloutAcceptance(malformed, {
+      sessionId, message: firstMessage, baselineOrdinal: 827,
+    }), null);
+  }
+
+  const mismatchedTurn = structuredClone(records.slice(0, 2));
+  mismatchedTurn[1].payload.turn_id = '01a05dd0-2eb7-7bd1-9145-efcc9aa55b3f';
+  assert.equal(rolloutAcceptance(mismatchedTurn, {
+    sessionId, message: firstMessage, baselineOrdinal: 827,
+  }).classification, 'ambiguous');
+  assert.equal(rolloutAcceptance(records, {
+    sessionId, message: `${firstMessage} changed`, baselineOrdinal: 827,
+  }), null);
+});
+
+test('plain resume transport cleans launcher and script-style separate frontend groups after confirmation', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codex-resume-transport-'));
+  try {
+    const rolloutPath = join(root, 'rollout.jsonl');
+    const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
+    const message = 'OPSLE_WAKE v1 event=event-1 gen=3; read durable state.';
+    writeFileSync(rolloutPath, `${JSON.stringify({ ordinal: 1, type: 'session_meta', payload: { id: sessionId } })}\n`);
+    const watcher = new EventEmitter();
+    watcher.close = () => {};
+    const child = new EventEmitter();
+    child.pid = 9100;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    const spawns = [];
+    const signals = [];
+    let spawned = false;
+    let exactFrontends = [];
+    const groupMembers = new Map([
+      [9100, [{ pid: 9100, pgrp: 9100, start_time_ticks: '910000' }]],
+      [9110, [
+        { pid: 9110, pgrp: 9110, start_time_ticks: '911000' },
+        { pid: 9111, pgrp: 9110, start_time_ticks: '911100' },
+      ]],
+    ]);
+    const resultPromise = runCodexResumeTransport({
+      sessionId,
+      message,
+      rolloutPath,
+      spawnProcess: (command, args, options) => {
+        spawns.push({ command, args, options });
+        spawned = true;
+        exactFrontends = [
+          { pid: 9110, pgrp: 9110, start_time_ticks: '911000' },
+          { pid: 9111, pgrp: 9110, start_time_ticks: '911100' },
+        ];
+        queueMicrotask(() => {
+          const additions = [
+            {
+              ordinal: 2,
+              type: 'response_item',
+              payload: {
+                type: 'message', role: 'user', content: [{ type: 'input_text', text: message }],
+                internal_chat_message_metadata_passthrough: { turn_id: 'turn-1' },
+              },
+            },
+            {
+              ordinal: 3,
+              type: 'event_msg',
+              payload: {
+                type: 'item_completed', thread_id: sessionId, turn_id: 'turn-1',
+                item: { type: 'UserMessage', content: [{ type: 'text', text: message }] },
+                started_at_ms: 123,
+              },
+            },
+          ];
+          const lines = additions.map((record, index) => (
+            index === 0
+              ? JSON.stringify(record).replace('"ordinal":2', '"ordinal": 2')
+              : JSON.stringify(record)
+          ));
+          writeFileSync(rolloutPath, `${readFileSync(rolloutPath, 'utf8')}${lines.join('\n')}\n`);
+          // The rollout proof is already durable when busy text arrives. The
+          // live output handler must inspect that proof before classifying it.
+          child.stderr.emit('data', Buffer.from('session already busy'));
+        });
+        return child;
+      },
+      watchFactory: () => watcher,
+      killProcess: (pid, signal) => {
+        signals.push([pid, signal]);
+        assert.equal(signal, 'SIGTERM');
+        const group = -pid;
+        groupMembers.set(group, []);
+        if (group === 9110) exactFrontends = [];
+        if (group === 9100) {
+          child.signalCode = 'SIGTERM';
+          child.emit('exit', null, 'SIGTERM');
+        }
+      },
+      inspectFrontends: () => (spawned ? exactFrontends : []),
+      inspectProcessGroup: (group) => groupMembers.get(group) ?? [],
+      authoritativeHostProcess: {
+        pid: 700, start_time_ticks: '7000', executable: '/opt/codex',
+      },
+      inspectHostProcess: () => ({
+        pid: 700, pgrp: 7000, start_time_ticks: '7000', executable: '/opt/codex',
+      }),
+    });
+    const result = await resultPromise;
+    assert.deepEqual(result.argv, canonicalResumeArgv(sessionId, message));
+    assert.equal(spawns[0].command, '/bin/sh');
+    assert.match(spawns[0].args[1], /script -qefc/);
+    assert.doesNotMatch(spawns[0].args.join(' '), /codex exec resume/);
+    assert.equal(spawns[0].options.detached, true);
+    assert.equal(result.classification, 'confirmed');
+    assert.equal(result.cleanup_proven, true);
+    assert.equal(result.authoritative_host_continuity_proven, true);
+    assert.equal(result.authoritative_host_signaled, false);
+    assert.equal(result.authoritative_host_process_group, 7000);
+    assert.equal(result.launcher_exit_observed, true);
+    assert.deepEqual(result.tracked_process_groups, [9100, 9110]);
+    assert.deepEqual(result.frontend_process_groups, [9110]);
+    assert.deepEqual(result.signaled_process_groups, [9100, 9110]);
+    assert.deepEqual(result.process_group_member_counts, [
+      { process_group: 9100, member_count: 0 },
+      { process_group: 9110, member_count: 0 },
+    ]);
+    assert.deepEqual(signals, [[-9100, 'SIGTERM'], [-9110, 'SIGTERM']]);
+    assert.equal(signals.some(([pid]) => pid === -7000), false);
+    assert.equal(result.duplicate_frontend_count, 0);
+    assert.equal(result.turn_id, 'turn-1');
+    assert.equal(result.accepted_record_sha256, sha256(Buffer.from(`${JSON.stringify({
+      ordinal: 2,
+      type: 'response_item',
+      payload: {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: message }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn-1' },
+      },
+    }).replace('"ordinal":2', '"ordinal": 2')}\n`)));
+    assert.equal(result.turn_began_record_sha256, sha256(Buffer.from(`${JSON.stringify({
+      ordinal: 3,
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed', thread_id: sessionId, turn_id: 'turn-1',
+        item: { type: 'UserMessage', content: [{ type: 'text', text: message }] },
+        started_at_ms: 123,
+      },
+    })}\n`)));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('plain resume cleanup never signals an exact frontend group containing the authoritative host', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codex-resume-host-safety-'));
+  try {
+    const rolloutPath = join(root, 'rollout.jsonl');
+    const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
+    const message = 'OPSLE_WAKE v1 event=event-host-safety gen=3; read durable state.';
+    writeFileSync(rolloutPath, `${JSON.stringify({ ordinal: 1, type: 'session_meta' })}\n`);
+    const watcher = new EventEmitter();
+    watcher.close = () => {};
+    const child = new EventEmitter();
+    child.pid = 9200;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let spawned = false;
+    const signals = [];
+    const host = {
+      pid: 2585062,
+      pgrp: 7000,
+      start_time_ticks: '243929270',
+      executable: '/home/deploy/.local/bin/herdr',
+    };
+    const result = await runCodexResumeTransport({
+      sessionId,
+      message,
+      rolloutPath,
+      cleanupTimeoutMs: 0,
+      spawnProcess: () => {
+        spawned = true;
+        queueMicrotask(() => child.stderr.emit('data', Buffer.from('session already busy')));
+        return child;
+      },
+      watchFactory: () => watcher,
+      killProcess: (pid, signal) => {
+        signals.push([pid, signal]);
+        if (pid === -9200) {
+          child.signalCode = signal;
+          child.emit('exit', null, signal);
+        }
+      },
+      inspectFrontends: () => (spawned ? [{
+        pid: 9210, pgrp: host.pgrp, start_time_ticks: '921000',
+      }] : []),
+      inspectProcessGroup: (group) => (group === host.pgrp ? [host] : []),
+      authoritativeHostProcess: host,
+      inspectHostProcess: () => host,
+    });
+    assert.equal(result.classification, 'busy');
+    assert.equal(result.cleanup_proven, false);
+    assert.equal(result.authoritative_host_continuity_proven, true);
+    assert.equal(result.authoritative_host_signaled, false);
+    assert.deepEqual(result.blocked_process_groups, [7000]);
+    assert.deepEqual(signals, [[-9200, 'SIGTERM']]);
+    assert.equal(signals.some(([pid]) => pid === -host.pgrp), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('plain resume transport rechecks durable rollout after one early coalesced notification', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codex-resume-coalesced-watch-'));
+  try {
+    const rolloutPath = join(root, 'rollout.jsonl');
+    const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
+    const message = 'OPSLE_WAKE v1 event=event-coalesced gen=3; read durable state.';
+    writeFileSync(rolloutPath, `${JSON.stringify({ ordinal: 1, type: 'session_meta' })}\n`);
+    const watcher = new EventEmitter();
+    watcher.close = () => {};
+    const child = new EventEmitter();
+    child.pid = 9125;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let observeRollout;
+    let confirmationDeadline;
+    let notifications = 0;
+    const accepted = JSON.stringify({
+      ordinal: 2,
+      type: 'response_item',
+      payload: {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: message }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn-coalesced' },
+      },
+    });
+    const began = JSON.stringify({
+      ordinal: 3,
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed', thread_id: sessionId, turn_id: 'turn-coalesced',
+        item: { type: 'UserMessage', content: [{ type: 'text', text: message }] },
+        started_at_ms: 456,
+      },
+    });
+    const resultPromise = runCodexResumeTransport({
+      sessionId,
+      message,
+      rolloutPath,
+      watchFactory: (path, callback) => {
+        assert.equal(path, rolloutPath);
+        observeRollout = (...args) => {
+          notifications += 1;
+          callback(...args);
+        };
+        return watcher;
+      },
+      spawnProcess: () => {
+        queueMicrotask(() => {
+          const split = Math.floor(accepted.length / 2);
+          writeFileSync(rolloutPath, `${readFileSync(rolloutPath, 'utf8')}${accepted.slice(0, split)}`);
+          observeRollout('change');
+          writeFileSync(rolloutPath, `${readFileSync(rolloutPath, 'utf8')}${accepted.slice(split)}\n${began}\n`);
+          confirmationDeadline();
+        });
+        return child;
+      },
+      scheduleTimeout: (callback) => {
+        confirmationDeadline = callback;
+        return { callback };
+      },
+      cancelTimeout: () => {},
+      killProcess: () => {
+        child.signalCode = 'SIGTERM';
+        child.emit('exit', null, 'SIGTERM');
+      },
+      inspectFrontends: () => [],
+      inspectProcessGroup: () => [],
+    });
+    const result = await resultPromise;
+    assert.equal(notifications, 1);
+    assert.equal(result.classification, 'confirmed');
+    assert.equal(result.turn_id, 'turn-coalesced');
+    assert.equal(result.cleanup_proven, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('default confirmation window accepts exact proof after the former busy boundary', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codex-resume-busy-boundary-'));
+  try {
+    const rolloutPath = join(root, 'rollout.jsonl');
+    const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
+    const message = 'OPSLE_WAKE v1 event=event-busy-boundary gen=3; read durable state.';
+    writeFileSync(rolloutPath, `${JSON.stringify({ ordinal: 1, type: 'session_meta' })}\n`);
+    const watcher = new EventEmitter();
+    watcher.close = () => {};
+    const child = new EventEmitter();
+    child.pid = 9140;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let observeRollout;
+    let scheduledBound;
+    const result = await runCodexResumeTransport({
+      sessionId,
+      message,
+      rolloutPath,
+      watchFactory: (_path, callback) => {
+        observeRollout = callback;
+        return watcher;
+      },
+      spawnProcess: () => {
+        queueMicrotask(() => {
+          const simulatedAcceptanceAtMs = 30_001;
+          assert.ok(simulatedAcceptanceAtMs < scheduledBound);
+          const records = [{
+            ordinal: 2,
+            type: 'response_item',
+            payload: {
+              type: 'message', role: 'user', content: [{ type: 'input_text', text: message }],
+              internal_chat_message_metadata_passthrough: { turn_id: 'turn-busy-boundary' },
+            },
+          }, {
+            ordinal: 3,
+            type: 'event_msg',
+            payload: {
+              type: 'item_completed', thread_id: sessionId, turn_id: 'turn-busy-boundary',
+              item: { type: 'UserMessage', content: [{ type: 'text', text: message }] },
+              started_at_ms: simulatedAcceptanceAtMs,
+            },
+          }];
+          writeFileSync(
+            rolloutPath,
+            `${readFileSync(rolloutPath, 'utf8')}${records.map(JSON.stringify).join('\n')}\n`,
+          );
+          observeRollout('change');
+        });
+        return child;
+      },
+      scheduleTimeout: (_callback, milliseconds) => {
+        scheduledBound = milliseconds;
+        return { milliseconds };
+      },
+      cancelTimeout: () => {},
+      killProcess: () => {
+        child.signalCode = 'SIGTERM';
+        child.emit('exit', null, 'SIGTERM');
+      },
+      inspectFrontends: () => [],
+      inspectProcessGroup: () => [],
+    });
+    assert.equal(CODEX_RESUME_CONFIRMATION_TIMEOUT_MS, 120_000);
+    assert.equal(scheduledBound, CODEX_RESUME_CONFIRMATION_TIMEOUT_MS);
+    assert.equal(result.classification, 'confirmed');
+    assert.equal(result.turn_id, 'turn-busy-boundary');
+    assert.equal(result.cleanup_proven, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('deadline expiry stays uncertain and helper covers both cleanup phases', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codex-resume-deadline-'));
+  try {
+    const rolloutPath = join(root, 'rollout.jsonl');
+    const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
+    const message = 'OPSLE_WAKE v1 event=event-deadline gen=3; read durable state.';
+    writeFileSync(rolloutPath, `${JSON.stringify({ ordinal: 1, type: 'session_meta' })}\n`);
+    const watcher = new EventEmitter();
+    watcher.close = () => {};
+    const child = new EventEmitter();
+    child.pid = 9145;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let expireConfirmation;
+    let scheduledBound;
+    const result = await runCodexResumeTransport({
+      sessionId,
+      message,
+      rolloutPath,
+      watchFactory: () => watcher,
+      spawnProcess: () => {
+        queueMicrotask(() => expireConfirmation());
+        return child;
+      },
+      scheduleTimeout: (callback, milliseconds) => {
+        expireConfirmation = callback;
+        scheduledBound = milliseconds;
+        return { milliseconds };
+      },
+      cancelTimeout: () => {},
+      cleanupTimeoutMs: 0,
+      killProcess: () => {
+        child.signalCode = 'SIGTERM';
+        child.emit('exit', null, 'SIGTERM');
+      },
+      inspectFrontends: () => [],
+      inspectProcessGroup: () => [],
+    });
+    assert.equal(scheduledBound, CODEX_RESUME_CONFIRMATION_TIMEOUT_MS);
+    assert.equal(result.classification, 'uncertain');
+    assert.equal(result.reason, 'rollout-confirmation-deadline-reached-after-spawn');
+
+    let helperTimeout;
+    const transport = plainCodexResumeTransport({
+      run: (_command, _args, options) => {
+        helperTimeout = options.timeout;
+        return { stdout: `${JSON.stringify({ classification: 'uncertain' })}\n` };
+      },
+    });
+    transport.resume({
+      session_id: sessionId,
+      message,
+      binding: {
+        rollout: { realpath: rolloutPath },
+        host: { process: { pid: 1, start_time_ticks: '1', executable: '/bin/node' } },
+      },
+    });
+    assert.equal(
+      CODEX_RESUME_WORST_CASE_CLEANUP_TIMEOUT_MS,
+      CODEX_RESUME_CLEANUP_TIMEOUT_MS * 2,
+    );
+    assert.equal(CODEX_RESUME_HELPER_TIMEOUT_MS, 135_000);
+    assert.equal(ACTIVATION_LEASE_TTL_MS, 180_000);
+    assert.ok(ACTIVATION_LEASE_TTL_MS > CODEX_RESUME_HELPER_TIMEOUT_MS);
+    assert.equal(helperTimeout, CODEX_RESUME_HELPER_TIMEOUT_MS);
+    assert.ok(helperTimeout > (
+      CODEX_RESUME_CONFIRMATION_TIMEOUT_MS
+      + CODEX_RESUME_WORST_CASE_CLEANUP_TIMEOUT_MS
+    ));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('plain resume transport classifies live busy output while the stdin keeper remains alive', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codex-resume-busy-'));
+  try {
+    const rolloutPath = join(root, 'rollout.jsonl');
+    const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
+    const message = 'OPSLE_WAKE v1 event=event-busy gen=3; read durable state.';
+    writeFileSync(rolloutPath, `${JSON.stringify({ ordinal: 1, type: 'session_meta' })}\n`);
+    const watcher = new EventEmitter();
+    watcher.close = () => {};
+    const child = new EventEmitter();
+    child.pid = 9150;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let exitedBeforeCleanup = false;
+    let confirmationTimerCalled = false;
+    let confirmationTimerCancelled = false;
+    const result = await runCodexResumeTransport({
+      sessionId,
+      message,
+      rolloutPath,
+      spawnProcess: () => {
+        queueMicrotask(() => {
+          child.stdout.emit('data', Buffer.from('Session is bu'));
+          child.stdout.emit('data', Buffer.from('sy; try again later'));
+        });
+        return child;
+      },
+      watchFactory: () => watcher,
+      scheduleTimeout: (callback) => {
+        return {
+          callback: () => {
+            confirmationTimerCalled = true;
+            callback();
+          },
+        };
+      },
+      cancelTimeout: () => { confirmationTimerCancelled = true; },
+      killProcess: (pid, signal) => {
+        assert.equal(pid, -9150);
+        assert.equal(signal, 'SIGTERM');
+        exitedBeforeCleanup = child.exitCode != null || child.signalCode != null;
+        child.signalCode = 'SIGTERM';
+        child.emit('exit', null, 'SIGTERM');
+      },
+      inspectFrontends: () => [],
+      inspectProcessGroup: () => [],
+    });
+    assert.equal(result.classification, 'busy');
+    assert.equal(result.reason, 'codex-resume-busy-before-acceptance');
+    assert.equal(exitedBeforeCleanup, false);
+    assert.equal(confirmationTimerCalled, false);
+    assert.equal(confirmationTimerCancelled, true);
+    assert.equal(result.cleanup_proven, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('bound rollout opportunity closes registration races exactly once', async () => {
+  const root = fixture();
+  try {
+    const bound = bindingFixture(root);
+    const stats = statSync(bound.rolloutPath);
+    const baseline = {
+      path: realpathSync(bound.rolloutPath),
+      device: stats.dev,
+      inode: stats.ino,
+      size_bytes: stats.size,
+    };
+    const watcher = new EventEmitter();
+    let closes = 0;
+    watcher.close = () => { closes += 1; };
+    const observation = registerBoundRolloutOpportunity(root, baseline, {
+      watchFactory: (directory) => {
+        assert.equal(directory, resolve(bound.rolloutPath, '..'));
+        writeFileSync(bound.rolloutPath, `${readFileSync(bound.rolloutPath, 'utf8')}${JSON.stringify({
+          ordinal: 2, type: 'event_msg', payload: { type: 'turn_complete' },
+        })}\n`);
+        return watcher;
+      },
+    });
+    const first = await observation.wait();
+    const second = await observation.wait();
+    assert.equal(first.type, 'bound-rollout-state-change');
+    assert.deepEqual(second, first);
+    assert.equal(closes, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('nonterminal wrapper returns and heartbeat cannot make a wait model-ready', () => {
   let current = wait();
@@ -447,7 +1139,7 @@ test('duplicate dispatcher start is idempotent and exact process death advances 
   }
 });
 
-test('exact Codex session binding validates identity and explicit generation adoption', () => {
+test('authoritative Herdr Codex binding validates exact identity and rejects generation drift', () => {
   const root = fixture();
   try {
     const bound = bindingFixture(root, { bind: false });
@@ -456,21 +1148,22 @@ test('exact Codex session binding validates identity and explicit generation ado
       '--rollout', bound.rolloutPath,
       '--sessions-root', bound.sessionsRoot,
       '--host-pid', '700',
-      '--writer-pid', '701',
-      '--tmux-session', bound.tmux.session_name,
-      '--tmux-pane', bound.tmux.pane_id,
-      '--topology', 'standalone-embedded-writer',
+      '--workspace-id', bound.host.workspace_id,
+      '--workspace-cwd', bound.host.workspace_cwd,
+      '--pane-id', bound.host.pane_id,
+      '--terminal-id', bound.host.terminal_id,
     ], { dependencies: bound.dependencies });
-    assert.equal(status.classification, 'bound-unsupported');
+    assert.equal(status.classification, 'bound-authoritative-herdr');
     assert.equal(status.valid, true);
-    assert.equal(status.supported, false);
+    assert.equal(status.supported, true);
     assert.equal(status.binding.codex_session_uuid, bound.sessionId);
     assert.equal(status.binding.rollout.realpath, realpathSync(bound.rolloutPath));
     assert.equal(status.binding.rollout.device, statSync(bound.rolloutPath).dev);
     assert.equal(status.binding.rollout.inode, statSync(bound.rolloutPath).ino);
-    assert.equal(status.binding.codex_cli_version, 'codex-cli 0.151.0');
-    assert.equal(status.binding.host_process.uid, 1000);
-    assert.equal(status.binding.tmux.pane_tty, '/dev/pts/7');
+    assert.equal(status.binding.codex_cli_version, 'codex-cli 0.152.0');
+    assert.equal(status.binding.host.authority, 'authoritative');
+    assert.equal(status.binding.host.process.uid, 1000);
+    assert.equal(status.binding.native_wake.transport, 'plain-codex-resume');
     assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
 
     const supervisor = readJson(paths(root).supervisor);
@@ -479,10 +1172,10 @@ test('exact Codex session binding validates identity and explicit generation ado
     const stale = sessionCommand(root, 'status', [], { dependencies: bound.dependencies });
     assert.equal(stale.valid, false);
     assert.ok(stale.reasons.includes('supervisor-generation-stale'));
-    const adopted = sessionCommand(root, 'adopt', [], { dependencies: bound.dependencies });
-    assert.equal(adopted.adopted, true);
-    assert.equal(adopted.binding.supervisor_generation, supervisor.generation);
-    assert.equal(adopted.status.valid, true);
+    assert.throws(
+      () => sessionCommand(root, 'adopt', [], { dependencies: bound.dependencies }),
+      /must be replaced|generation drift/,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -497,9 +1190,10 @@ test('session binding fails deterministically for duplicate and mismatched ident
       rolloutPath: duplicate.rolloutPath,
       sessionsRoot: duplicate.sessionsRoot,
       hostPid: 700,
-      writerPid: 701,
-      tmuxSession: duplicate.tmux.session_name,
-      tmuxPane: duplicate.tmux.pane_id,
+      workspaceId: duplicate.host.workspace_id,
+      workspaceCwd: duplicate.host.workspace_cwd,
+      paneId: duplicate.host.pane_id,
+      terminalId: duplicate.host.terminal_id,
     }, { dependencies: duplicate.dependencies }), /one exact rollout candidate/);
   } finally {
     rmSync(duplicateRoot, { recursive: true, force: true });
@@ -510,23 +1204,17 @@ test('session binding fails deterministically for duplicate and mismatched ident
       ...dependencies,
       realpath: (path) => (path === root ? '/wrong/repository' : realpathSync(path)),
     }), 'repository-mismatch'],
-    ['dead or reused host process', ({ dependencies }) => ({
+    ['dead or reused Herdr host process', ({ dependencies }) => ({
       ...dependencies,
       processIdentity: (pid) => (pid === 700 ? null : dependencies.processIdentity(pid)),
-    }), 'host-process-dead-or-reused'],
-    ['writer topology changed', ({ dependencies }) => ({
+    }), 'herdr-host-process-dead-or-reused'],
+    ['old tmux authority returned', ({ dependencies }) => ({
       ...dependencies,
-      processIdentity: (pid) => (pid === 701
-        ? { ...dependencies.processIdentity(pid), start_time_ticks: 'reused' }
-        : dependencies.processIdentity(pid)),
-    }), 'writer-process-dead-reused-or-topology-changed'],
-    ['tmux identity changed', ({ dependencies, tmux }) => ({
-      ...dependencies,
-      tmuxIdentity: () => ({ ...tmux, pane_tty: '/dev/pts/99' }),
-    }), 'tmux-pane-session-tty-mismatch'],
+      legacyTmuxAuthority: () => true,
+    }), 'old-tmux-authority-live'],
     ['installed CLI changed', ({ dependencies }) => ({
       ...dependencies,
-      codexVersion: () => 'codex-cli 0.152.0',
+      codexVersion: () => 'codex-cli 0.153.0',
     }), 'codex-cli-version-mismatch'],
   ];
   for (const [label, mutate, reason] of cases) {
@@ -541,6 +1229,52 @@ test('session binding fails deterministically for duplicate and mismatched ident
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  }
+
+  const supersededRoot = fixture();
+  try {
+    const first = bindingFixture(supersededRoot);
+    const old = readJson(join(supersededRoot, '.opsle', 'wake', 'codex-session-binding.json'));
+    bindCodexSession(supersededRoot, {
+      sessionId: first.sessionId,
+      rolloutPath: first.rolloutPath,
+      sessionsRoot: first.sessionsRoot,
+      hostPid: 700,
+      workspaceId: first.host.workspace_id,
+      workspaceCwd: first.host.workspace_cwd,
+      paneId: first.host.pane_id,
+      terminalId: first.host.terminal_id,
+    }, { dependencies: first.dependencies });
+    const stale = codexSessionBindingStatus(supersededRoot, {
+      binding: old,
+      dependencies: first.dependencies,
+    });
+    assert.equal(stale.valid, false);
+    assert.ok(stale.reasons.includes('session-binding-superseded'));
+  } finally {
+    rmSync(supersededRoot, { recursive: true, force: true });
+  }
+
+  const identityRoot = fixture();
+  try {
+    const bound = bindingFixture(identityRoot);
+    const binding = readJson(join(identityRoot, '.opsle', 'wake', 'codex-session-binding.json'));
+    const changedSession = codexSessionBindingStatus(identityRoot, {
+      binding: { ...binding, codex_session_uuid: '01a05952-e1fa-71e2-adea-df7e3f7d99cf' },
+      dependencies: bound.dependencies,
+    });
+    assert.equal(changedSession.valid, false);
+    assert.ok(changedSession.reasons.includes('rollout-session-meta-mismatch'));
+    const supervisor = readJson(paths(identityRoot).supervisor);
+    supervisor.supervisor_id = 'supervisor-replaced';
+    writeJson(paths(identityRoot).supervisor, supervisor);
+    const changedSupervisor = codexSessionBindingStatus(identityRoot, {
+      dependencies: bound.dependencies,
+    });
+    assert.equal(changedSupervisor.valid, false);
+    assert.ok(changedSupervisor.reasons.includes('supervisor-identity-mismatch'));
+  } finally {
+    rmSync(identityRoot, { recursive: true, force: true });
   }
 
   for (const mode of ['metadata', 'missing', 'replaced', 'duplicate']) {
@@ -574,33 +1308,40 @@ test('session binding fails deterministically for duplicate and mismatched ident
   }
 });
 
-test('standalone writer topology retains queued work with zero resume and zero terminal input', async () => {
+test('authoritative Herdr binding rejects stale tmux authority before any transport call', async () => {
   const root = fixture();
   try {
     const bound = bindingFixture(root);
     const event = terminalEvent(root, 'unsupported-writer');
     enqueueTerminalWake(root, event);
     let resumeCalls = 0;
-    let terminalCalls = 0;
+    bound.dependencies.legacyTmuxAuthority = () => true;
     const nativeTransport = {
-      kind: 'shared-app-server-rpc',
-      resume: () => { resumeCalls += 1; return { submitted: true }; },
+      kind: 'plain-codex-resume',
+      resume: () => { resumeCalls += 1; return {
+        classification: 'confirmed', cleanup_proven: true,
+        authoritative_host_continuity_proven: true,
+      }; },
     };
     const result = deliverWake(root, event.event_id, {
       nativeTransport,
       bindingDependencies: bound.dependencies,
-      host: { commit: () => { terminalCalls += 1; } },
     });
-    assert.equal(result.classification, 'unsupported-topology');
-    assert.equal(result.reason, 'codex-0.151.0-standalone-embedded-writer-lock');
+    assert.equal(result.classification, 'queued');
+    assert.equal(result.reason, 'codex-session-binding-stale');
     assert.equal(result.delivered, false);
     assert.equal(resumeCalls, 0);
-    assert.equal(terminalCalls, 0);
     assert.equal(existsSync(join(root, '.opsle', 'wake', 'requests', `${event.event_id}.json`)), true);
     assert.equal(existsSync(join(root, '.opsle', 'wake', 'deliveries', `${event.event_id}.json`)), false);
     assert.equal(existsSync(join(root, '.opsle', 'wake', 'activation-decisions', `${event.event_id}.json`)), false);
 
-    const dispatcher = stageDispatcher(root);
+    const owner = processIdentity(process.pid);
+    const dispatcher = stageDispatcher(root, {
+      pid: owner.pid,
+      startTime: owner.start_time_ticks,
+    });
+    dispatcher.process.executable = owner.executable;
+    writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
     const dispatched = await runWakeDispatcher(root, {
       dispatcherId: dispatcher.dispatcher_id,
       dispatcherGeneration: dispatcher.dispatcher_generation,
@@ -611,28 +1352,32 @@ test('standalone writer topology retains queued work with zero resume and zero t
       bindingDependencies: bound.dependencies,
       maxCycles: 1,
     });
-    assert.equal(dispatched.results[0].classification, 'unsupported-topology');
+    assert.equal(dispatched.results[0].classification, 'queued');
     assert.equal(resumeCalls, 0);
-    assert.equal(terminalCalls, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('supported native topology uses a tiny message and an exactly-once decision boundary', () => {
+test('unchanged delivery fences preserve canonical plain Codex resume exactly once', () => {
   const root = fixture();
   try {
-    const bound = bindingFixture(root, { topology: 'shared-app-server' });
+    const bound = bindingFixture(root);
     const event = terminalEvent(root, 'native-supported');
     enqueueTerminalWake(root, event);
+    const dispatcher = stageCurrentDispatcher(root);
     const calls = [];
     const nativeTransport = {
-      kind: 'shared-app-server-rpc',
-      resume: (request) => { calls.push(request); return { submitted: true }; },
+      kind: 'plain-codex-resume',
+      resume: (request) => {
+        calls.push(request);
+        return confirmedResumeResult(request.session_id, request.message, 9000);
+      },
     };
     const delivered = deliverWake(root, event.event_id, {
       nativeTransport,
       bindingDependencies: bound.dependencies,
+      dispatcher,
     });
     assert.equal(delivered.delivered, true);
     assert.equal(calls.length, 1);
@@ -640,18 +1385,443 @@ test('supported native topology uses a tiny message and an exactly-once decision
       event.event_id,
       readJson(paths(root).supervisor).generation,
     ));
-    assert.match(calls[0].message, /^OPSLE_WAKE v1 event=[^ ]+ gen=\d+; read durable repository state\.$/);
+    assert.match(calls[0].message, /^OPSLE_WAKE v1 event=[^ ]+ gen=\d+; read durable state\.$/);
     assert.doesNotMatch(calls[0].message, /task-|attempt-|child output|claimed outcome/i);
     assert.equal(deliverWake(root, event.event_id, {
       nativeTransport,
       bindingDependencies: bound.dependencies,
+      dispatcher,
     }).classification, 'duplicate');
     assert.equal(calls.length, 1);
+    assert.deepEqual(delivered.receipt.temporary_frontend.argv, [
+      'codex', 'resume', bound.sessionId, calls[0].message,
+    ]);
+    assert.equal(delivered.receipt.temporary_frontend.cleanup_proven, true);
+    assert.equal(delivered.receipt.rollout_confirmation.turn_id, 'turn-1');
+    assert.equal(readJson(join(
+      root,
+      '.opsle',
+      'wake',
+      'activation-decisions',
+      `${event.event_id}.json`,
+    )).status, 'DELIVERED');
+    assert.equal(events(root).filter((entry) => (
+      entry.type === 'HOST_WAKE_DELIVERED'
+      && entry.source_event_id === event.event_id
+    )).length, 1);
     const generation = readJson(paths(root).supervisor).generation;
+    assert.throws(() => consumeWakeDelivery(root, event.event_id, {
+      deliveryId: delivered.receipt.delivery_id,
+      generation: generation + 1,
+    }), /stale supervisor generation/);
     assert.equal(consumeWakeDelivery(root, event.event_id, {
       deliveryId: delivered.receipt.delivery_id,
       generation,
     }).duplicate, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const regression of [
+  {
+    name: 'supervisor generation recovery',
+    reason: 'supervisor-delivery-fence-changed-after-native-transport',
+    mutate(root) {
+      const supervisor = readJson(paths(root).supervisor);
+      supervisor.generation += 1;
+      writeJson(paths(root).supervisor, supervisor);
+    },
+  },
+  {
+    name: 'supervisor identity replacement',
+    reason: 'supervisor-delivery-fence-changed-after-native-transport',
+    mutate(root) {
+      const supervisor = readJson(paths(root).supervisor);
+      supervisor.supervisor_id = 'supervisor-mid-transport-replacement';
+      writeJson(paths(root).supervisor, supervisor);
+    },
+  },
+  {
+    name: 'dispatcher generation replacement',
+    reason: 'dispatcher-fence-no-longer-current-after-native-transport',
+    mutate(root) {
+      const path = join(root, '.opsle', 'wake', 'dispatcher.json');
+      const dispatcher = readJson(path);
+      dispatcher.dispatcher_generation += 1;
+      writeJson(path, dispatcher);
+    },
+  },
+  {
+    name: 'dispatcher process replacement',
+    reason: 'dispatcher-fence-no-longer-current-after-native-transport',
+    mutate(root) {
+      const path = join(root, '.opsle', 'wake', 'dispatcher.json');
+      const dispatcher = readJson(path);
+      dispatcher.process.start_time_ticks = 'replacement-start-time';
+      writeJson(path, dispatcher);
+    },
+  },
+  {
+    name: 'queue version change',
+    reason: 'wake-queue-version-changed-after-native-transport',
+    mutate(root, eventId) {
+      const path = join(root, '.opsle', 'wake', 'requests', `${eventId}.json`);
+      const request = readJson(path);
+      request.queue_version += 1;
+      writeJson(path, request);
+    },
+  },
+  {
+    name: 'request content change',
+    reason: 'wake-request-changed-after-native-transport',
+    mutate(root, eventId) {
+      const path = join(root, '.opsle', 'wake', 'requests', `${eventId}.json`);
+      const request = readJson(path);
+      request.attempt_id = 'attempt-mid-transport-replacement';
+      writeJson(path, request);
+    },
+  },
+  {
+    name: 'activation lease takeover',
+    reason: 'activation-lease-fence-changed-after-native-transport',
+    mutate(root) {
+      const path = join(root, '.opsle', 'wake', 'activation-lease.json');
+      const lease = readJson(path);
+      lease.lease_id = 'activation-lease-mid-transport-takeover';
+      lease.event_id = 'event-mid-transport-takeover';
+      lease.fencing_token += 1;
+      writeJson(path, lease);
+    },
+  },
+  {
+    name: 'activation decision replacement',
+    reason: 'activation-decision-fence-mismatch',
+    decisionFailure: 'concurrent-uncertain-decision',
+    mutate(root, eventId) {
+      const path = join(
+        root,
+        '.opsle',
+        'wake',
+        'activation-decisions',
+        `${eventId}.json`,
+      );
+      const decision = readJson(path);
+      decision.status = 'UNCERTAIN';
+      decision.failure = 'concurrent-uncertain-decision';
+      writeJson(path, decision);
+    },
+  },
+]) {
+  test(`confirmed transport fails closed after mid-transport ${regression.name}`, () => {
+    const root = fixture();
+    try {
+      const bound = bindingFixture(root);
+      const event = terminalEvent(root, `post-transport-${regression.name.replaceAll(' ', '-')}`);
+      enqueueTerminalWake(root, event);
+      const dispatcher = stageCurrentDispatcher(root);
+      const attemptPath = join(paths(root).attempts, `${event.attempt_id}.json`);
+      writeJson(attemptPath, {
+        attempt_id: event.attempt_id,
+        telemetry: {
+          activation_counts: {
+            evidence: 'fixture',
+            total_automatic: 0,
+            terminal_event: 0,
+            human: 0,
+            wait_induced_automatic: 0,
+          },
+        },
+      });
+      const stateBefore = readFileSync(paths(root).state);
+      const telemetryBefore = readFileSync(attemptPath);
+      let transportCalls = 0;
+      const nativeTransport = {
+        kind: 'plain-codex-resume',
+        resume: (request) => {
+          transportCalls += 1;
+          regression.mutate(root, event.event_id);
+          return confirmedResumeResult(request.session_id, request.message, 9300);
+        },
+      };
+      const result = deliverWake(root, event.event_id, {
+        nativeTransport,
+        bindingDependencies: bound.dependencies,
+        dispatcher,
+      });
+      assert.equal(result.classification, 'uncertain');
+      assert.equal(result.reason, regression.reason);
+      assert.equal(result.delivered, false);
+      assert.equal(result.replayed, false);
+      assert.equal(transportCalls, 1);
+      assert.equal(existsSync(join(
+        root,
+        '.opsle',
+        'wake',
+        'deliveries',
+        `${event.event_id}.json`,
+      )), false);
+      const decision = readJson(join(
+        root,
+        '.opsle',
+        'wake',
+        'activation-decisions',
+        `${event.event_id}.json`,
+      ));
+      assert.equal(decision.status, 'UNCERTAIN');
+      assert.equal(
+        decision.failure,
+        regression.decisionFailure ?? regression.reason,
+      );
+      assert.deepEqual(readFileSync(paths(root).state), stateBefore);
+      assert.deepEqual(readFileSync(attemptPath), telemetryBefore);
+      assert.equal(events(root).some((entry) => (
+        (entry.type === 'SUPERVISOR_ACTIVATION'
+          && entry.cause_event_id === event.event_id)
+        || (entry.type === 'SUPERVISOR_REACTIVATED'
+          && entry.cause_event_id === event.event_id)
+        || (entry.type === 'HOST_WAKE_DELIVERED'
+          && entry.source_event_id === event.event_id)
+      )), false);
+
+      deliverWake(root, event.event_id, {
+        nativeTransport,
+        bindingDependencies: bound.dependencies,
+        dispatcher,
+      });
+      assert.equal(transportCalls, 1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test('busy-before-acceptance remains queued and dispatcher retry follows an observed state change', async () => {
+  const root = fixture();
+  try {
+    const bound = bindingFixture(root);
+    const event = terminalEvent(root, 'busy-retry');
+    enqueueTerminalWake(root, event);
+    const dispatcherOwner = processIdentity(process.pid);
+    const dispatcher = stageDispatcher(root, {
+      pid: dispatcherOwner.pid,
+      startTime: dispatcherOwner.start_time_ticks,
+    });
+    dispatcher.process.executable = dispatcherOwner.executable;
+    writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
+    let calls = 0;
+    let opportunityWaits = 0;
+    let opportunityRegistrations = 0;
+    let delayCalls = 0;
+    const transport = {
+      kind: 'plain-codex-resume',
+      resume: (request) => {
+        calls += 1;
+        if (calls === 1) {
+          return { classification: 'busy', reason: 'codex-resume-busy-before-acceptance' };
+        }
+        return confirmedResumeResult(request.session_id, request.message, 9200, {
+          accepted_ordinal: 20, accepted_record_sha256: 'c'.repeat(64),
+          turn_began_ordinal: 21, turn_began_record_sha256: 'd'.repeat(64),
+          turn_id: 'turn-busy-retry', turn_started_at_ms: 2,
+        });
+      },
+    };
+    const result = await runWakeDispatcher(root, {
+      dispatcherId: dispatcher.dispatcher_id,
+      dispatcherGeneration: dispatcher.dispatcher_generation,
+      launchNonce: dispatcher.launch_nonce,
+      pid: dispatcher.process.pid,
+      getProcessIdentity: () => dispatcher.process,
+      nativeTransport: transport,
+      bindingDependencies: bound.dependencies,
+      observeBoundRollout: (_fixtureRoot, baseline) => {
+        opportunityRegistrations += 1;
+        assert.equal(baseline.path, realpathSync(bound.rolloutPath));
+        return {
+        close() {},
+        wait: async () => {
+          opportunityWaits += 1;
+          return { type: 'bound-rollout-state-change', path: bound.rolloutPath };
+        },
+        };
+      },
+      delay: async () => { delayCalls += 1; },
+      maxCycles: 2,
+    });
+    assert.equal(opportunityWaits, 1);
+    assert.equal(opportunityRegistrations, 2);
+    assert.equal(delayCalls, 0);
+    assert.equal(calls, 2, JSON.stringify(result));
+    assert.equal(result.results[0].classification, 'native-delivered');
+    const decision = readJson(join(root, '.opsle', 'wake', 'activation-decisions', `${event.event_id}.json`));
+    assert.equal(decision.status, 'DELIVERED');
+    assert.equal(decision.prior_attempts[0].status, 'BUSY');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('uncertain dispatcher delivery is not replayed by an opportunity signal', async () => {
+  const root = fixture();
+  try {
+    const bound = bindingFixture(root);
+    const event = terminalEvent(root, 'uncertain-no-replay');
+    enqueueTerminalWake(root, event);
+    const owner = processIdentity(process.pid);
+    const dispatcher = stageDispatcher(root, {
+      pid: owner.pid,
+      startTime: owner.start_time_ticks,
+    });
+    dispatcher.process.executable = owner.executable;
+    writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
+    let calls = 0;
+    let waits = 0;
+    let closes = 0;
+    const result = await runWakeDispatcher(root, {
+      dispatcherId: dispatcher.dispatcher_id,
+      dispatcherGeneration: dispatcher.dispatcher_generation,
+      launchNonce: dispatcher.launch_nonce,
+      pid: dispatcher.process.pid,
+      getProcessIdentity: () => dispatcher.process,
+      nativeTransport: {
+        kind: 'plain-codex-resume',
+        resume: () => {
+          calls += 1;
+          return { classification: 'uncertain', reason: 'fixture-uncertain' };
+        },
+      },
+      bindingDependencies: bound.dependencies,
+      observeBoundRollout: () => ({
+        close: () => { closes += 1; },
+        wait: async () => {
+          waits += 1;
+          return { type: 'bound-rollout-state-change' };
+        },
+      }),
+      maxCycles: 2,
+    });
+    assert.equal(result.reason, 'delivery-not-replayable');
+    assert.equal(calls, 1);
+    assert.equal(waits, 0);
+    assert.equal(closes, 1);
+    const decision = readJson(join(root, '.opsle', 'wake', 'activation-decisions', `${event.event_id}.json`));
+    assert.equal(decision.status, 'UNCERTAIN');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('activation decision fence rejects malformed, expired, and boundary expiry', () => {
+  const root = fixture();
+  try {
+    const acquired = acquireActivationLease(root, 'event-fence-expiry', {
+      nowMs: 1_000,
+      ttlMs: 100,
+    });
+    assert.equal(acquired.acquired, true);
+    assert.equal(decisionFenceCurrent(root, acquired.lease, { nowMs: 1_099 }), true);
+    assert.equal(decisionFenceCurrent(root, acquired.lease, { nowMs: 1_100 }), false);
+    assert.equal(decisionFenceCurrent(root, acquired.lease, { nowMs: 1_101 }), false);
+    assert.equal(decisionFenceCurrent(root, {
+      ...acquired.lease,
+      expires_at: 'malformed-expiry',
+    }, { nowMs: 1_000 }), false);
+
+    const leasePath = join(root, '.opsle', 'wake', 'activation-lease.json');
+    const malformed = readJson(leasePath);
+    malformed.expires_at = 'malformed-expiry';
+    writeJson(leasePath, malformed);
+    assert.equal(decisionFenceCurrent(root, malformed, { nowMs: 1_000 }), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('post-transport lease expiry without takeover is uncertain and non-replayable', () => {
+  const root = fixture();
+  try {
+    const bound = bindingFixture(root);
+    const event = terminalEvent(root, 'post-transport-lease-expiry');
+    enqueueTerminalWake(root, event);
+    const dispatcher = stageCurrentDispatcher(root);
+    const attemptPath = join(paths(root).attempts, `${event.attempt_id}.json`);
+    writeJson(attemptPath, {
+      attempt_id: event.attempt_id,
+      telemetry: {
+        activation_counts: {
+          evidence: 'fixture',
+          total_automatic: 0,
+          terminal_event: 0,
+          human: 0,
+          wait_induced_automatic: 0,
+        },
+      },
+    });
+    const stateBefore = readFileSync(paths(root).state);
+    const telemetryBefore = readFileSync(attemptPath);
+    const acquiredAtMs = 1_000;
+    let transportCompleted = false;
+    let transportCalls = 0;
+    const nativeTransport = {
+      kind: 'plain-codex-resume',
+      resume: (request) => {
+        transportCalls += 1;
+        transportCompleted = true;
+        return confirmedResumeResult(request.session_id, request.message, 9400);
+      },
+    };
+    const deliveryOptions = {
+      nativeTransport,
+      bindingDependencies: bound.dependencies,
+      dispatcher,
+      getActivationNowMs: () => (
+        transportCompleted
+          ? acquiredAtMs + ACTIVATION_LEASE_TTL_MS + 1
+          : acquiredAtMs
+      ),
+    };
+    const result = deliverWake(root, event.event_id, deliveryOptions);
+    assert.equal(result.classification, 'uncertain');
+    assert.equal(result.reason, 'activation-lease-fence-changed-after-native-transport');
+    assert.equal(result.delivered, false);
+    assert.equal(result.replayed, false);
+    assert.equal(transportCalls, 1);
+    assert.equal(existsSync(join(
+      root,
+      '.opsle',
+      'wake',
+      'deliveries',
+      `${event.event_id}.json`,
+    )), false);
+    const decision = readJson(join(
+      root,
+      '.opsle',
+      'wake',
+      'activation-decisions',
+      `${event.event_id}.json`,
+    ));
+    assert.equal(decision.status, 'UNCERTAIN');
+    assert.equal(
+      decision.failure,
+      'activation-lease-fence-changed-after-native-transport',
+    );
+    assert.deepEqual(readFileSync(paths(root).state), stateBefore);
+    assert.deepEqual(readFileSync(attemptPath), telemetryBefore);
+    assert.equal(events(root).some((entry) => (
+      (entry.type === 'SUPERVISOR_ACTIVATION'
+        && entry.cause_event_id === event.event_id)
+      || (entry.type === 'SUPERVISOR_REACTIVATED'
+        && entry.cause_event_id === event.event_id)
+      || (entry.type === 'HOST_WAKE_DELIVERED'
+        && entry.source_event_id === event.event_id)
+    )), false);
+
+    const replay = deliverWake(root, event.event_id, deliveryOptions);
+    assert.equal(replay.classification, 'queued');
+    assert.equal(replay.reason, 'activation-decision-uncertain');
+    assert.equal(replay.delivered, false);
+    assert.equal(transportCalls, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -696,15 +1866,15 @@ test('activation lease serializes owners, fences generations, expires, and relea
   }
 });
 
-test('crash-uncertain native activation never crosses the decision boundary twice', () => {
+test('uncertain plain resume activation never crosses the decision boundary twice', () => {
   const root = fixture();
   try {
-    const bound = bindingFixture(root, { topology: 'shared-app-server' });
+    const bound = bindingFixture(root);
     const event = terminalEvent(root, 'native-crash');
     enqueueTerminalWake(root, event);
     let calls = 0;
     const transport = {
-      kind: 'shared-app-server-rpc',
+      kind: 'plain-codex-resume',
       resume: () => { calls += 1; throw new Error('connection lost after submit'); },
     };
     const first = deliverWake(root, event.event_id, {
