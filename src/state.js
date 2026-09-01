@@ -353,6 +353,35 @@ export function validateDurableState(root) {
     if (!VALID_CHILD_STATES.has(attempt.child_state)) errors.push(`invalid child state in ${file}`);
     if (!existsSync(join(p.tasks, `${attempt.task_id}.json`))) errors.push(`orphan attempt ${attempt.attempt_id}`);
   }
+  const wake = join(p.opsle, 'wake');
+  const sessionBinding = join(wake, 'codex-session-binding.json');
+  if (existsSync(sessionBinding)) {
+    const binding = readJson(sessionBinding);
+    if (binding.schema !== 'opsle.durable-supervisor.codex-session-binding/v1') {
+      errors.push('invalid Codex session binding schema');
+    }
+    if (binding.supervisor_id !== supervisor.supervisor_id) {
+      errors.push('Codex session binding supervisor identity mismatch');
+    }
+  }
+  const activationLease = join(wake, 'activation-lease.json');
+  if (existsSync(activationLease)) {
+    const lease = readJson(activationLease);
+    if (lease.schema !== 'opsle.durable-supervisor.activation-lease/v1'
+        || !Number.isSafeInteger(lease.fencing_token)
+        || lease.fencing_token <= 0) {
+      errors.push('invalid activation lease');
+    }
+  }
+  const activationDecisions = join(wake, 'activation-decisions');
+  if (existsSync(activationDecisions)) {
+    for (const file of readdirSync(activationDecisions).filter((name) => name.endsWith('.json'))) {
+      const decision = readJson(join(activationDecisions, file));
+      if (decision.schema !== 'opsle.durable-supervisor.activation-decision/v1') {
+        errors.push(`invalid activation decision in ${file}`);
+      }
+    }
+  }
   return { valid: errors.length === 0, errors };
 }
 

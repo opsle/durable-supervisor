@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-4155d216-7544-40a9-94ac-f6828cb920f9","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":9,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-persistent-host-wakeup-dispatcher","time":"2026-09-01T01:19:05.892Z","type":"TASK_HANDOFF_CREATED"}

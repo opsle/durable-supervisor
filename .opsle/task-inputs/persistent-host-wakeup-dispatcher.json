@@ -1,0 +1,111 @@
+{
+  "task_id": "task-persistent-host-wakeup-dispatcher",
+  "parent_decision_id": "decision-f1194fa5-566c-44f6-b92c-ea0a626851d8",
+  "title": "Replace finite wake adapter with persistent safe dispatcher",
+  "objective": "Implement the smallest repository-local provider-free host dispatcher that persists independently of Runner and supervisor tool turns, observes durable terminal wake requests, evaluates the current authoritative tmux supervisor immediately before delivery without a launch-time readiness lease, queues indefinitely while unsafe or unavailable, and delivers and consumes each event exactly once after safe prompt-idle or later recovery.",
+  "scope": [
+    "persistent detached host dispatcher lifecycle and generation fencing",
+    "immediate tmux prompt-idle, busy, human-typing, and unavailable classification",
+    "indefinite durable terminal-event queue and exact-once delivery",
+    "recovery adoption and dispatcher restart",
+    "focused race tests and operator documentation"
+  ],
+  "authorization": {
+    "may": [
+      "inspect and modify the uncommitted detached Runner and host wakeup implementation",
+      "replace launch-time readiness leases and five-second adapters with a repository-local detached provider-free dispatcher",
+      "use filesystem event notification plus provider-free bounded host-state reevaluation while queued events exist",
+      "add exact PID, process-start, supervisor identity, generation, and queue-version fencing",
+      "add deterministic dependency-injected tests and run focused and full verification"
+    ],
+    "may_modify": [
+      "src/**",
+      "bin/**",
+      "tests/**",
+      "README.md",
+      "ARCHITECTURE.md",
+      "SPEC.md",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "modify or delete the existing CHILD_COMPLETION event event-c2b96a59-251f-4514-82e4-2ab8b029f561 or HOST_WAKE_DEFERRED event event-b48638dd-9de3-4b9c-8ec3-3e051a57c3d3",
+      "modify sibling repositories or install a server-wide service",
+      "clear, overwrite, submit, or reinterpret human-composed input",
+      "weaken supervisor identity, generation, pane, process, composer, attached-client, delivery-receipt, queue-version, or claim fences",
+      "enable Claude or review, add model polling, deploy, merge, push, initialize another repository, or broaden scope"
+    ]
+  },
+  "required_inputs": [
+    "src/runner.js",
+    "src/wakeup.js",
+    "src/host-terminal.js",
+    "src/cli.js",
+    "bin/opsle-wake-delivery.js",
+    "tests/wakeup.test.js",
+    "tests/detached-runner.test.js",
+    ".opsle/events/event-c2b96a59-251f-4514-82e4-2ab8b029f561.json",
+    ".opsle/events/event-b48638dd-9de3-4b9c-8ec3-3e051a57c3d3.json",
+    ".opsle/wake/requests/event-c2b96a59-251f-4514-82e4-2ab8b029f561.json"
+  ],
+  "relevant_context": [
+    "Immutable live timing shows CHILD_COMPLETION at 23:54:36.916Z, HOST_WAKE_QUEUED at 23:54:36.931Z, and HOST_WAKE_DEFERRED at 23:54:41.776Z with ambiguous-composer. The initial delivery attempt was prompt; the architectural defect is that the five-second adapter then exited and nothing remained to observe a later safe-idle transition.",
+    "The current readiness lease was asserted at child launch and is now expired. Prompt safety must instead be derived conservatively from current host evidence immediately before each delivery attempt.",
+    "The authoritative Codex supervisor runs persistently in tmux. A detached repository-local Node dispatcher is permitted; external GUI, container, distributed service, server-wide installation, and model inference are not.",
+    "The dispatcher must not wake on heartbeat or nonterminal progress. Only terminal completion/failure/timeout/stall/intervention requests already admitted by enqueueTerminalWake are eligible.",
+    "When no queued requests exist, wait on filesystem/event notification without model activity. While a request is queued but the host is unsafe, provider-free re-evaluation may use a conservative bounded backoff and must not expire or discard the request.",
+    "Safe prompt-idle must require an authoritative live session/pane/Codex process, no attached human client, a directly observed empty Codex composer and idle prompt, and an immediate tmux server-side final predicate before literal paste plus Enter.",
+    "Busy Codex, attached human interaction, nonempty human composer text, unavailable tmux, ambiguous capture, and stale generation must all defer without input.",
+    "A dispatcher must be single-owner and generation-fenced. Recovery adopts receipt-free queued requests, retires or supersedes stale dispatchers, starts the current dispatcher, and later consumes a delivered event once.",
+    "A CLAIMED or UNCERTAIN delivery receipt remains non-replayable. DELIVERED and CONSUMED are idempotent duplicates.",
+    "Preserve the default detached Runner, explicit foreground fallback, zero wait-induced activations, Codex enabled, Claude disabled, review off, Gearbox required, and Context Firewall required."
+  ],
+  "expected_deliverable": "A narrow provider-free persistent dispatcher implementation with durable lifecycle evidence, current-state prompt classification, indefinite exact-once queue semantics, recovery restart/adoption, and deterministic race coverage.",
+  "expected_evidence": [
+    "idle terminal completion is delivered once without a pre-created readiness lease",
+    "busy supervisor defers and later idle transition delivers once",
+    "attached human and nonempty human composer both defer without any input",
+    "tmux unavailable at completion retains the request indefinitely and later recovery delivers once",
+    "duplicate event, duplicate dispatcher, duplicate drain, and duplicate recovery do not resend",
+    "stale supervisor generation and stale dispatcher cannot deliver or consume a newer event",
+    "dispatcher crash/restart retains receipt-free queued work and never replays uncertain delivery",
+    "heartbeat and nonterminal progress do not activate the dispatcher delivery path",
+    "focused tests and npm run verify pass"
+  ],
+  "acceptance_criteria": [
+    "the finite five-second wake adapter and launch-time prompt-readiness lease are no longer the canonical path",
+    "a persistent provider-free dispatcher owns host wake observation independently of Runner and supervisor turns",
+    "queued eligible requests have no delivery expiry and survive dispatcher, supervisor, tmux, and process unavailability",
+    "prompt readiness is conservatively evaluated from current evidence immediately before delivery and final commit",
+    "human-composed input is never cleared, overwritten, or submitted",
+    "delivery and consumption remain durable, idempotent, generation-fenced, and fail closed under uncertainty",
+    "recovery adopts queued work and ensures exactly one current dispatcher",
+    "wait-induced automatic model activations remain zero",
+    "focused and full deterministic tests pass",
+    "Context Firewall packet is complete_for_decision and no unexpected files change"
+  ],
+  "prohibited_actions": [
+    "blind tmux injection or optimistic composer inference",
+    "finite queue TTL or deletion of undelivered terminal requests",
+    "one dispatcher per event or multiple unfenced dispatcher owners",
+    "model polling, heartbeat-triggered inference, or supervisor wait cells",
+    "rewriting failed live evidence, broad refactoring, release, deployment, merge, push, or global installation"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled with configured model and reasoning effort",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "requirement_ids": [],
+  "route_hint": "codex",
+  "deterministic_command": null,
+  "verification_command": [
+    "npm",
+    "run",
+    "verify"
+  ],
+  "expects_changes": true,
+  "timeout_seconds": 1800
+}

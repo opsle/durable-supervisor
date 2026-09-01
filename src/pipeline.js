@@ -73,6 +73,28 @@ function validateRelativePath(value) {
   return value;
 }
 
+function validateArgv(value, field) {
+  if (value == null) return;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`${field} must be a nonempty argv array`);
+  }
+  if (typeof value[0] !== 'string' || value[0].length === 0) {
+    throw new Error(`${field}[0] must be a nonempty command string`);
+  }
+  if (value.some((argument) => typeof argument !== 'string')) {
+    throw new Error(`${field} argv entries must all be strings`);
+  }
+}
+
+export function validateTaskCommands(task) {
+  validateArgv(task.deterministic_command, 'deterministic_command');
+  validateArgv(task.verification_command, 'verification_command');
+  if (task.route_hint === 'deterministic' && task.deterministic_command == null) {
+    throw new Error('deterministic route requires deterministic_command argv');
+  }
+  return task;
+}
+
 export function validateHandoff(input) {
   const required = [
     'title', 'objective', 'scope', 'authorization', 'expected_deliverable',
@@ -87,6 +109,7 @@ export function validateHandoff(input) {
   if (!Array.isArray(input.acceptance_criteria) || input.acceptance_criteria.length === 0) {
     throw new Error('acceptance criteria must be nonempty');
   }
+  validateTaskCommands(input);
   return input;
 }
 
@@ -145,6 +168,7 @@ function filterCapabilities(discovery, policy) {
 }
 
 export function routeTask(root, task) {
+  validateTaskCommands(task);
   const p = paths(root);
   const policy = readJson(p.policy);
   const discovery = discoverCapabilities(root);
@@ -236,17 +260,35 @@ export function releaseClaim(root, claim, status = 'COMPLETED') {
   const path = join(p.claims, `${claim.claim_id}.json`);
   const current = readJson(path);
   if (current.fence_generation !== claim.fence_generation) throw new Error('stale claim fence');
+  const indexPath = join(p.claims, 'index.json');
+  const index = readJson(indexPath);
+  if (current.status !== 'ACTIVE') {
+    if (current.status !== status) {
+      throw new Error(`claim is already terminal: ${current.status}`);
+    }
+    const indexed = index[`task-${claim.task_id}`];
+    if (indexed?.claim_id !== current.claim_id
+        || indexed.fence_generation !== current.fence_generation
+        || indexed.status !== current.status
+        || indexed.completed_at !== current.completed_at) {
+      index[`task-${claim.task_id}`] = current;
+      writeJson(indexPath, index);
+    }
+    return current;
+  }
   current.status = status;
   current.completed_at = now();
   writeJson(path, current);
-  const indexPath = join(p.claims, 'index.json');
-  const index = readJson(indexPath);
   index[`task-${claim.task_id}`] = current;
   writeJson(indexPath, index);
   return current;
 }
 
 export function createAttempt(root, task, gearbox, claimFactory = acquireClaim) {
+  validateTaskCommands(task);
+  if (task.state === 'REJECTED') {
+    throw new Error(`rejected task cannot be relaunched: ${task.task_id}`);
+  }
   const p = paths(root);
   const policy = readJson(p.policy);
   const supervisor = readJson(p.supervisor);

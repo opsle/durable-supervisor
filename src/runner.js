@@ -9,10 +9,18 @@ import {
   statSync,
 } from 'node:fs';
 import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { canonicalJson, id, now, readJson, sha256, writeJson } from './io.js';
 import { emit, paths, updateState } from './state.js';
-import { releaseClaim } from './pipeline.js';
-import { applyWakeEvent, registerWait, terminalWakeType } from './wakeup.js';
+import { releaseClaim, validateTaskCommands } from './pipeline.js';
+import {
+  applyWakeEvent,
+  enqueueTerminalWake,
+  ensureWakeDispatcher,
+  registerWait,
+  terminalWakeType,
+} from './wakeup.js';
 
 const CONTEXT_PACKET_SCHEMA = 'opsle.durable-supervisor.context-firewall-packet/v2';
 const BYTE_MEASUREMENT = Object.freeze({
@@ -258,34 +266,11 @@ function rawReference(path, root) {
   return { path: relative(root, path), bytes, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') };
 }
 
-export async function runAttempt(root, task, attempt, claim) {
+function prepareAttemptLaunch(root, task, attempt, mode) {
   const p = paths(root);
   const attemptPath = join(p.attempts, `${attempt.attempt_id}.json`);
-  const rawDirectory = join(p.raw, attempt.attempt_id);
-  mkdirSync(rawDirectory, { recursive: true, mode: 0o700 });
-  const stdoutPath = join(rawDirectory, 'stdout.jsonl');
-  const stderrPath = join(rawDirectory, 'stderr.log');
-  const lastMessagePath = join(rawDirectory, 'last-message.txt');
-  const before = snapshotFiles(root);
-  const policy = attempt.policy_snapshot;
-  let command;
-  let args;
-  if (attempt.gearbox_route === 'codex') {
-    command = attempt.policy_snapshot.gearbox_decision.discovery.commands.codex.path;
-    args = [
-      'exec',
-      '--model', policy.model,
-      '-c', `model_reasoning_effort="${policy.reasoning_effort}"`,
-      '-c', 'approval_policy="never"',
-      '--sandbox', 'workspace-write',
-      '--cd', root,
-      '--json',
-      '--color', 'never',
-      '--output-last-message', lastMessagePath,
-      childPrompt(task, attempt),
-    ];
-  } else {
-    [command, ...args] = task.deterministic_command;
+  if (attempt.wait_registration || attempt.child_state !== 'QUEUED') {
+    throw new Error(`attempt is not launchable: ${attempt.attempt_id} ${attempt.child_state}`);
   }
   const waitRegisteredAt = now();
   const processWindows = task.verification_command ? 2 : 1;
@@ -317,7 +302,274 @@ export async function runAttempt(root, task, attempt, claim) {
     ],
   });
   updateState(root, { supervisor_state: 'DORMANT' });
-  emit(root, 'RUNNER_LAUNCHING', { task_id: task.task_id, attempt_id: attempt.attempt_id, route: attempt.gearbox_route });
+  emit(root, 'RUNNER_LAUNCHING', {
+    task_id: task.task_id,
+    attempt_id: attempt.attempt_id,
+    route: attempt.gearbox_route,
+    launch_mode: mode,
+  });
+  return attempt;
+}
+
+function workerDirectory(root) {
+  const directory = join(paths(root).opsle, 'workers');
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  return directory;
+}
+
+function workerPath(root, attemptId) {
+  return join(workerDirectory(root), `${attemptId}.json`);
+}
+
+function processAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function persistDetachedWorkerFailure(root, record, message) {
+  const p = paths(root);
+  if (record) {
+    const failureMessage = record.status === 'FAILED' && record.failure
+      ? record.failure
+      : message;
+    record.status = 'FAILED';
+    record.failure = failureMessage;
+    record.terminal_at ??= now();
+    writeJson(workerPath(root, record.attempt_id), record);
+    const attemptPath = join(p.attempts, `${record.attempt_id}.json`);
+    if (existsSync(attemptPath)) {
+      const attempt = readJson(attemptPath);
+      if (!['COMPLETED', 'FAILED'].includes(attempt.child_state)) {
+        attempt.child_state = 'UNKNOWN';
+      }
+      attempt.runner_failure ??= {
+        schema: 'opsle.durable-supervisor.runner-failure/v1',
+        runner_outcome: 'FAILED',
+        child_outcome: attempt.child_state === 'UNKNOWN' ? 'UNKNOWN' : attempt.child_state,
+        failure: failureMessage,
+        worker_terminal_at: record.terminal_at,
+        recorded_at: now(),
+      };
+      let intervention = record.intervention_event_id
+        && existsSync(join(p.events, `${record.intervention_event_id}.json`))
+        ? readJson(join(p.events, `${record.intervention_event_id}.json`))
+        : null;
+      if (!intervention) {
+        intervention = emit(root, 'INTERVENTION_REQUIRED', {
+          task_id: record.task_id,
+          attempt_id: record.attempt_id,
+          wait_id: record.attempt_id,
+          terminal_type: 'intervention-required',
+          runner_outcome: 'FAILED',
+          child_outcome: attempt.runner_failure.child_outcome,
+          reason: failureMessage,
+        });
+        record.intervention_event_id = intervention.event_id;
+        writeJson(workerPath(root, record.attempt_id), record);
+      }
+      if (attempt.wait_registration) {
+        attempt.wait_registration = applyWakeEvent(attempt.wait_registration, {
+          event_id: intervention.event_id,
+          wait_id: record.attempt_id,
+          type: 'intervention-required',
+        });
+      }
+      writeJson(attemptPath, attempt);
+      updateState(root, {
+        supervisor_state: 'PAUSED',
+        pause: {
+          active: true,
+          after_current: false,
+          reason: 'Detached Runner failed before terminal lifecycle publication.',
+          changed_at: now(),
+        },
+        latest_unresolved_issue: {
+          attempt_id: record.attempt_id,
+          runner_outcome: 'FAILED',
+          child_outcome: attempt.runner_failure.child_outcome,
+          reason: failureMessage,
+        },
+      });
+    }
+  }
+  return new Error(message);
+}
+
+export async function launchDetachedAttempt(root, task, attempt, claim, {
+  handshakeTimeoutMs = 5000,
+  workerScript = fileURLToPath(new URL('../bin/opsle-runner-worker.js', import.meta.url)),
+} = {}) {
+  prepareAttemptLaunch(root, task, attempt, 'detached');
+  const supervisor = readJson(paths(root).supervisor);
+  const launchNonce = id('runner-launch');
+  const recordPath = workerPath(root, attempt.attempt_id);
+  const record = {
+    schema: 'opsle.durable-supervisor.detached-runner/v1',
+    task_id: task.task_id,
+    attempt_id: attempt.attempt_id,
+    claim_id: claim.claim_id,
+    fence_generation: claim.fence_generation,
+    supervisor_id: supervisor.supervisor_id,
+    supervisor_generation: supervisor.generation,
+    launch_nonce: launchNonce,
+    launcher_pid: process.pid,
+    worker_pid: null,
+    status: 'SPAWNING',
+    launched_at: now(),
+    owned_at: null,
+    terminal_at: null,
+    failure: null,
+  };
+  writeJson(recordPath, record);
+  let worker;
+  try {
+    worker = spawn(process.execPath, [
+      workerScript,
+      '--root', root,
+      '--attempt', attempt.attempt_id,
+      '--launch-nonce', launchNonce,
+    ], { cwd: root, detached: true, stdio: 'ignore' });
+    if (!Number.isInteger(worker.pid)) throw new Error('detached Runner did not receive a worker PID');
+    record.worker_pid = worker.pid;
+    record.status = 'LAUNCHED';
+    writeJson(recordPath, record);
+    worker.unref();
+  } catch (error) {
+    record.status = 'FAILED';
+    record.failure = error.message;
+    writeJson(recordPath, record);
+    attempt.child_state = 'UNKNOWN';
+    writeJson(join(paths(root).attempts, `${attempt.attempt_id}.json`), attempt);
+    updateState(root, {
+      supervisor_state: 'PAUSED',
+      pause: { active: true, after_current: false, reason: 'Detached Runner launch failed.', changed_at: now() },
+      latest_unresolved_issue: { attempt_id: attempt.attempt_id, reason: error.message },
+    });
+    throw error;
+  }
+  const deadline = Date.now() + handshakeTimeoutMs;
+  while (Date.now() <= deadline) {
+    const current = readJson(recordPath);
+    if (['OWNED', 'TERMINAL'].includes(current.status)) {
+      return {
+        launch_mode: 'detached',
+        task_id: task.task_id,
+        attempt_id: attempt.attempt_id,
+        child_state: readJson(join(paths(root).attempts, `${attempt.attempt_id}.json`)).child_state,
+        worker_pid: current.worker_pid,
+        ownership: current.status,
+      };
+    }
+    if (current.status === 'FAILED' || !processAlive(worker.pid)) {
+      throw new Error(current.failure ?? 'detached Runner exited before durable ownership');
+    }
+    await sleep(20);
+  }
+  throw new Error('detached Runner did not establish durable ownership before handshake deadline');
+}
+
+export async function runDetachedWorker(root, attemptId, launchNonce, {
+  runAttemptImpl = runAttempt,
+  runAttemptOptions = {},
+} = {}) {
+  const p = paths(root);
+  const recordPath = workerPath(root, attemptId);
+  const deadline = Date.now() + 5000;
+  let record;
+  while (Date.now() <= deadline) {
+    record = readJson(recordPath);
+    if (record.worker_pid === process.pid) break;
+    await sleep(10);
+  }
+  if (!record || record.worker_pid !== process.pid || record.launch_nonce !== launchNonce) {
+    throw persistDetachedWorkerFailure(
+      root,
+      record,
+      'detached Runner launch identity did not match durable record',
+    );
+  }
+  const supervisor = readJson(p.supervisor);
+  if (record.supervisor_id !== supervisor.supervisor_id
+      || record.supervisor_generation !== supervisor.generation) {
+    throw persistDetachedWorkerFailure(
+      root,
+      record,
+      'detached Runner supervisor generation changed before ownership',
+    );
+  }
+  const attemptPath = join(p.attempts, `${attemptId}.json`);
+  const attempt = readJson(attemptPath);
+  const task = readJson(join(p.tasks, `${attempt.task_id}.json`));
+  const claim = readJson(join(p.claims, `${attempt.claim_id}.json`));
+  if (claim.status !== 'ACTIVE'
+      || claim.fence_generation !== attempt.fence_generation
+      || claim.claim_id !== record.claim_id) {
+    throw persistDetachedWorkerFailure(
+      root,
+      record,
+      'detached Runner claim fence is not active and exact',
+    );
+  }
+  record.status = 'OWNED';
+  record.owned_at = now();
+  writeJson(recordPath, record);
+  emit(root, 'DETACHED_RUNNER_OWNED', {
+    task_id: task.task_id,
+    attempt_id: attemptId,
+    worker_pid: process.pid,
+    claim_id: claim.claim_id,
+    fence_generation: claim.fence_generation,
+    supervisor_generation: record.supervisor_generation,
+  });
+  try {
+    const result = await runAttemptImpl(root, task, attempt, claim, {
+      prepared: true,
+      detached: true,
+      ...runAttemptOptions,
+    });
+    record.status = 'TERMINAL';
+    record.terminal_at = now();
+    writeJson(recordPath, record);
+    return result;
+  } catch (error) {
+    throw persistDetachedWorkerFailure(root, record, error.message);
+  }
+}
+
+export async function runAttempt(root, task, attempt, claim, {
+  prepared = false,
+  detached = false,
+  failureInjection = null,
+} = {}) {
+  const p = paths(root);
+  const attemptPath = join(p.attempts, `${attempt.attempt_id}.json`);
+  validateTaskCommands(task);
+  if (!prepared) prepareAttemptLaunch(root, task, attempt, detached ? 'detached-worker' : 'foreground-wait');
+  const rawDirectory = join(p.raw, attempt.attempt_id);
+  mkdirSync(rawDirectory, { recursive: true, mode: 0o700 });
+  const stdoutPath = join(rawDirectory, 'stdout.jsonl');
+  const stderrPath = join(rawDirectory, 'stderr.log');
+  const lastMessagePath = join(rawDirectory, 'last-message.txt');
+  const before = snapshotFiles(root);
+  const policy = attempt.policy_snapshot;
+  let command;
+  let args;
+  if (attempt.gearbox_route === 'codex') {
+    command = attempt.policy_snapshot.gearbox_decision.discovery.commands.codex.path;
+    args = [
+      'exec',
+      '--model', policy.model,
+      '-c', `model_reasoning_effort="${policy.reasoning_effort}"`,
+      '-c', 'approval_policy="never"',
+      '--sandbox', 'workspace-write',
+      '--cd', root,
+      '--json',
+      '--color', 'never',
+      '--output-last-message', lastMessagePath,
+      childPrompt(task, attempt),
+    ];
+  } else {
+    [command, ...args] = task.deterministic_command;
+  }
   const result = await runProcess({
     command,
     args,
@@ -344,6 +596,28 @@ export async function runAttempt(root, task, attempt, claim) {
       writeJson(join(p.claims, `${claim.claim_id}.json`), claim);
     },
   });
+  const executionPath = join(rawDirectory, 'execution.json');
+  const executionEvidence = {
+    schema: 'opsle.durable-supervisor.execution-evidence/v1',
+    task_id: task.task_id,
+    attempt_id: attempt.attempt_id,
+    execution: {
+      command: attempt.gearbox_route === 'deterministic' ? task.deterministic_command : ['codex', 'exec'],
+      exit_code: result.code,
+      signal: result.signal,
+      duration_ms: result.duration_ms,
+      timed_out: result.timed_out,
+      spawn_error: result.spawn_error,
+    },
+    provider_process_terminated_at: now(),
+    verification: null,
+    post_processing_status: 'PENDING',
+    recorded_at: now(),
+  };
+  writeJson(executionPath, executionEvidence);
+  if (failureInjection === 'verification') {
+    throw new Error('injected Runner failure before verification');
+  }
   let verification = null;
   if (task.verification_command) {
     const verifyStdout = join(rawDirectory, 'verification.stdout.log');
@@ -359,29 +633,19 @@ export async function runAttempt(root, task, attempt, claim) {
       onHeartbeat() {},
     });
   }
-  const executionPath = join(rawDirectory, 'execution.json');
-  writeJson(executionPath, {
-    schema: 'opsle.durable-supervisor.execution-evidence/v1',
-    task_id: task.task_id,
-    attempt_id: attempt.attempt_id,
-    execution: {
-      command: attempt.gearbox_route === 'deterministic' ? task.deterministic_command : ['codex', 'exec'],
-      exit_code: result.code,
-      signal: result.signal,
-      duration_ms: result.duration_ms,
-      timed_out: result.timed_out,
-      spawn_error: result.spawn_error,
-    },
-    verification: verification ? {
+  executionEvidence.verification = verification ? {
       command: task.verification_command,
       exit_code: verification.code,
       signal: verification.signal,
       duration_ms: verification.duration_ms,
       timed_out: verification.timed_out,
       spawn_error: verification.spawn_error,
-    } : null,
-    recorded_at: now(),
-  });
+    } : null;
+  executionEvidence.post_processing_status = 'VERIFICATION_RECORDED';
+  writeJson(executionPath, executionEvidence);
+  if (failureInjection === 'reduction') {
+    throw new Error('injected Runner failure before Context Firewall reduction');
+  }
   const after = snapshotFiles(root);
   const changed = changedFiles(before, after);
   const unexpected = changed.filter((path) => !matchesAuthorized(path, task.authorization.may_modify));
@@ -442,7 +706,13 @@ export async function runAttempt(root, task, attempt, claim) {
     reduction_ratio: packet.reduction_ratio,
     output_tokens: null,
     cost: null,
-    activation_counts: {
+    activation_counts: detached ? {
+      evidence: 'detached-runner-no-wait-cell',
+      total_automatic: null,
+      terminal_event: null,
+      human: null,
+      wait_induced_automatic: 0,
+    } : {
       evidence: 'partial-local-events',
       total_automatic: null,
       terminal_event: 1,
@@ -466,6 +736,9 @@ export async function runAttempt(root, task, attempt, claim) {
     timedOut: result.timed_out,
     exitCode: result.code,
   });
+  if (failureInjection === 'terminal-publication') {
+    throw new Error('injected Runner failure before terminal event publication');
+  }
   const completionEvent = emit(root, 'CHILD_COMPLETION', {
     task_id: task.task_id,
     attempt_id: attempt.attempt_id,
@@ -488,7 +761,9 @@ export async function runAttempt(root, task, attempt, claim) {
     terminal_type: wakeType,
     model_turns_used_for_polling: null,
     activation_counts: attempt.telemetry.activation_counts,
-    wait_mechanism: 'runner OS close event with registered terminal wake',
+    wait_mechanism: detached
+      ? 'detached Runner worker OS close event; no initiating supervisor wait cell'
+      : 'foreground compatibility Runner OS close event with registered terminal wake',
   });
   attempt.wait_registration = applyWakeEvent(attempt.wait_registration, {
     event_id: completionEvent.event_id,
@@ -501,34 +776,45 @@ export async function runAttempt(root, task, attempt, claim) {
   writeJson(attemptPath, attempt);
   const currentState = readJson(p.state);
   const pauseActive = currentState.pause?.active === true;
-  const appliedAfterCurrent = pauseActive && currentState.pause.after_current === true;
+  const pauseAfterCurrentPending = pauseActive && currentState.pause.after_current === true;
   updateState(root, {
-    supervisor_state: pauseActive ? 'PAUSED' : 'ACTIVE',
-    pause: appliedAfterCurrent
-      ? { ...currentState.pause, after_current: false, applied_at: now() }
-      : currentState.pause,
+    supervisor_state: pauseAfterCurrentPending
+      ? (detached ? 'DORMANT' : 'ACTIVE')
+      : (pauseActive ? 'PAUSED' : (detached ? 'DORMANT' : 'ACTIVE')),
+    pause: currentState.pause,
   });
-  if (appliedAfterCurrent) {
-    emit(root, 'PAUSE_AFTER_CURRENT_APPLIED', {
+  let wakeRequest = null;
+  let wakeDispatcher = null;
+  if (detached) {
+    wakeRequest = enqueueTerminalWake(root, completionEvent);
+    try {
+      wakeDispatcher = ensureWakeDispatcher(root);
+    } catch (error) {
+      wakeDispatcher = { started: false, reason: 'dispatcher-start-error', error: error.message };
+    }
+  } else {
+    emit(root, 'SUPERVISOR_ACTIVATION', {
+      classification: 'terminal-event',
+      automatic: true,
+      cause_event_id: completionEvent.event_id,
       task_id: task.task_id,
       attempt_id: attempt.attempt_id,
-      reason: currentState.pause.reason,
+      wait_id: attempt.attempt_id,
+    });
+    emit(root, 'SUPERVISOR_REACTIVATED', {
+      cause_event_id: completionEvent.event_id,
+      task_id: task.task_id,
+      attempt_id: attempt.attempt_id,
+      classification: 'terminal-event',
+      resulting_state: pauseAfterCurrentPending ? 'ACTIVE' : (pauseActive ? 'PAUSED' : 'ACTIVE'),
     });
   }
-  emit(root, 'SUPERVISOR_ACTIVATION', {
-    classification: 'terminal-event',
-    automatic: true,
-    cause_event_id: completionEvent.event_id,
-    task_id: task.task_id,
-    attempt_id: attempt.attempt_id,
-    wait_id: attempt.attempt_id,
-  });
-  emit(root, 'SUPERVISOR_REACTIVATED', {
-    cause_event_id: completionEvent.event_id,
-    task_id: task.task_id,
-    attempt_id: attempt.attempt_id,
-    classification: 'terminal-event',
-    resulting_state: pauseActive ? 'PAUSED' : 'ACTIVE',
-  });
-  return { attempt, packet, completion, completion_event: completionEvent };
+  return {
+    attempt,
+    packet,
+    completion,
+    completion_event: completionEvent,
+    wake_request: wakeRequest,
+    wake_dispatcher: wakeDispatcher,
+  };
 }

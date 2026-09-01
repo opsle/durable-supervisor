@@ -129,11 +129,16 @@ export function activationSummary(events) {
     event.type === 'SUPERVISOR_ACTIVATION'
     && event.classification === 'human'
   )).length;
+  const completions = events.filter((event) => event.type === 'CHILD_COMPLETION');
+  const waitZeroProven = completions.length > 0 && completions.every((event) => (
+    event.activation_counts?.wait_induced_automatic === 0
+    && event.wait_mechanism?.includes('no initiating supervisor wait cell')
+  ));
   return {
-    evidence: terminal || human ? 'partial-local-events' : 'absent',
+    evidence: terminal || human || waitZeroProven ? 'partial-local-events' : 'absent',
     total_automatic: null,
     terminal_event: terminal || null,
     human: human || null,
-    wait_induced_automatic: null,
+    wait_induced_automatic: waitZeroProven ? 0 : null,
   };
 }

@@ -1,0 +1,94 @@
+{
+  "task_id": "task-codex-resume-reality-audit",
+  "parent_decision_id": "decision-dd60de38-b311-48ac-9412-a9c3bb6e3b7a",
+  "title": "Audit installed Codex resume session behavior",
+  "objective": "Establish source-grounded and controlled empirical behavior for Codex CLI 0.151.0 session resume, multi-client message propagation, thread ownership, serialization, frontend lifetime, draft preservation, failure modes, exact session discovery, and public automation prior art before any authoritative wake transport is changed.",
+  "scope": [
+    "installed codex-cli 0.151.0 help, package, binary behavior, process topology, app-server behavior, rollout/session storage, and exact rust-v0.151.0 openai/codex source",
+    "official CLI reference as secondary evidence plus GitHub source, issues, discussions, web search, and public repository prior art for codex resume SESSION_ID MESSAGE or equivalent",
+    "deterministic mapping of the persistent tmux TUI process and rollout metadata to session 01a05952-e1fa-71e2-adea-df7e3f7d99ce, with stale-binding detection requirements",
+    "preservation and analysis of the operator-observed Desktop experiment in session 01a05a17-c5c5-7463-8670-14c5127f2072 where injected test produced Received while the original frontend continued",
+    "controlled disposable interactive-session experiments for empty composer, synthetic simple draft, synthetic multiline draft, active reasoning, concurrent submission, duplicate prompt, two near-simultaneous resumes, and temporary frontend disposal",
+    "a precise implementation contract for provider-free wake dispatch, activation lease, generation fencing, idempotency, queued recovery, pause-after-evaluation, and tiny durable-event messages"
+  ],
+  "authorization": {
+    "may": [
+      "inspect this repository, installed Codex artifacts, process metadata, tmux metadata, and local Codex rollout/session files read-only",
+      "query official OpenAI documentation, exact-tag openai/codex GitHub source, GitHub issues/discussions/code, web search, and public repositories",
+      "create and dispose bounded temporary Codex test frontends/sessions that are explicitly not repository supervisors and cannot modify this repository",
+      "use synthetic test composer drafts in disposable sessions and preserve exact before/after screen and rollout hashes",
+      "record source URLs, commit/tag hashes, commands, process identities, timestamps, rollout offsets, and experiment receipts in completion evidence"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "invoke codex resume against the persistent authoritative tmux TUI session 01a05952-e1fa-71e2-adea-df7e3f7d99ce",
+      "invoke codex resume against the current corrective activation or the operator experiment session",
+      "type into, clear, submit, overwrite, or otherwise mutate any real human composer draft",
+      "change .opsle authority, source, tests, documentation, policy, objective, claims, tasks, events, wake requests, dispatcher state, tmux, or Herdr beyond Runner-owned attempt evidence",
+      "create a second repository supervisor, initialize another repository, install or upgrade Codex, enable Claude or review, modify sibling repositories, deploy, merge, push, or install server-wide",
+      "treat official documentation silence as disproof of observed installed behavior or invoke Graphify without a Gearbox selection"
+    ]
+  },
+  "required_inputs": [
+    ".opsle/objective.json",
+    ".opsle/policy.json",
+    ".opsle/supervisor.json",
+    ".opsle/state.json",
+    ".opsle/wake/dispatcher.json",
+    ".opsle/evidence/compact/task-herdr-reality-audit-attempt-001.json",
+    "src/wakeup.js",
+    "src/host-terminal.js",
+    "src/cli.js",
+    "tests/wakeup.test.js"
+  ],
+  "relevant_context": [
+    "The authoritative durable identity is supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe generation 12 and remains PAUSED with no active work or active claims after exact reconciliation.",
+    "The persistent tmux TUI process started 2026-08-31 19:36:37 UTC and session_meta binds it to Codex TUI session 01a05952-e1fa-71e2-adea-df7e3f7d99ce, cwd exactly this repository, cli_version 0.151.0, originator codex-tui.",
+    "The current corrective activation is a separate Codex Desktop frontend/session and does not create a second .opsle supervisor identity.",
+    "The operator demonstrated codex resume 01a05a17-c5c5-7463-8670-14c5127f2072 test; the target rollout durably records user test at 12:23:40 UTC and assistant Received at 12:23:46 UTC while the original frontend continued.",
+    "Official OpenAI CLI reference calls codex resume stable and supports an explicit UUID and optional prompt, but does not state multi-client injection, composer, serialization, or frontend-lifetime guarantees.",
+    "Four historical wake requests are immutable and receipt-free; three target stale generation 9, one targets generation 12 but its task has already been accepted without keystroke delivery. Do not rewrite or deliver them during audit.",
+    "Herdr remains a viable host/sidebar layer but its agent.prompt is PTY transport without draft-safety guarantees; wake transport is now independent of host selection."
+  ],
+  "expected_deliverable": "A complete_for_decision evidence packet containing exact installed/source findings, public prior art, controlled experiment receipts, deterministic session-binding and stale-detection rules, a concurrency/failure matrix, and the smallest safe implementation contract or an exact fail-closed limitation.",
+  "expected_evidence": [
+    "codex-cli 0.151.0 command/help, package provenance, exact rust-v0.151.0 tag commit, and exact source paths governing resume, prompt submission, thread loading, input queuing, and multi-client notifications",
+    "local process/session/rollout evidence separating durable supervisor identity, persistent TUI session, operator experiment session, and temporary corrective frontend",
+    "source-backed explanation of whether resume attaches to an existing logical thread, creates a second core, queues a turn, serializes against active turns, and propagates events to other clients",
+    "controlled disposable-TUI before/after evidence for empty, simple draft, multiline draft, active reasoning, near-simultaneous human input, two terminal events, duplicates, and frontend disposal",
+    "GitHub issues/discussions and at least two public automation/code-search findings where available, with absence stated honestly if no relevant prior art exists",
+    "failure behavior for invalid/missing/stale/deleted session, cwd mismatch, busy thread, concurrent resume, frontend termination, and rollout/file locking",
+    "deterministic authoritative session discovery and validation algorithm bound to repository, supervisor ID, generation, host process identity, rollout session_meta, and stale process/rollout facts",
+    "implementation recommendations for activation lease, event idempotency, tiny message format, recovery, queued obsolete events, pause-after-evaluation, Herdr hosting, tmux fallback, and wait-cell fallback",
+    "zero repository source changes and zero authoritative-session prompts"
+  ],
+  "acceptance_criteria": [
+    "uses actual installed Codex 0.151.0 behavior and exact-tag source rather than documentation assumptions",
+    "preserves the operator experiment as positive empirical evidence without overgeneralizing it",
+    "does not touch the authoritative persistent TUI or any human draft",
+    "controlled experiments are disposable, bounded, and independently evidenced",
+    "all concurrency and recovery cases are classified as proven, unproven, or unsafe with exact evidence",
+    "Context Firewall packet is complete_for_decision with no unexpected changed artifacts"
+  ],
+  "prohibited_actions": [
+    "authoritative-session wake delivery before implementation fencing",
+    "terminal keystroke delivery to any real human composer",
+    "source changes, merge, deployment, installation, policy change, host migration, or history rewrite",
+    "model polling or Graphify without Gearbox selection"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled with configured model and reasoning effort",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "Affected Verification advisory only",
+    "model polling prohibited"
+  ],
+  "requirement_ids": [],
+  "route_hint": "codex",
+  "deterministic_command": null,
+  "verification_command": null,
+  "expects_changes": false,
+  "timeout_seconds": 2400
+}

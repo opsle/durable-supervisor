@@ -28,11 +28,22 @@ import {
   createAttempt,
   createTask,
   discoverCapabilities,
+  releaseClaim,
   routeTask,
 } from './pipeline.js';
-import { runAttempt } from './runner.js';
+import { launchDetachedAttempt, runAttempt } from './runner.js';
 import { activationSummary } from './activation-telemetry.js';
-import { applyWakeEvent } from './wakeup.js';
+import {
+  adoptCodexSessionBinding,
+  adoptQueuedWakes,
+  applyWakeEvent,
+  bindCodexSession,
+  codexSessionBindingStatus,
+  consumeWakeDelivery,
+  drainWakeQueue,
+  ensureWakeDispatcher,
+  wakeQueueStatus,
+} from './wakeup.js';
 
 function usage() {
   return `usage: opsle COMMAND
@@ -42,6 +53,8 @@ commands:
   status [--json] [--watch [--iterations N] [--interval-ms MS]]
   validate
   recover
+  reconcile runner-failure --task TASK_ID --attempt ATTEMPT_ID
+    --claim CLAIM_ID --fence N --generation N
   cutover --first-task TASK_ID
   pause [--after-current] [--reason TEXT]
   resume
@@ -53,12 +66,21 @@ commands:
   policy review MODE [--reviewer PROVIDER]
   models status|enable|disable [PROVIDER]
   task create --input FILE
-  task run TASK_ID
+  task run TASK_ID [--foreground-wait]
   task evaluate TASK_ID --accept|--reject --rationale TEXT
   task show TASK_ID
   requirements [--json]
   evidence show ATTEMPT_ID
-  events consume EVENT_ID
+  events consume EVENT_ID [--delivery ID --generation N]
+  wake start
+  wake status
+  wake drain
+  session bind --session UUID --rollout PATH --sessions-root PATH
+    --host-pid PID --writer-pid PID --tmux-session NAME --tmux-pane PANE
+    [--topology standalone-embedded-writer|shared-app-server]
+    [--native-proof SHA256]
+  session status
+  session adopt
   telemetry import-activation-profile --input FILE
   supervisor session-name|start|attach|is-alive
 `;
@@ -82,6 +104,30 @@ function integerOption(args, flag, fallback, { minimum = 1, maximum = Number.MAX
     throw new Error(`${flag} must be between ${minimum} and ${maximum}`);
   }
   return value;
+}
+
+export function sessionCommand(root, subcommand, args, { dependencies = {} } = {}) {
+  if (subcommand === 'status') return codexSessionBindingStatus(root, { dependencies });
+  if (subcommand === 'adopt') return adoptCodexSessionBinding(root, { dependencies });
+  if (subcommand !== 'bind') throw new Error('session requires bind, status, or adopt');
+  const required = [
+    '--session', '--rollout', '--sessions-root', '--host-pid',
+    '--writer-pid', '--tmux-session', '--tmux-pane',
+  ];
+  for (const flag of required) {
+    if (!valueAfter(args, flag)) throw new Error(`session bind requires ${flag}`);
+  }
+  return bindCodexSession(root, {
+    sessionId: valueAfter(args, '--session'),
+    rolloutPath: valueAfter(args, '--rollout'),
+    sessionsRoot: valueAfter(args, '--sessions-root'),
+    hostPid: integerOption(args, '--host-pid', null),
+    writerPid: integerOption(args, '--writer-pid', null),
+    tmuxSession: valueAfter(args, '--tmux-session'),
+    tmuxPane: valueAfter(args, '--tmux-pane'),
+    topology: valueAfter(args, '--topology', 'standalone-embedded-writer'),
+    nativeProofSha256: valueAfter(args, '--native-proof'),
+  }, { dependencies });
 }
 
 function attemptForState(root, state) {
@@ -411,7 +457,182 @@ function tmuxAlive(name) {
   return spawnSync('tmux', ['has-session', '-t', name]).status === 0;
 }
 
-function recover(root) {
+function processAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function exactDetachedRunnerOwner({ attempt, claim, runner, supervisor, isProcessAlive }) {
+  return runner?.schema === 'opsle.durable-supervisor.detached-runner/v1'
+    && runner.status === 'OWNED'
+    && runner.task_id === attempt.task_id
+    && runner.attempt_id === attempt.attempt_id
+    && runner.claim_id === attempt.claim_id
+    && runner.fence_generation === attempt.fence_generation
+    && runner.supervisor_id === supervisor.supervisor_id
+    && runner.supervisor_generation === attempt.policy_snapshot?.supervisor_generation
+    && claim?.schema === 'opsle.durable-supervisor.claim/v1'
+    && claim.status === 'ACTIVE'
+    && claim.task_id === attempt.task_id
+    && claim.attempt_id === attempt.attempt_id
+    && claim.claim_id === attempt.claim_id
+    && claim.fence_generation === attempt.fence_generation
+    && claim.owner_supervisor_id === supervisor.supervisor_id
+    && claim.owner_generation === runner.supervisor_generation
+    && Number.isInteger(runner.worker_pid)
+    && isProcessAlive(runner.worker_pid);
+}
+
+function positiveInteger(value, field) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${field} must be a positive integer`);
+  return parsed;
+}
+
+export function reconcileRunnerFailure(root, {
+  taskId,
+  attemptId,
+  claimId,
+  fenceGeneration,
+  supervisorGeneration,
+  isProcessAlive = processAlive,
+  releaseClaimImpl = releaseClaim,
+}) {
+  if (!taskId || !attemptId || !claimId) {
+    throw new Error('runner failure reconciliation requires exact task, attempt, and claim IDs');
+  }
+  const expectedFence = positiveInteger(fenceGeneration, 'fence generation');
+  const expectedGeneration = positiveInteger(supervisorGeneration, 'supervisor generation');
+  const p = paths(root);
+  const supervisor = readJson(p.supervisor);
+  if (supervisor.generation !== expectedGeneration) throw new Error('stale supervisor generation');
+
+  const taskPath = join(p.tasks, `${taskId}.json`);
+  const attemptPath = join(p.attempts, `${attemptId}.json`);
+  const workerPath = join(p.opsle, 'workers', `${attemptId}.json`);
+  const claimPath = join(p.claims, `${claimId}.json`);
+  for (const [label, path] of [
+    ['task', taskPath],
+    ['attempt', attemptPath],
+    ['worker', workerPath],
+    ['claim', claimPath],
+  ]) {
+    if (!existsSync(path)) throw new Error(`missing exact ${label} record`);
+  }
+  const task = readJson(taskPath);
+  const attempt = readJson(attemptPath);
+  const worker = readJson(workerPath);
+  const claim = readJson(claimPath);
+  const index = readJson(join(p.claims, 'index.json'));
+  const indexedClaim = index[`task-${taskId}`];
+  const completionEvents = existsSync(p.eventsLog)
+    ? readFileSync(p.eventsLog, 'utf8').trim().split('\n').filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((event) => event.type === 'CHILD_COMPLETION' && event.attempt_id === attemptId)
+    : [];
+  const executionPath = join(p.raw, attemptId, 'execution.json');
+
+  const exactIdentity = task.task_id === taskId
+    && task.state === 'REJECTED'
+    && task.attempts.filter((value) => value === attemptId).length === 1
+    && attempt.schema === 'opsle.durable-supervisor.child-attempt/v1'
+    && attempt.task_id === taskId
+    && attempt.attempt_id === attemptId
+    && attempt.claim_id === claimId
+    && attempt.fence_generation === expectedFence
+    && worker.schema === 'opsle.durable-supervisor.detached-runner/v1'
+    && worker.status === 'FAILED'
+    && worker.task_id === taskId
+    && worker.attempt_id === attemptId
+    && worker.claim_id === claimId
+    && worker.fence_generation === expectedFence
+    && worker.supervisor_id === supervisor.supervisor_id
+    && worker.supervisor_generation === attempt.policy_snapshot?.supervisor_generation
+    && claim.schema === 'opsle.durable-supervisor.claim/v1'
+    && ['ACTIVE', 'FAILED'].includes(claim.status)
+    && claim.task_id === taskId
+    && claim.attempt_id === attemptId
+    && claim.claim_id === claimId
+    && claim.fence_generation === expectedFence
+    && claim.owner_supervisor_id === supervisor.supervisor_id
+    && claim.owner_generation === worker.supervisor_generation
+    && indexedClaim?.task_id === taskId
+    && indexedClaim?.attempt_id === attemptId
+    && indexedClaim?.claim_id === claimId
+    && indexedClaim?.fence_generation === expectedFence;
+  if (!exactIdentity) throw new Error('runner failure reconciliation identity or fence is ambiguous');
+  if (attempt.child_state !== 'UNKNOWN'
+      || attempt.exit_code != null
+      || attempt.compact_packet != null
+      || attempt.completion_handoff != null
+      || attempt.acceptance != null
+      || existsSync(executionPath)
+      || completionEvents.length !== 0) {
+    throw new Error('child outcome is not exactly unknown and evidence-free');
+  }
+  if (!Number.isSafeInteger(worker.worker_pid)
+      || !Number.isSafeInteger(attempt.pid)
+      || isProcessAlive(worker.worker_pid)
+      || isProcessAlive(attempt.pid)) {
+    throw new Error('exact detached Runner and child process death is not proven');
+  }
+  if (typeof worker.failure !== 'string' || worker.failure.length === 0 || !worker.terminal_at) {
+    throw new Error('worker record is not exact terminal FAILED evidence');
+  }
+
+  const workerRecordSha256 = sha256(readFileSync(workerPath));
+  const existing = attempt.runner_reconciliation;
+  if (existing && (existing.schema !== 'opsle.durable-supervisor.runner-failure-reconciliation/v1'
+      || existing.status !== 'COMMITTED'
+      || existing.runner_outcome !== 'FAILED'
+      || existing.child_outcome !== 'UNKNOWN'
+      || existing.claim_release_intent !== 'FAILED'
+      || existing.claim_id !== claimId
+      || existing.worker_record_sha256 !== workerRecordSha256
+      || existing.fence_generation !== expectedFence
+      || existing.reconciled_by_supervisor_id !== supervisor.supervisor_id)) {
+    throw new Error('existing runner reconciliation is ambiguous');
+  }
+  if (!existing && (claim.status !== 'ACTIVE' || indexedClaim.status !== 'ACTIVE')) {
+    throw new Error('exact active claim is required before reconciliation commit');
+  }
+  if (!existing) {
+    attempt.runner_reconciliation = {
+      schema: 'opsle.durable-supervisor.runner-failure-reconciliation/v1',
+      status: 'COMMITTED',
+      runner_outcome: 'FAILED',
+      child_outcome: 'UNKNOWN',
+      claim_release_intent: 'FAILED',
+      claim_id: claimId,
+      fence_generation: expectedFence,
+      worker_record_sha256: workerRecordSha256,
+      worker_terminal_at: worker.terminal_at,
+      worker_failure: worker.failure,
+      reconciled_by_supervisor_id: supervisor.supervisor_id,
+      reconciled_at_generation: expectedGeneration,
+      committed_at: now(),
+    };
+    writeJson(attemptPath, attempt);
+  }
+
+  const released = releaseClaimImpl(root, claim, 'FAILED');
+  return {
+    reconciliation: existing ? 'ALREADY_COMMITTED' : 'COMMITTED',
+    task_id: taskId,
+    attempt_id: attemptId,
+    runner_outcome: 'FAILED',
+    child_outcome: 'UNKNOWN',
+    claim_id: claimId,
+    fence_generation: expectedFence,
+    claim_status: released.status,
+    relaunched: false,
+  };
+}
+
+export function recover(root, {
+  isProcessAlive = processAlive,
+  startWakeDispatcher = ensureWakeDispatcher,
+  dispatcherOptions = {},
+} = {}) {
   const p = paths(root);
   const supervisor = readJson(p.supervisor);
   const state = readJson(p.state);
@@ -424,22 +645,53 @@ function recover(root) {
       if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(attempt.child_state)) {
         reconciliation = { classification: `known_${attempt.child_state.toLowerCase()}`, action: 'do_not_relaunch' };
       } else if (attempt.child_state === 'UNKNOWN') {
-        reconciliation = {
-          classification: 'unknown_unreconciled',
-          action: 'remain_paused_and_reconcile',
+        reconciliation = attempt.runner_reconciliation?.status === 'COMMITTED'
+          && attempt.runner_reconciliation.runner_outcome === 'FAILED'
+          && attempt.runner_reconciliation.child_outcome === 'UNKNOWN'
+          ? {
+            classification: 'known_runner_failed_child_unknown',
+            action: 'do_not_relaunch',
+            pid: attempt.pid,
+            claim_status: readJson(join(p.claims, `${attempt.claim_id}.json`)).status,
+          }
+          : {
+            classification: 'unknown_unreconciled',
+            action: 'remain_paused_and_reconcile',
+            pid: attempt.pid,
+          };
+      } else {
+        const runnerPath = join(p.opsle, 'workers', `${attempt.attempt_id}.json`);
+        const runner = existsSync(runnerPath) ? readJson(runnerPath) : null;
+        const claimPath = attempt.claim_id
+          ? join(p.claims, `${attempt.claim_id}.json`)
+          : null;
+        const claim = claimPath && existsSync(claimPath) ? readJson(claimPath) : null;
+        const detachedOwned = exactDetachedRunnerOwner({
+          attempt,
+          claim,
+          runner,
+          supervisor,
+          isProcessAlive,
+        });
+        const foregroundOwned = !runner
+          && Number.isInteger(attempt.pid)
+          && isProcessAlive(attempt.pid);
+        if (detachedOwned || foregroundOwned) reconciliation = {
+          classification: 'known_running',
+          action: 'preserve_claim_and_wait',
           pid: attempt.pid,
+          runner_pid: runner?.worker_pid ?? null,
+          lifecycle_owner: detachedOwned ? 'detached-runner-worker' : 'foreground-child',
         };
-      } else if (attempt.pid) {
-        let alive = true;
-        try { process.kill(attempt.pid, 0); } catch { alive = false; }
-        if (alive) reconciliation = { classification: 'known_running', action: 'preserve_claim_and_wait', pid: attempt.pid };
         else {
           attempt.child_state = 'UNKNOWN';
           const intervention = emit(root, 'INTERVENTION_REQUIRED', {
             task_id: attempt.task_id,
             attempt_id: attempt.attempt_id,
             wait_id: attempt.attempt_id,
-            reason: 'active child PID is absent without terminal evidence',
+            reason: runner
+              ? 'exact detached Runner owner is absent without terminal evidence'
+              : 'active foreground child PID is absent without terminal evidence',
           });
           if (attempt.wait_registration) {
             attempt.wait_registration = applyWakeEvent(attempt.wait_registration, {
@@ -468,7 +720,15 @@ function recover(root) {
   supervisor.recovered_at = now();
   writeJson(p.supervisor, supervisor);
   emit(root, 'SUPERVISOR_RECOVERED', { reconciliation });
-  return { supervisor, state: readJson(p.state), reconciliation };
+  const adopted_wake_event_ids = adoptQueuedWakes(root);
+  const wake_dispatcher = startWakeDispatcher(root, dispatcherOptions);
+  return {
+    supervisor,
+    state: readJson(p.state),
+    reconciliation,
+    adopted_wake_event_ids,
+    wake_dispatcher,
+  };
 }
 
 function evaluateTask(root, taskId, accept, rationale) {
@@ -507,6 +767,8 @@ function evaluateTask(root, taskId, accept, rationale) {
   writeJson(taskPath, task);
   if (accept) setRequirements(root, task.requirement_ids, 'IMPLEMENTED', [attempt.compact_packet, attempt.completion_handoff]);
   const currentState = readJson(p.state);
+  const applyPauseAfterCurrent = currentState.pause?.active === true
+    && currentState.pause.after_current === true;
   const nextState = {
     ...currentState,
     active_task_id: null,
@@ -515,7 +777,19 @@ function evaluateTask(root, taskId, accept, rationale) {
       ? NEXT_UNSATISFIED_REQUIREMENT_ACTION
       : `Create corrective work for ${taskId}.`,
   };
+  emit(root, 'SUPERVISOR_DECISION', {
+    task_id: taskId,
+    attempt_id: attemptId,
+    decision_id: decision.decision_id,
+    decision: decision.decision,
+  });
   updateState(root, {
+    supervisor_state: applyPauseAfterCurrent ? 'PAUSED' : currentState.supervisor_state,
+    pause: applyPauseAfterCurrent ? {
+      ...currentState.pause,
+      after_current: false,
+      applied_at: now(),
+    } : currentState.pause,
     active_task_id: nextState.active_task_id,
     active_attempt_id: nextState.active_attempt_id,
     latest_accepted_task_id: accept ? taskId : currentState.latest_accepted_task_id,
@@ -524,20 +798,29 @@ function evaluateTask(root, taskId, accept, rationale) {
       ? derivePendingNextAction(nextState, readJson(p.requirements))
       : nextState.pending_next_action,
   });
-  emit(root, 'SUPERVISOR_DECISION', { task_id: taskId, attempt_id: attemptId, decision_id: decision.decision_id, decision: decision.decision });
+  if (applyPauseAfterCurrent) {
+    emit(root, 'PAUSE_AFTER_CURRENT_APPLIED', {
+      task_id: taskId,
+      attempt_id: attemptId,
+      decision_id: decision.decision_id,
+      terminal_task_state: task.state,
+      reason: currentState.pause.reason,
+    });
+  }
   return { decision, task, attempt };
 }
 
-function consumeEvent(root, eventId) {
+export function consumeEvent(root, eventId, { deliveryId = null, generation = null } = {}) {
   const p = paths(root);
   const state = readJson(p.state);
   state.processed_event_ids ??= [];
   if (state.processed_event_ids.includes(eventId)) return { event_id: eventId, duplicate: true, action: 'ignored' };
   const event = readJson(join(p.events, `${eventId}.json`));
+  const wake = consumeWakeDelivery(root, eventId, { deliveryId, generation });
   state.processed_event_ids.push(eventId);
   writeJson(p.state, state);
   emit(root, 'EVENT_CONSUMED', { source_event_id: eventId, source_event_type: event.type });
-  return { event_id: eventId, duplicate: false, action: 'recorded' };
+  return { event_id: eventId, duplicate: false, action: 'recorded', wake_delivery: wake };
 }
 
 function importActivationProfile(root, profile) {
@@ -637,6 +920,16 @@ export async function main(args) {
     print(recover(root));
     return;
   }
+  if (command === 'reconcile' && subcommand === 'runner-failure') {
+    print(reconcileRunnerFailure(root, {
+      taskId: valueAfter(rest, '--task'),
+      attemptId: valueAfter(rest, '--attempt'),
+      claimId: valueAfter(rest, '--claim'),
+      fenceGeneration: valueAfter(rest, '--fence'),
+      supervisorGeneration: valueAfter(rest, '--generation'),
+    }));
+    return;
+  }
   if (command === 'cutover') {
     const taskId = valueAfter(args, '--first-task');
     if (!taskId) throw new Error('cutover requires --first-task TASK_ID');
@@ -733,16 +1026,21 @@ export async function main(args) {
       const gearbox = routeTask(root, task);
       emit(root, 'GEARBOX_ROUTED', { task_id: task.task_id, decision_id: gearbox.decision_id, route: gearbox.selected_route, rationale: gearbox.rationale });
       const { attempt, claim } = createAttempt(root, task, gearbox);
-      const result = await runAttempt(root, task, attempt, claim);
-      print({
-        task_id: task.task_id,
-        attempt_id: result.attempt.attempt_id,
-        child_state: result.attempt.child_state,
-        acceptance: result.attempt.acceptance,
-        compact_packet: result.attempt.compact_packet,
-        completion_handoff: result.attempt.completion_handoff,
-        completion_event_id: result.completion_event.event_id,
-      });
+      if (rest.includes('--foreground-wait')) {
+        const result = await runAttempt(root, task, attempt, claim);
+        print({
+          launch_mode: 'foreground-wait',
+          task_id: task.task_id,
+          attempt_id: result.attempt.attempt_id,
+          child_state: result.attempt.child_state,
+          acceptance: result.attempt.acceptance,
+          compact_packet: result.attempt.compact_packet,
+          completion_handoff: result.attempt.completion_handoff,
+          completion_event_id: result.completion_event.event_id,
+        });
+      } else {
+        print(await launchDetachedAttempt(root, task, attempt, claim));
+      }
     } else if (subcommand === 'evaluate') {
       const taskId = rest[0];
       const accept = rest.includes('--accept');
@@ -765,7 +1063,24 @@ export async function main(args) {
     return;
   }
   if (command === 'events' && subcommand === 'consume') {
-    print(consumeEvent(root, rest[0]));
+    print(consumeEvent(root, rest[0], {
+      deliveryId: valueAfter(rest, '--delivery'),
+      generation: valueAfter(rest, '--generation'),
+    }));
+    return;
+  }
+  if (command === 'wake') {
+    if (subcommand === 'start') {
+      print(ensureWakeDispatcher(root));
+    } else if (subcommand === 'status') {
+      print(wakeQueueStatus(root));
+    } else if (subcommand === 'drain') {
+      print(drainWakeQueue(root));
+    } else throw new Error('wake requires start, status, or drain');
+    return;
+  }
+  if (command === 'session') {
+    print(sessionCommand(root, subcommand, rest));
     return;
   }
   if (command === 'telemetry') {

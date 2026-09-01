@@ -32,6 +32,7 @@ import {
 } from '../src/state.js';
 import { runAttempt } from '../src/runner.js';
 import { registerWait } from '../src/wakeup.js';
+import { reconcileRunnerFailure, recover } from '../src/cli.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 const cliPath = join(sourceRoot, 'bin', 'opsle.js');
@@ -340,6 +341,107 @@ test('recovery fences an absent running child as unknown without retrying it', a
     assert.equal(recoveredAgain.code, 0, recoveredAgain.stderr);
     assert.equal(eventLines(root)
       .filter((event) => event.type === 'INTERVENTION_REQUIRED').length, interventionCount);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('exact failed-worker reconciliation commits before idempotent claim release and preserves unknown child outcome', () => {
+  const root = fixture();
+  try {
+    const p = paths(root);
+    const task = createTask(root, handoff({ task_id: 'task-reconcile-failed-runner' }));
+    const { attempt, claim } = createAttempt(root, task, routeTask(root, task));
+    task.state = 'REJECTED';
+    writeJson(join(p.tasks, `${task.task_id}.json`), task);
+    attempt.child_state = 'UNKNOWN';
+    attempt.pid = 2_147_483_601;
+    writeJson(join(p.attempts, `${attempt.attempt_id}.json`), attempt);
+    mkdirSync(join(root, '.opsle', 'workers'), { recursive: true });
+    const supervisor = readJson(p.supervisor);
+    const workerPath = join(root, '.opsle', 'workers', `${attempt.attempt_id}.json`);
+    writeJson(workerPath, {
+      schema: 'opsle.durable-supervisor.detached-runner/v1',
+      task_id: task.task_id,
+      attempt_id: attempt.attempt_id,
+      claim_id: claim.claim_id,
+      fence_generation: claim.fence_generation,
+      supervisor_id: supervisor.supervisor_id,
+      supervisor_generation: supervisor.generation,
+      launch_nonce: 'runner-launch-reconcile-fixture',
+      launcher_pid: 2_147_483_600,
+      worker_pid: 2_147_483_602,
+      status: 'FAILED',
+      launched_at: '2026-09-01T02:00:00.000Z',
+      owned_at: '2026-09-01T02:00:01.000Z',
+      terminal_at: '2026-09-01T02:05:00.000Z',
+      failure: 'verification dispatch rejected malformed argv',
+    });
+    const exact = {
+      taskId: task.task_id,
+      attemptId: attempt.attempt_id,
+      claimId: claim.claim_id,
+      fenceGeneration: claim.fence_generation,
+      supervisorGeneration: supervisor.generation,
+      isProcessAlive: () => false,
+    };
+
+    assert.throws(() => reconcileRunnerFailure(root, {
+      ...exact,
+      isProcessAlive: (pid) => pid === 2_147_483_602,
+    }), /process death is not proven/);
+    assert.throws(() => reconcileRunnerFailure(root, {
+      ...exact,
+      releaseClaimImpl() {
+        const committed = readJson(join(p.attempts, `${attempt.attempt_id}.json`));
+        assert.equal(committed.runner_reconciliation.status, 'COMMITTED');
+        assert.equal(committed.runner_reconciliation.child_outcome, 'UNKNOWN');
+        assert.equal(readJson(join(p.claims, `${claim.claim_id}.json`)).status, 'ACTIVE');
+        throw new Error('injected claim release interruption');
+      },
+    }), /injected claim release interruption/);
+    assert.equal(readJson(join(p.claims, `${claim.claim_id}.json`)).status, 'ACTIVE');
+
+    const reconciled = runCli(root, [
+      'reconcile',
+      'runner-failure',
+      '--task', task.task_id,
+      '--attempt', attempt.attempt_id,
+      '--claim', claim.claim_id,
+      '--fence', String(claim.fence_generation),
+      '--generation', String(supervisor.generation),
+    ]);
+    assert.equal(reconciled.code, 0, reconciled.stderr);
+    const first = JSON.parse(reconciled.stdout);
+    assert.equal(first.reconciliation, 'ALREADY_COMMITTED');
+    assert.equal(first.runner_outcome, 'FAILED');
+    assert.equal(first.child_outcome, 'UNKNOWN');
+    assert.equal(first.claim_status, 'FAILED');
+    const attemptPath = join(p.attempts, `${attempt.attempt_id}.json`);
+    const committedBytes = readFileSync(attemptPath, 'utf8');
+    const releasedAt = readJson(join(p.claims, `${claim.claim_id}.json`)).completed_at;
+
+    const duplicate = reconcileRunnerFailure(root, exact);
+    assert.equal(duplicate.reconciliation, 'ALREADY_COMMITTED');
+    assert.equal(readFileSync(attemptPath, 'utf8'), committedBytes);
+    assert.equal(readJson(join(p.claims, `${claim.claim_id}.json`)).completed_at, releasedAt);
+    assert.throws(() => reconcileRunnerFailure(root, {
+      ...exact,
+      supervisorGeneration: supervisor.generation + 1,
+    }), /stale supervisor generation/);
+    assert.throws(() => reconcileRunnerFailure(root, {
+      ...exact,
+      fenceGeneration: claim.fence_generation + 1,
+    }), /identity or fence is ambiguous/);
+    assert.throws(() => createAttempt(root, task, routeTask(root, task)), /rejected task cannot be relaunched/);
+
+    const recovered = recover(root, {
+      isProcessAlive: () => false,
+      startWakeDispatcher: () => ({ started: false, reason: 'fixture-disabled' }),
+    });
+    assert.equal(recovered.reconciliation.classification, 'known_runner_failed_child_unknown');
+    assert.equal(recovered.reconciliation.action, 'do_not_relaunch');
+    assert.equal(recovered.reconciliation.claim_status, 'FAILED');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

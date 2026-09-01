@@ -1,0 +1,131 @@
+{
+  "task_id": "task-detached-runner-host-wakeup",
+  "title": "Implement detached Runner and safe tmux host wakeup",
+  "objective": "Replace the canonical foreground wait-cell execution path with a detached Runner process and a durable, idempotent, generation-fenced tmux Codex wakeup adapter while preserving zero wait-induced automatic activations and the existing fallback.",
+  "scope": [
+    "detached Runner launcher and independently surviving worker",
+    "Runner-owned child lifecycle, heartbeat, timeout, evidence, Context Firewall packet, terminal event, and claim release",
+    "durable wake queue and short-lived host delivery adapter",
+    "safe tmux prompt-idle, busy, human-interacting, unavailable, and queued classifications",
+    "idempotent delivery and supervisor generation fencing",
+    "operator CLI for detached launch, wake inspection/drain, and prompt readiness",
+    "focused deterministic race, recovery, pause-after-current, and activation telemetry tests",
+    "architecture, operations, and fallback documentation"
+  ],
+  "authorization": {
+    "may": [
+      "inspect repository source, tests, documentation, durable state, the current tmux pane read-only, installed Codex CLI behavior read-only, and the event-driven-agent-wakeup sibling repository read-only",
+      "refactor Runner internals so foreground fallback and detached worker share one lifecycle implementation",
+      "add repository-local executable launch, worker, notification, and wake-delivery adapters",
+      "use detached local Node processes and tmux commands without installing a daemon or modifying global Codex configuration",
+      "persist repository-local wake queue, readiness lease, delivery receipt, worker identity, and telemetry artifacts under .opsle through runtime code",
+      "add dependency-injected deterministic tests for tmux states and crash/race boundaries",
+      "run focused and full deterministic verification"
+    ],
+    "may_modify": [
+      "src/**",
+      "bin/**",
+      "adapters/**",
+      "tests/**",
+      "tools/**",
+      "README.md",
+      "ARCHITECTURE.md",
+      "SPEC.md",
+      "docs/OPERATIONS.md",
+      "docs/SELF_HOSTING_PROOF.md",
+      "package.json"
+    ],
+    "may_not": [
+      "modify .opsle runtime authority, historical events, decisions, evidence, requirements, objective history, policy, supervisor identity, tasks, attempts, or claims directly",
+      "modify sibling repositories or depend on uncommitted sibling changes",
+      "blindly inject text into tmux, clear or overwrite a human composer, or deliver while the supervisor is busy or a human is detectably interacting",
+      "treat heartbeat or nonterminal progress as an eligible wake",
+      "weaken task authorization, claims, fencing, single authority, timeout, Context Firewall, Acceptance, pause, or recovery semantics",
+      "enable Claude or review, deploy, merge, push, create a PR, install server-wide, initialize another repository, or change user-level Codex configuration"
+    ]
+  },
+  "required_inputs": [
+    "src/runner.js",
+    "src/host-terminal.js",
+    "src/wakeup.js",
+    "src/cli.js",
+    "src/pipeline.js",
+    "src/state.js",
+    "src/activation-telemetry.js",
+    "tests/wakeup.test.js",
+    "tests/bootstrap.test.js",
+    "tests/operator-controls.test.js",
+    "tests/recovery-policy.test.js",
+    "ARCHITECTURE.md",
+    "docs/OPERATIONS.md",
+    "/home/deploy/apps/opsle-bootstrap/repos/event-driven-agent-wakeup/src/runtime.js"
+  ],
+  "relevant_context": [
+    "The prior correction reduced a defective live interval from 23 wait-induced automatic activations to zero by keeping an enclosing tool cell open; that invariant must remain true.",
+    "The current runAttempt function awaits child and verification completion inside task run, so the supervisor cannot return to its normal prompt while work is active.",
+    "The canonical task run path must detach a repository-local Runner worker, return only after durable launch ownership is established, and leave foreground wait-cell behavior available only through an explicit fallback flag.",
+    "The Runner worker, not the supervisor turn, must own child PID, heartbeat, timeout, verification, raw evidence, Context Firewall reduction, completion handoff, terminal event, claim release, pause-after-current application, and wake queue creation.",
+    "Eligible automatic wake reasons are only child completion, failure, terminal timeout/stall, and intervention-required. Heartbeat and nonterminal progress remain ineligible.",
+    "Official Codex configuration supports a notify command receiving a JSON payload and lifecycle hooks, but there is no supported repository-level API that safely submits text into an idle TUI composer. The adapter must therefore use an explicit repo-owned readiness lease plus conservative tmux evidence; screen text alone is insufficient as canonical authority.",
+    "A safe delivery decision must bind supervisor id, exact current generation, tmux session, pane identity, Codex process identity, a fresh prompt-ready lease, no active/busy marker, no attached client or other detectable human interaction, and an empty known composer. Unsafe or ambiguous state queues durably.",
+    "Delivery must be fail-closed and idempotent. Use an atomic delivery claim/receipt; a crash-uncertain delivery must not be automatically replayed. The injected prompt must carry the event id and direct the supervisor to reconstruct durable state and consume exactly once.",
+    "A bounded short-lived detached adapter may retry safe delivery after terminal creation; no external GUI, service platform, container, distributed service, model polling, or long-running supervisor tool call is allowed.",
+    "Recovery must later drain queued eligible events exactly once. Duplicate events must not create duplicate injections. A stale supervisor generation or stale readiness lease must not consume an event targeted to the current generation.",
+    "The human must be able to use deterministic status/watch and operator controls during a detached child without transferring lifecycle ownership away from Runner.",
+    "Provider policy remains Codex enabled on gpt-5.6-sol high, Claude disabled, review off, Gearbox required, Context Firewall required, model polling forbidden."
+  ],
+  "expected_deliverable": "A tested canonical detached execution path and repository-local safe tmux wakeup adapter that returns the supervisor prompt immediately, queues whenever delivery is ambiguous, wakes once on eligible durable events, retains the explicit wait-cell fallback, and documents the host boundary and residual limitations.",
+  "expected_evidence": [
+    "task run defaults to detached launch and returns before child completion",
+    "detached worker survives launcher exit and owns lifecycle through a durable terminal event",
+    "foreground wait-cell path requires an explicit compatibility flag",
+    "prompt-ready lease and delivery receipt are bound to supervisor identity, exact generation, tmux pane, and process identity",
+    "idle completion delivers once; busy, attached-human, unavailable tmux, stale generation, and ambiguous composer queue without injection",
+    "duplicate event is idempotent and recovery later consumes a queued event exactly once",
+    "pause-after-current lets the child complete, applies PAUSED state, and prevents another launch",
+    "telemetry can record terminal, human, and wait-induced activation counts with wait-induced zero when proven",
+    "focused tests and npm run verify pass",
+    "actual changed files remain authorized"
+  ],
+  "acceptance_criteria": [
+    "no foreground/background child or wait remains attached to the initiating supervisor tool turn in canonical detached mode",
+    "the supervisor state is DORMANT during detached work while deterministic status/watch and human controls remain available",
+    "Runner lifecycle and terminal evidence are durable before host wake delivery is attempted",
+    "only terminal/intervention events are eligible for automatic delivery",
+    "unsafe, busy, human-interacting, unavailable, stale, and ambiguous states queue durably without tmux input",
+    "delivery and event consumption are idempotent and crash uncertainty fails closed",
+    "stale supervisor generation cannot consume a newer generation event",
+    "claims, fencing, single authority, pause-after-current, Gearbox, Context Firewall, and Acceptance are preserved",
+    "foreground wait-cell is documented as fallback rather than default",
+    "focused and full deterministic verification pass",
+    "Context Firewall packet is complete_for_decision",
+    "no unexpected files change"
+  ],
+  "prohibited_actions": [
+    "blind tmux send-keys based only on pane existence or a fixed delay",
+    "clearing, replacing, or submitting human-composed text",
+    "model polling, periodic supervisor inference, or heartbeat-triggered activation",
+    "unbounded daemonization or external infrastructure",
+    "history rewriting or direct mutation of prior durable records",
+    "release, merge, deployment, server-wide installation, or cross-repository initialization"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled with configured model and reasoning effort",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling and wait-induced automatic reasoning prohibited",
+    "Affected Verification advisory only"
+  ],
+  "requirement_ids": [],
+  "route_hint": "codex",
+  "deterministic_command": null,
+  "verification_command": [
+    "npm",
+    "run",
+    "verify"
+  ],
+  "expects_changes": true,
+  "timeout_seconds": 2400
+}

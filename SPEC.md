@@ -36,10 +36,12 @@ Later policy changes are prospective.
 2. Operator policy makes disabled providers ineligible.
 3. Gearbox selects an adequate permitted deterministic route or Codex.
 4. Claim acquisition fails if the task already has an active claim.
-5. The Runner durably registers an explicit bounded wait before launch and
-   before making the supervisor `DORMANT`.
-6. The OS process wait, not a model loop, detects completion, failure, or
-   timeout and publishes a terminal event.
+5. The Runner durably registers an explicit bounded wait, establishes detached
+   worker ownership, and makes the supervisor logically `DORMANT` before the
+   initiating command returns. Foreground waiting requires an explicit
+   compatibility flag.
+6. The detached worker's OS process wait, not a supervisor turn or model loop,
+   detects completion, failure, or timeout and publishes a terminal event.
 7. Raw stdout, stderr, the final child message, execution metadata, and
    verification output are retained as applicable.
 8. Changed paths are compared with the task's `may_modify` envelope.
@@ -54,14 +56,42 @@ Later policy changes are prospective.
 
 Normal model-level polling and wait-induced automatic reasoning are prohibited.
 Healthy heartbeat, host-wrapper yield/timeout, and any other nonterminal return
-cannot make a wait model-ready. Terminal completion/failure/timeout/stall or an
-intervention-required event may wake automatic supervision. Explicit human
-interaction is separately eligible and classified as human.
+cannot enter the wake queue. Only terminal completion/failure/timeout/stall or
+an intervention-required event can.
 
-The Codex host must bind the terminal adapter so wrapper yields are consumed
-inside one deterministic call. Without that host binding, the repository can
-detect and report trajectory activations but cannot prevent the external host
-from initiating them.
+Wake classification is owned by one detached repository-local provider-free
+dispatcher fenced by exact PID/start/executable, dispatcher generation,
+supervisor identity/generation, and request queue version. Receipt-free requests
+have no expiry. Filesystem observation is registered before the queue scan.
+
+New requests bind only durable supervisor identity/generation, not a frontend.
+A separate `codex-session-binding/v1` records repository realpath, Codex UUID,
+rollout `session_meta` hashes and inode, installed CLI version, UID, exact host
+and writer process identities, tmux session/pane/TTY, and writer topology. Every
+fact is revalidated before transport selection. Missing, replaced, duplicated,
+dead/reused, mismatched, or stale facts fail closed.
+
+Codex 0.151.0 standalone embedded-writer topology is explicitly unsupported:
+normal dispatch calls neither `codex resume` nor terminal input and retains the
+event. Only a separately proven shared-app-server topology may select the native
+transport. Before selection crosses the transport boundary, an activation lease
+CAS fences generation, owner, process, event, expiry, and monotonic token; a
+per-event decision record provides the non-replayable exactly-once boundary.
+The message contains only event ID, generation, and a durable-state instruction.
+
+Legacy tmux request bytes remain readable and immutable. Prior-generation and
+already-evaluated requests are obsolete, not adopted. `SupervisorHostAdapter`,
+the tmux commit implementation, Herdr candidate discovery, and foreground
+terminal wait remain explicit compatibility boundaries and are never called by
+normal automatic dispatch.
+
+Herdr is a candidate-only read-only host. Deterministic discovery requires one
+exact socket, repository/workspace, pane, terminal, Codex session, process
+identity, and current supervisor generation. Structured workspace, pane,
+process, agent-status, attached-client, and event facts may be reported without
+terminal scraping. None authorize input. Because Herdr 0.8.2 cannot prove an
+empty human draft or exclusive input transaction, its commit result is always
+`submitted: false` and no prompt/send primitive is called.
 
 ## Return values and evidence
 
@@ -83,11 +113,31 @@ unauthorized changes, failed verification, and incomplete packets fail closed.
 Pause blocks new automatic launches and does not implicitly cancel a running
 child.
 
+`deterministic_command` and `verification_command`, when present, are nonempty
+argv arrays whose entries are strings. Validation occurs before routing, claim
+acquisition, attempt creation, or Runner launch. Runner writes provider process
+termination evidence before verification, Context Firewall reduction,
+Acceptance, or terminal publication.
+
 Recovery preserves the existing supervisor identity and reconstructs from
 repository files. Known terminal work is not relaunched. A live PID preserves
-its claim. An absent PID without terminal evidence is marked `UNKNOWN`, pauses
-progression, and requires reconciliation. Recovery does not require a
-conversation summary and does not infer a retry.
+its claim only for the explicit foreground path. Detached work requires a live
+exact `OWNED` Runner worker matching the attempt, active claim, fence, supervisor,
+launch generation, and worker PID. A live child without that worker is orphaned,
+marked `UNKNOWN`, pauses progression, and requires reconciliation. Recovery does
+not require a conversation summary and does not infer a retry. It never rewrites
+or adopts wake requests: prior generations become obsolete. It supersedes a
+stale dispatcher and ensures one current dispatcher. Session-binding generation
+adoption is a separate explicit command after every other identity fact validates.
+Claimed or uncertain activation decisions remain non-replayable; delivered and
+consumed receipts are idempotent.
+
+A terminal `FAILED` worker record is Runner evidence, not child success or
+failure evidence. The explicit reconciliation path requires exact task, attempt,
+worker, claim, fence, supervisor generation, absent process, rejected-task, and
+unknown-child facts. It first commits a durable `FAILED` Runner / `UNKNOWN` child
+record and only then idempotently releases that exact claim as `FAILED`. Recovery
+recognizes the committed result and never retries it.
 
 ## Policy boundaries
 

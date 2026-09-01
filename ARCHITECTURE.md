@@ -55,9 +55,9 @@ path controls how much execution detail enters the next decision.
 | Capability Discovery | Deterministic executable and sibling-revision discovery in `src/pipeline.js`. Presence does not imply permission or integration. |
 | Gearbox | A local, inspectable routing adapter chooses a predeclared deterministic command when adequate, otherwise an enabled Codex route. Disabled providers are ineligible. |
 | Claims/fencing | One active task claim with a monotonically increasing fence generation; conflicting acquisition fails closed. |
-| Runner | `src/runner.js` registers a bounded wait before dormancy, launches the process, records PID and heartbeat, captures raw artifacts, enforces timeout, blocks until process close, and publishes a terminal event. |
-| Event-driven wakeup | `src/wakeup.js` is a fail-closed state machine. Terminal completion/failure/timeout/stall/intervention and explicit human interaction are eligible; heartbeat and host nonterminal returns are not. |
-| Host-terminal boundary | `src/host-terminal.js` mechanically consumes resumable wrapper returns inside one bounded deterministic call and exposes only terminal control. The host must bind this adapter. |
+| Runner | `src/runner.js` defaults to a detached repository-local worker. A durable PID/nonce/fence handshake completes before the launcher returns; the worker then owns child PID, heartbeat, timeout, evidence, verification, Context Firewall, Acceptance, claim release, pause-after-current, terminal event, and wake creation. |
+| Event-driven wakeup | `src/wakeup.js` queues only terminal/intervention events and maintains one persistent detached provider-free dispatcher. Observation is registered before the receipt-free scan. Requests have no expiry and never bind a frontend. Stale/evaluated requests are obsolete without byte mutation. Session validation, activation leases, per-event decision CAS, receipts, consumption, and telemetry are durable and idempotent. Heartbeat and nonterminal progress remain ineligible. |
+| Supervisor/session boundary | Durable supervisor identity is separate from `codex-session-binding/v1`, which binds repository, generation, Codex UUID, rollout metadata/inode, CLI version, UID, exact host/writer processes, and tmux pane/TTY. Codex 0.151.0 standalone writer is unsupported, so normal dispatch performs no resume or terminal input. `src/host-terminal.js` retains tmux and mechanical wait compatibility; Herdr remains candidate-only and refuses input. |
 | Context Firewall | A local reducer creates a bounded packet with completeness, measured bytes, changed-file scope, verification result, hashes, and raw references. |
 | Decision evidence | Completion handoff separates child claims from deterministic observations and unknowns. |
 | Acceptance | Deterministic criteria gate the attempt before a separate supervisor accept/reject decision can advance requirements. |
@@ -79,20 +79,39 @@ Supervisor and child lifecycles are independent:
 - Supervisor: `ACTIVE`, `DORMANT`, or `PAUSED`.
 - Child: `QUEUED`, `LAUNCHING`, `RUNNING`, a terminal state, or `UNKNOWN`.
 
-The Runner persists the wait registration before setting the supervisor to
-`DORMANT` and launching the bounded process. Heartbeats update liveness but do
-not change wake state. After process close it persists raw evidence,
-verification, the compact packet, completion handoff, Acceptance result, and a
-terminal completion event. Only applying that event can return automatic
-supervision to `ACTIVE` or apply a requested pause. Duplicate terminal delivery
-is idempotent.
+The default `task run` path persists its wait and detached-worker launch record,
+sets the supervisor `DORMANT`, spawns an independent Node worker, and returns
+after that worker durably acknowledges exact claim, fence, supervisor, nonce,
+and PID ownership. No child process or wait remains attached to the initiating
+supervisor turn. `--foreground-wait` deliberately selects the prior blocking
+compatibility path.
 
-The repository Runner and the Codex host terminal are separate boundaries. A
-nonterminal tool-wrapper return can reactivate inference even while the Runner
-is correctly blocked. The host-terminal adapter therefore loops over resumable
-returns mechanically until it observes an exit code or reaches its explicit
-deadline. Reaching the host deadline without terminal evidence fails closed;
-it is not permission for automatic reasoning.
+The detached worker owns the full lifecycle. After process close it persists
+the provider process result first, then verification, raw evidence, the compact
+packet, completion handoff, Acceptance, claim release, terminal event, the
+pending pause-after-current request, and a durable wake request before ensuring one
+persistent detached host dispatcher exists. If any post-processing phase fails,
+the worker durably records Runner failure, moves an unresolved attempt to
+`UNKNOWN`, and publishes an eligible intervention wake without a false child
+completion. The supervisor remains `DORMANT` while delivery is queued.
+Pause-after-current is applied only after supervisor evaluation and terminal
+task state (`ACCEPTED` or `REJECTED`). The dispatcher is independent of the Runner and any supervisor tool
+turn. Before deciding that the queue is empty, it registers filesystem
+observation and then rechecks receipt-free requests. An event created on either
+side of that boundary is therefore observed without polling. With an empty
+queue it blocks on that notification; with queued
+receipt-free work it re-evaluates binding/transport state using bounded provider-free backoff
+without expiry.
+
+Native delivery is conservative and one-shot. A separate session binding must
+revalidate every exact identity fact and an explicitly proven supported topology.
+The provider-free activation lease serializes events and fences generation,
+dispatcher process, expiry, and monotonic token. An atomic per-event activation
+decision is created before transport and is never replayed after uncertainty.
+Only event ID, generation, and the durable-state instruction enter the message.
+The installed standalone embedded writer fails this capability gate, so the
+current dispatcher retains receipt-free work without spawning resume or calling
+tmux input. Legacy tmux requests remain readable and byte-identical.
 
 ## Recovery and duplicate prevention
 
@@ -103,10 +122,24 @@ increments the existing supervisor generation; it does not create another
 identity.
 
 For a durable active attempt, recovery does not relaunch a known terminal child.
-If its PID is alive, the claim is preserved and no duplicate is launched. If
-the PID is absent without terminal evidence, the attempt becomes `UNKNOWN`,
-automatic progression pauses, and reconciliation is required. No retry is
-inferred from process absence.
+For detached work, only a live worker whose durable `OWNED` record exactly
+matches the attempt, active claim, fence, supervisor identity, launch generation,
+and worker PID preserves the claim. A merely live child with a dead or mismatched
+worker is an orphan: the attempt becomes `UNKNOWN`, automatic progression pauses,
+and reconciliation is required. The explicit foreground compatibility path has
+no worker record and retains its direct live-child ownership rule. Recovery
+increments the supervisor generation, leaves queued request bytes and targets
+unchanged, classifies old requests obsolete, supersedes stale dispatcher
+ownership, and starts the current dispatcher. Session-binding adoption is
+explicit and allowed only after all non-generation facts validate.
+
+The explicit failed-worker reconciler is narrower than ordinary recovery. It
+requires a rejected task, an exact `UNKNOWN` attempt with no child terminal
+evidence, an exact terminal `FAILED` worker, the matching active or already
+failed claim and fence, current supervisor generation, and proof that both
+recorded processes are dead. It durably commits `runner_outcome=FAILED` and
+`child_outcome=UNKNOWN` before releasing the exact claim as `FAILED`. Repeated
+execution preserves the original commit and claim completion time.
 
 tmux provides a predictable interactive session name and attach/start helpers.
 It is not an ownership lock or a state store.
@@ -119,8 +152,8 @@ but do not pretend to import every sibling prototype:
 - sibling Gearbox, Context Firewall, wakeup, decision-evidence, handoff,
   Affected Verification, and profiler repositories are only discovered and
   revision-recorded;
-- wakeup is a local registered-wait state machine driven by durable terminal
-  events, not an external notification service;
+- wakeup is a local durable queue and capability-gated native-session boundary driven only by
+  terminal/intervention events, not an external notification service;
 - Context Firewall and Gearbox are narrow local implementations intended to be
   replaceable;
 - Affected Verification remains advisory and cannot waive established tests;
@@ -129,6 +162,24 @@ but do not pretend to import every sibling prototype:
   is off;
 - multi-host, multi-repository, distributed, web, scheduler, deployment, and
   automatic merge concerns are outside V0.1.
+
+Herdr 0.8.2 is operationally useful for structured workspace, pane, terminal,
+process, agent-status, event, persistence, and multi-client observations. It
+does not provide an atomic prompt-idle, human-draft-empty, concurrent-input
+exclusion, generation fence, request-deduplication, and Opsle-receipt-coupling
+transaction. The Herdr adapter is therefore permanently `candidate-only` in
+this implementation: discovery rejects any missing, duplicate, or mismatched
+binding fact, status never authorizes delivery, and commit performs no prompt or
+pane send call.
+
+Installed Codex 0.151.0 standalone resume starts another embedded app-server and
+loses the active thread writer lock while the persistent TUI remains open. The
+positive Desktop observation demonstrates only a shared-app-server condition.
+Current native wake is therefore PARTIAL and disabled. A future PASS requires a
+separately authorized controlled migration to one shared app-server, an exact
+binding with controlled proof hash, and re-verification of multi-client delivery.
+The tmux host implementation remains explicit compatibility code, not the normal
+automatic dispatcher transport.
 
 This architecture is an experimental single-host vertical slice, not a
 production-readiness claim.

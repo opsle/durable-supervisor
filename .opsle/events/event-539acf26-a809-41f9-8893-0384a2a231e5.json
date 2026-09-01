@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-539acf26-a809-41f9-8893-0384a2a231e5","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":11,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-correct-detached-terminal-reconciliation","time":"2026-09-01T03:10:35.735Z","type":"TASK_HANDOFF_CREATED"}

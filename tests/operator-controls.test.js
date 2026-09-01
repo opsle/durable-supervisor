@@ -315,7 +315,7 @@ test('accepted task cannot recreate an automatic next action after terminal comp
   }
 });
 
-test('pause after current lets the running child finish, then blocks the next launch', async () => {
+test('pause after current evaluates and terminalizes the task before PAUSED blocks the next launch', async () => {
   const root = fixture();
   try {
     const p = paths(root);
@@ -352,11 +352,26 @@ test('pause after current lets the running child finish, then blocks the next la
     assert.equal(completed.attempt.child_state, 'COMPLETED');
     assert.equal(readFileSync(join(root, 'task-delayed-child.txt'), 'utf8'), 'done\n');
     const after = readJson(p.state);
-    assert.equal(after.supervisor_state, 'PAUSED');
+    assert.equal(after.supervisor_state, 'ACTIVE');
     assert.equal(after.pause.active, true);
-    assert.equal(after.pause.after_current, false);
-    assert.ok(after.pause.applied_at);
-    assert.equal(eventLines(root).filter((event) => event.type === 'PAUSE_AFTER_CURRENT_APPLIED').length, 1);
+    assert.equal(after.pause.after_current, true);
+    assert.equal(readJson(join(p.tasks, `${task.task_id}.json`)).state, 'AWAITING_SUPERVISOR');
+    assert.equal(eventLines(root).filter((event) => event.type === 'PAUSE_AFTER_CURRENT_APPLIED').length, 0);
+
+    const evaluated = await runCli(root, [
+      'task', 'evaluate', task.task_id,
+      '--accept', '--rationale', 'fixture evidence satisfies the bounded task',
+    ]);
+    assert.equal(evaluated.code, 0, evaluated.stderr);
+    const terminal = readJson(p.state);
+    assert.equal(readJson(join(p.tasks, `${task.task_id}.json`)).state, 'ACCEPTED');
+    assert.equal(terminal.supervisor_state, 'PAUSED');
+    assert.equal(terminal.pause.active, true);
+    assert.equal(terminal.pause.after_current, false);
+    assert.ok(terminal.pause.applied_at);
+    const ordered = eventLines(root).map((event) => event.type);
+    assert.ok(ordered.lastIndexOf('CHILD_COMPLETION') < ordered.lastIndexOf('SUPERVISOR_DECISION'));
+    assert.ok(ordered.lastIndexOf('SUPERVISOR_DECISION') < ordered.lastIndexOf('PAUSE_AFTER_CURRENT_APPLIED'));
 
     const next = createTask(root, handoff('task-must-not-launch'));
     const blocked = await runCli(root, ['task', 'run', next.task_id]);
