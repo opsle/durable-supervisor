@@ -322,7 +322,7 @@ test('accepted task cannot recreate an automatic next action after terminal comp
     assert.equal(readJson(p.state).pending_next_action, null);
     const status = await runCli(root, ['status']);
     assert.equal(status.code, 0, status.stderr);
-    assert.match(status.stdout, /^next: none$/m);
+    assert.match(status.stdout, /^Next: none$/m);
     assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -542,13 +542,78 @@ test('bounded status watch is read-only and measured telemetry uses durable fact
       '2',
       '--interval-ms',
       '1',
+      '--verbose',
     ]);
     assert.equal(watch.code, 0, watch.stderr);
     assert.equal((watch.stdout.match(/STATUS SNAPSHOT/g) ?? []).length, 2);
-    assert.match(watch.stdout, /output tokens: unknown/);
-    assert.match(watch.stdout, /cost: unknown/);
+    assert.match(watch.stdout, /Output tokens: unknown/);
+    assert.match(watch.stdout, /Cost: unknown/);
     assert.equal(readFileSync(p.eventsLog, 'utf8'), eventsBeforeWatch);
     assert.equal(readJson(join(p.tasks, `${task.task_id}.json`)).attempts.length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('operator status commands separate concise, verbose, and JSON output', async () => {
+  const root = fixture();
+  try {
+    const concise = await runCli(root, ['status']);
+    assert.equal(concise.code, 0, concise.stderr);
+    assert.ok(concise.stdout.trim().split('\n').length <= 10, concise.stdout);
+    assert.match(concise.stdout, /^Supervisor: READY/m);
+    assert.doesNotMatch(concise.stdout, /Repository:|Tmux fallback:/);
+    assert.doesNotMatch(concise.stdout, /^\s*\{/);
+
+    const verbose = await runCli(root, ['status', '--verbose']);
+    assert.equal(verbose.code, 0, verbose.stderr);
+    assert.match(verbose.stdout, /SUPERVISOR DIAGNOSTICS/);
+    assert.match(verbose.stdout, new RegExp(`Repository: ${root.replaceAll('/', '\\/')}`));
+    assert.match(verbose.stdout, /Tmux fallback: .*unavailable/);
+
+    const structured = await runCli(root, ['status', '--json']);
+    assert.equal(structured.code, 0, structured.stderr);
+    const statusValue = JSON.parse(structured.stdout);
+    assert.equal(statusValue.supervisor.repository, root);
+    assert.equal(statusValue.operator_state.supervisor, 'READY');
+    assert.equal(statusValue.session_binding.classification, 'unbound');
+
+    const policy = readJson(paths(root).policy);
+    const policyHuman = await runCli(root, ['policy', 'status']);
+    assert.equal(policyHuman.code, 0, policyHuman.stderr);
+    assert.match(policyHuman.stdout, /^Policy: /);
+    assert.deepEqual(JSON.parse((await runCli(root, ['policy', 'status', '--json'])).stdout), policy);
+
+    const modelsHuman = await runCli(root, ['models', 'status']);
+    assert.equal(modelsHuman.code, 0, modelsHuman.stderr);
+    assert.match(modelsHuman.stdout, /^Models: /);
+    assert.deepEqual(
+      JSON.parse((await runCli(root, ['models', 'status', '--json'])).stdout),
+      policy.providers,
+    );
+
+    const wakeHuman = await runCli(root, ['wake', 'status']);
+    assert.equal(wakeHuman.code, 0, wakeHuman.stderr);
+    assert.match(wakeHuman.stdout, /^Wake: clear/m);
+    const wakeJson = JSON.parse((await runCli(root, ['wake', 'status', '--json'])).stdout);
+    assert.ok(Array.isArray(wakeJson.requests));
+    assert.deepEqual(wakeJson.status_summary, {
+      current_event_id: null,
+      latest_authoritative_event_id: null,
+      actionable_count: 0,
+      authoritative_count: 0,
+    });
+
+    const sessionHuman = await runCli(root, ['session', 'status']);
+    assert.equal(sessionHuman.code, 0, sessionHuman.stderr);
+    assert.match(sessionHuman.stdout, /^Herdr session: UNBOUND/m);
+
+    const liveness = await runCli(root, ['supervisor', 'is-alive']);
+    assert.equal(liveness.code, 1);
+    assert.match(liveness.stdout, /^Supervisor: UNKNOWN/m);
+    const livenessJson = await runCli(root, ['supervisor', 'is-alive', '--json']);
+    assert.equal(livenessJson.code, 1);
+    assert.equal(JSON.parse(livenessJson.stdout).classification, 'unknown');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

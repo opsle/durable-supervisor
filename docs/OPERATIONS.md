@@ -26,7 +26,18 @@ One snapshot:
 ./bin/opsle.js status
 ```
 
-Machine-readable snapshot:
+The default is an attention-first human summary intended to fit one terminal
+screen. It derives supervisor and child labels from current durable authority;
+`UNKNOWN` and `UNCERTAIN` are never collapsed into idle or active. Times are
+relative and identifiers are safely abbreviated.
+
+Expanded human diagnostics, including exact identifiers and timestamps:
+
+```bash
+./bin/opsle.js status --verbose
+```
+
+The full machine-readable snapshot remains uncontaminated JSON:
 
 ```bash
 ./bin/opsle.js status --json
@@ -37,6 +48,8 @@ Continuous deterministic watch, stopped with Ctrl-C:
 ```bash
 ./bin/opsle.js status --watch
 ```
+
+Add `--verbose` or `--json` to select the corresponding watch format.
 
 Bounded watch:
 
@@ -118,20 +131,23 @@ To launch one task and atomically pause after its supervisor evaluation:
 ```
 
 The pause is durable before successful detached Runner ownership returns. The
-launch result reports `pause_after_current.armed: true` together with
-`action: END_TURN_IMMEDIATELY`; no follow-up pause command or status check is
-required. Runner publishes the terminal child result as `AWAITING_SUPERVISOR`
-while the pause remains pending. `task evaluate` records `ACCEPTED` or
-`REJECTED` before applying `PAUSED`, so no next child can launch.
+default launch output is one human notice confirming the child, Runner
+monitoring ownership, supervisor dormancy, and `END_TURN_IMMEDIATELY`. Use
+`task run TASK_ID --json` when automation needs the complete launch object. A
+pause-after-current JSON result reports `pause_after_current.armed: true`
+together with `action: END_TURN_IMMEDIATELY`; no follow-up pause command or
+status check is required. Runner publishes the terminal child result as
+`AWAITING_SUPERVISOR` while the pause remains pending. `task evaluate` records
+`ACCEPTED` or `REJECTED` before applying `PAUSED`, so no next child can launch.
 
 The command returns only after a repository-local worker has durably accepted
 the exact attempt, claim fence, supervisor generation, nonce, and worker PID.
-Its result says `action: END_TURN_IMMEDIATELY`, `monitoring_owner: RUNNER_ONLY`,
-and records the matching durable dormancy contract. The initiating supervisor
-must end the current turn immediately. Runner alone owns child, status,
-heartbeat, and watch monitoring. The supervisor must not automatically check
-child state, status, heartbeat, filesystem watches, timeouts, or waits while the
-attempt is running.
+Its JSON result says `action: END_TURN_IMMEDIATELY`,
+`monitoring_owner: RUNNER_ONLY`, and records the matching durable dormancy
+contract. The initiating supervisor must end the current turn immediately.
+Runner alone owns child, status, heartbeat, and watch monitoring. The supervisor
+must not automatically check child state, status, heartbeat, filesystem watches,
+timeouts, or waits while the attempt is running.
 
 Manual operator inspection remains separate and provider-free:
 
@@ -184,6 +200,12 @@ Inspect queued, delivered, uncertain, or consumed events without model use:
 ```bash
 ./bin/opsle.js wake status
 ```
+
+The default reports the current actionable authoritative request, selected by
+authority and timestamp rather than directory order. Uncertain delivery is an
+attention condition. Use `wake status --verbose` for exact event/task/attempt
+details or `wake status --json` for all records and the deterministic current
+and latest event IDs.
 
 `wake drain` performs one provider-free diagnostic classification pass:
 
@@ -379,6 +401,9 @@ npm run test:supervisor-routing
 ./bin/opsle.js models status
 ```
 
+Both commands default to concise human output. Add `--verbose` for expanded
+provider diagnostics or `--json` for the complete policy/provider objects.
+
 Provider changes are prospective:
 
 ```bash
@@ -425,6 +450,11 @@ Derive the repository session name and inspect liveness:
 ./bin/opsle.js supervisor session-name
 ./bin/opsle.js supervisor is-alive
 ```
+
+`is-alive` treats a current authoritative Herdr binding as canonical. Missing
+tmux is not an error in that case. A live tmux session is reported only as a
+compatibility fallback; its details are shown by `--verbose`. Use `--json` for
+the full Herdr and fallback evidence.
 
 Start only when no session is alive:
 
@@ -532,8 +562,10 @@ If the tmux session was lost, check before recreating it:
 ./bin/opsle.js supervisor attach
 ```
 
-`is-alive` exits nonzero when no session exists; that result is expected before
-`start`. Never start a second live session for the same repository.
+`is-alive` exits nonzero with `UNKNOWN` when neither a current Herdr binding nor
+a live compatibility fallback proves process authority. That result can be
+expected before `start`. Never start a second live session for the same
+repository.
 
 ## Inspect tasks, requirements, and evidence
 

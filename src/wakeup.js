@@ -1995,11 +1995,17 @@ export function wakeQueueStatus(root, {
   const bindingStatus = codexSessionBindingStatus(root, { dependencies: bindingDependencies });
   const requests = readdirSync(wake.requests).filter((name) => name.endsWith('.json')).sort().map((name) => {
     const request = readJson(join(wake.requests, name));
+    const authoritative = request.target?.supervisor_id === supervisor.supervisor_id
+      && request.target?.supervisor_generation === supervisor.generation;
     const receipt = readOptional(receiptPath(root, request.event_id));
     if (receipt) {
       return {
         event_id: request.event_id,
         terminal_type: request.terminal_type,
+        task_id: request.task_id,
+        attempt_id: request.attempt_id,
+        queued_at: request.queued_at,
+        authoritative,
         classification: ['DELIVERED', 'CONSUMED'].includes(receipt.status) ? 'duplicate' : 'queued',
         reason: receipt.status,
         receipt,
@@ -2011,12 +2017,20 @@ export function wakeQueueStatus(root, {
       return {
         event_id: request.event_id,
         terminal_type: request.terminal_type,
+        task_id: request.task_id,
+        attempt_id: request.attempt_id,
+        queued_at: request.queued_at,
+        authoritative,
         ...lifecycle,
       };
     }
     return {
       event_id: request.event_id,
       terminal_type: request.terminal_type,
+      task_id: request.task_id,
+      attempt_id: request.attempt_id,
+      queued_at: request.queued_at,
+      authoritative,
       classification: !bindingStatus.valid
         ? 'queued'
         : (bindingStatus.supported ? 'native-ready' : 'unsupported-topology'),

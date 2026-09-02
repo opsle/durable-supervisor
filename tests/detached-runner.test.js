@@ -320,7 +320,7 @@ test('detached ownership ends the launcher turn and only a queued terminal event
   try {
     const task = createTask(root, handoff('task-detached-default', 2400));
     const started = Date.now();
-    const launched = runCli(root, ['task', 'run', task.task_id]);
+    const launched = runCli(root, ['task', 'run', task.task_id, '--json']);
     const elapsed = Date.now() - started;
     assert.equal(launched.code, 0, launched.stderr);
     assert.ok(launched.stdout.trim(), JSON.stringify(launched));
@@ -425,6 +425,21 @@ test('foreground waiting is available only through the explicit compatibility fl
   }
 });
 
+test('default detached launch emits one useful notice and immediately leaves supervision dormant', async () => {
+  const root = fixture();
+  try {
+    const task = createTask(root, handoff('task-human-launch-notice', 500));
+    const launched = runCli(root, ['task', 'run', task.task_id]);
+    assert.equal(launched.code, 0, launched.stderr);
+    assert.equal(launched.stdout.trim().split('\n').length, 1);
+    assert.match(launched.stdout, /^Child .* started as .*; Runner owns monitoring and the supervisor is dormant\./);
+    assert.match(launched.stdout, /END_TURN_IMMEDIATELY$/m);
+    assert.equal(readJson(paths(root).state).supervisor_state, 'DORMANT');
+  } finally {
+    await cleanupDetachedFixture(root);
+  }
+});
+
 test('task run atomically arms pause-after-current before detached ownership returns', async () => {
   for (const evaluation of ['accept', 'reject']) {
     const root = fixture();
@@ -433,7 +448,7 @@ test('task run atomically arms pause-after-current before detached ownership ret
       const reason = `atomic ${evaluation} fixture boundary`;
       const launched = runCli(root, [
         'task', 'run', task.task_id,
-        '--pause-after-current', '--reason', reason,
+        '--pause-after-current', '--reason', reason, '--json',
       ]);
       assert.equal(launched.code, 0, launched.stderr);
       const launch = JSON.parse(launched.stdout);
@@ -510,7 +525,7 @@ test('compatibility pause command remains available for an existing detached lau
   const root = fixture();
   try {
     const task = createTask(root, handoff('task-detached-pause', 650));
-    const launched = runCli(root, ['task', 'run', task.task_id]);
+    const launched = runCli(root, ['task', 'run', task.task_id, '--json']);
     assert.equal(launched.code, 0, launched.stderr);
     assert.ok(launched.stdout.trim(), JSON.stringify(launched));
     const launch = JSON.parse(launched.stdout);

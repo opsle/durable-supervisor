@@ -39,6 +39,17 @@ import {
 } from './supervisor-routing.js';
 import { activationSummary } from './activation-telemetry.js';
 import {
+  deriveDisplayState,
+  deriveSupervisorLiveness,
+  detachedLaunchNotice,
+  renderModels,
+  renderPolicy,
+  renderSession,
+  renderSupervisorStatus,
+  renderWakeStatus,
+  selectWakeRecords,
+} from './operator-display.js';
+import {
   generateResumePacket,
   readResumeEvidence,
   readResumePacket,
@@ -60,7 +71,7 @@ function usage() {
 
 commands:
   init
-  status [--json] [--watch [--iterations N] [--interval-ms MS]]
+  status [--verbose|--json] [--watch [--iterations N] [--interval-ms MS]]
   validate
   recover
   resume-packet generate [--recover]
@@ -73,28 +84,30 @@ commands:
   resume
   objective show
   objective set --text TEXT
-  policy status
+  policy status [--verbose|--json]
   policy enable PROVIDER
   policy disable PROVIDER
   policy review MODE [--reviewer PROVIDER]
-  models status|enable|disable [PROVIDER]
+  models status [--verbose|--json]
+  models enable|disable [PROVIDER]
   task create --input FILE
-  task run TASK_ID [--pause-after-current] [--foreground-wait]
+  task run TASK_ID [--pause-after-current] [--foreground-wait] [--json]
   task evaluate TASK_ID --accept|--reject --rationale TEXT
   task show TASK_ID
   requirements [--json]
   evidence show ATTEMPT_ID
   events consume EVENT_ID [--delivery ID --generation N]
   wake start
-  wake status
+  wake status [--verbose|--json]
   wake drain
   session bind --session UUID --rollout PATH --sessions-root PATH
     --host-pid PID --workspace-id ID --workspace-cwd PATH
     --pane-id ID --terminal-id ID [--legacy-tmux-session NAME]
-  session status
+  session status [--verbose|--json]
   session adopt
   telemetry import-activation-profile --input FILE
-  supervisor session-name|start|attach|is-alive
+  supervisor session-name|start|attach
+  supervisor is-alive [--verbose|--json]
   supervisor route select --input FILE
   supervisor route show DECISION_ID
   supervisor route load-skill DECISION_ID --skill SKILL_ID
@@ -108,6 +121,13 @@ function valueAfter(args, flag, fallback = null) {
 
 function print(value) {
   process.stdout.write(`${typeof value === 'string' ? value : JSON.stringify(value, null, 2)}\n`);
+}
+
+function outputMode(args) {
+  const json = args.includes('--json');
+  const verbose = args.includes('--verbose');
+  if (json && verbose) throw new Error('choose only one of --verbose or --json');
+  return { json, verbose };
 }
 
 function integerOption(args, flag, fallback, { minimum = 1, maximum = Number.MAX_SAFE_INTEGER } = {}) {
@@ -173,12 +193,6 @@ function measuredElapsedMs(attempt) {
   if (!attempt.started_at) return null;
   const started = Date.parse(attempt.started_at);
   return Number.isFinite(started) ? Math.max(0, Date.now() - started) : null;
-}
-
-function displayValue(value) {
-  if (value == null) return 'unknown';
-  if (typeof value === 'object') return JSON.stringify(value);
-  return String(value);
 }
 
 function updatePolicy(root, mutate, actor = 'operator-cli') {
@@ -280,7 +294,7 @@ function setObjective(root, text, actor = 'operator-cli') {
   return { objective, reconciliation, event_id: event.event_id };
 }
 
-function status(root, json = false) {
+function status(root, { json = false, verbose = false, referenceTime = Date.now() } = {}) {
   const p = paths(root);
   const supervisor = readJson(p.supervisor);
   const state = readJson(p.state);
@@ -291,6 +305,28 @@ function status(root, json = false) {
     ? readJson(join(p.tasks, `${state.active_task_id}.json`)) : null;
   const attempt = state.active_attempt_id && existsSync(join(p.attempts, `${state.active_attempt_id}.json`))
     ? readJson(join(p.attempts, `${state.active_attempt_id}.json`)) : null;
+  const claim = attempt?.claim_id && existsSync(join(p.claims, `${attempt.claim_id}.json`))
+    ? readJson(join(p.claims, `${attempt.claim_id}.json`)) : null;
+  const runnerPath = attempt?.attempt_id
+    ? join(p.opsle, 'workers', `${attempt.attempt_id}.json`)
+    : null;
+  const runner = runnerPath && existsSync(runnerPath) ? readJson(runnerPath) : null;
+  const sessionBinding = codexSessionBindingStatus(root);
+  const operatorState = deriveDisplayState({
+    supervisor,
+    state,
+    task,
+    attempt,
+    claim,
+    runner,
+    processIsAlive: processAlive,
+  });
+  if (sessionBinding.classification === 'stale') {
+    operatorState.attention = true;
+    operatorState.reasons.unshift(
+      `authoritative Herdr binding is UNKNOWN: ${(sessionBinding.reasons ?? []).join(', ') || 'stale'}`,
+    );
+  }
   const counts = {};
   for (const requirement of matrix.requirements) counts[requirement.state] = (counts[requirement.state] ?? 0) + 1;
   const events = existsSync(p.eventsLog)
@@ -336,6 +372,8 @@ function status(root, json = false) {
       tmux_alive: supervisor.session_id ? tmuxAlive(supervisor.session_id) : false,
     },
     objective: objective.history.find((item) => item.revision === objective.current_revision),
+    session_binding: sessionBinding,
+    operator_state: operatorState,
     active_work: task ? {
       task_id: task.task_id,
       description: task.title,
@@ -381,84 +419,19 @@ function status(root, json = false) {
     telemetry,
   };
   if (json) return value;
-  const active = value.active_work;
-  return [
-    'SUPERVISOR',
-    `repository: ${root}`,
-    `identity: ${supervisor.supervisor_id}`,
-    `generation: ${supervisor.generation}`,
-    `state: ${state.supervisor_state}`,
-    `phase: ${state.phase}`,
-    `pause: ${state.pause.active}`,
-    `tmux: ${supervisor.session_id ?? 'none'} (${value.supervisor.tmux_alive ? 'alive' : 'not running'})`,
-    `objective revision: ${objective.current_revision}`,
-    `objective: ${value.objective?.objective ?? 'unknown'}`,
-    '',
-    'ACTIVE WORK',
-    active ? [
-      `task: ${active.task_id} ${active.description}`,
-      `task state: ${active.state}`,
-      `attempt: ${active.attempt_id}`,
-      `route: ${active.route}`,
-      `provider: ${displayValue(active.provider)}`,
-      `child: ${active.child_state}`,
-      `pid: ${displayValue(active.pid)}`,
-      `claim: ${active.claim_id}`,
-      `start: ${displayValue(active.start_time)}`,
-      `elapsed ms: ${displayValue(active.elapsed_ms)}`,
-      `heartbeat: ${displayValue(active.last_heartbeat)}`,
-      `completion: ${displayValue(active.completion)}`,
-      `execution duration ms: ${displayValue(active.telemetry.execution_duration_ms)}`,
-      `raw output bytes: ${displayValue(active.telemetry.raw_output_bytes)}`,
-      `raw evidence bytes: ${displayValue(active.telemetry.raw_evidence_bytes)}`,
-      `compact packet bytes: ${displayValue(active.telemetry.compact_packet_bytes)}`,
-      `retained bytes: ${displayValue(active.telemetry.retained_bytes)}`,
-      `suppressed bytes: ${displayValue(active.telemetry.suppressed_bytes)}`,
-      `reduction ratio: ${displayValue(active.telemetry.reduction_ratio)}`,
-      'output tokens: unknown',
-      'cost: unknown',
-    ].join('\n') : 'none',
-    '',
-    'POLICY',
-    `providers: ${Object.entries(value.policy.providers).map(([name, enabled]) => `${name}=${enabled ? 'enabled' : 'disabled'}`).join(' ')}`,
-    `review: ${value.policy.review_mode}`,
-    `affected verification: ${value.policy.affected_verification}`,
-    '',
-    'PROGRESS',
-    `requirements: ${Object.entries(counts).map(([name, count]) => `${name}=${count}`).join(' ')}`,
-    `latest accepted task: ${state.latest_accepted_task_id ?? 'none'}`,
-    `unresolved: ${state.latest_unresolved_issue == null ? 'none' : displayValue(state.latest_unresolved_issue)}`,
-    `next: ${state.pending_next_action ?? 'none'}`,
-    '',
-    'MEASUREMENT',
-    `children: ${telemetry.children}`,
-    `routes: deterministic=${telemetry.deterministic_routes} model=${telemetry.model_routes}`,
-    `automatic activations: ${displayValue(activations.total_automatic)}`,
-    `terminal-event activations: ${displayValue(activations.terminal_event)}`,
-    `human activations: ${displayValue(activations.human)}`,
-    `wait-induced activations: ${displayValue(activations.wait_induced_automatic)}`,
-    `activation evidence: ${activations.evidence}`,
-    'legacy model polling field: untrusted',
-    `measured child duration ms: ${displayValue(telemetry.measured_child_execution_duration_ms)}`,
-    `measured raw output bytes: ${displayValue(telemetry.measured_raw_output_bytes)}`,
-    `measured raw evidence bytes: ${displayValue(telemetry.measured_raw_evidence_bytes)}`,
-    `measured compact packet bytes: ${displayValue(telemetry.measured_compact_packet_bytes)}`,
-    `unmeasured completions: ${telemetry.unmeasured_completion_count}`,
-    'output tokens: unknown',
-    'cost: unknown',
-  ].join('\n');
+  return renderSupervisorStatus(value, { verbose, referenceTime });
 }
 
 async function watchStatus(root, args) {
   const intervalMs = integerOption(args, '--interval-ms', 1000, { maximum: 3_600_000 });
   const iterations = integerOption(args, '--iterations', Number.POSITIVE_INFINITY, { maximum: 1_000_000 });
-  const json = args.includes('--json');
+  const { json, verbose } = outputMode(args);
   for (let iteration = 1; iteration <= iterations; iteration += 1) {
-    if (json) print(JSON.stringify(status(root, true)));
+    if (json) print(JSON.stringify(status(root, { json: true })));
     else {
       if (iteration > 1) print('');
       print(`STATUS SNAPSHOT ${iteration}`);
-      print(status(root));
+      print(status(root, { verbose }));
     }
     if (iteration < iterations) await sleep(intervalMs);
   }
@@ -921,8 +894,9 @@ export async function main(args) {
   }
   if (!existsSync(paths(root).supervisor)) throw new Error('run opsle init first');
   if (command === 'status') {
+    const mode = outputMode(args);
     if (args.includes('--watch')) await watchStatus(root, args);
-    else print(status(root, args.includes('--json')));
+    else print(status(root, mode));
     return;
   }
   if (command === 'validate') {
@@ -1016,7 +990,11 @@ export async function main(args) {
     return;
   }
   if (command === 'models') {
-    if (subcommand === 'status') print(readJson(paths(root).policy).providers);
+    if (subcommand === 'status') {
+      const mode = outputMode(rest);
+      const policy = readJson(paths(root).policy);
+      print(mode.json ? policy.providers : renderModels(policy, mode));
+    }
     else if (['enable', 'disable'].includes(subcommand)) {
       args = ['policy', subcommand, rest[0]];
       return main(args);
@@ -1024,7 +1002,11 @@ export async function main(args) {
     return;
   }
   if (command === 'policy') {
-    if (subcommand === 'status') print(readJson(paths(root).policy));
+    if (subcommand === 'status') {
+      const mode = outputMode(rest);
+      const policy = readJson(paths(root).policy);
+      print(mode.json ? policy : renderPolicy(policy, mode));
+    }
     else if (['enable', 'disable'].includes(subcommand)) {
       recordHumanActivation(root, `policy-${subcommand}`);
       const provider = rest[0];
@@ -1075,12 +1057,13 @@ export async function main(args) {
           completion_event_id: result.completion_event.event_id,
         });
       } else {
-        print(await launchDetachedAttempt(root, task, attempt, claim, {
+        const launch = await launchDetachedAttempt(root, task, attempt, claim, {
           pauseAfterCurrent: pauseAfterCurrent ? {
             actor: 'operator-cli',
             reason: valueAfter(rest, '--reason', 'task run requested pause after current'),
           } : null,
-        }));
+        });
+        print(rest.includes('--json') ? launch : detachedLaunchNotice(launch));
       }
     } else if (subcommand === 'evaluate') {
       const taskId = rest[0];
@@ -1114,14 +1097,27 @@ export async function main(args) {
     if (subcommand === 'start') {
       print(ensureWakeDispatcher(root));
     } else if (subcommand === 'status') {
-      print(wakeQueueStatus(root));
+      const mode = outputMode(rest);
+      const wake = wakeQueueStatus(root);
+      const selected = selectWakeRecords(wake.requests);
+      wake.status_summary = {
+        current_event_id: selected.current?.event_id ?? null,
+        latest_authoritative_event_id: selected.latest?.event_id ?? null,
+        actionable_count: selected.actionable_count,
+        authoritative_count: selected.authoritative_count,
+      };
+      print(mode.json ? wake : renderWakeStatus(wake, mode));
     } else if (subcommand === 'drain') {
       print(drainWakeQueue(root));
     } else throw new Error('wake requires start, status, or drain');
     return;
   }
   if (command === 'session') {
-    print(sessionCommand(root, subcommand, rest));
+    const result = sessionCommand(root, subcommand, rest);
+    if (subcommand === 'status') {
+      const mode = outputMode(rest);
+      print(mode.json ? result : renderSession(result, mode));
+    } else print(result);
     return;
   }
   if (command === 'telemetry') {
@@ -1165,9 +1161,40 @@ export async function main(args) {
     const name = tmuxName(root);
     if (subcommand === 'session-name') print(name);
     else if (subcommand === 'is-alive') {
-      const alive = tmuxAlive(name);
-      print(alive ? 'alive' : 'not-running');
-      if (!alive) process.exitCode = 1;
+      const mode = outputMode(rest);
+      const supervisor = readJson(paths(root).supervisor);
+      const herdr = codexSessionBindingStatus(root);
+      const tmux = { session: name, alive: tmuxAlive(name) };
+      const liveness = deriveSupervisorLiveness({
+        authorityStatus: supervisor.authority_status,
+        herdr,
+        tmuxAlive: tmux.alive,
+      });
+      const { classification, authority } = liveness;
+      const result = {
+        classification,
+        authority,
+        supervisor_id: supervisor.supervisor_id,
+        supervisor_generation: supervisor.generation,
+        herdr,
+        tmux,
+        reason: liveness.reason,
+      };
+      if (mode.json) print(result);
+      else if (mode.verbose) {
+        print([
+          `Supervisor: ${classification.toUpperCase()}${authority ? ` — ${authority}` : ' — current process authority is unproven'}`,
+          renderSession(herdr, { verbose: true }),
+          `Tmux fallback: ${name} (${tmux.alive ? 'available' : 'unavailable'})`,
+          `Identity: ${supervisor.supervisor_id}`,
+          `Generation: ${supervisor.generation}`,
+        ].join('\n'));
+      } else {
+        print(classification === 'alive'
+          ? `Supervisor: ALIVE — ${authority === 'herdr' ? 'authoritative Herdr session is current' : 'tmux compatibility fallback is live'}`
+          : `Supervisor: UNKNOWN — ${herdr.reasons?.join(', ') || herdr.classification}`);
+      }
+      if (classification !== 'alive') process.exitCode = 1;
     } else if (subcommand === 'start') {
       if (tmuxAlive(name)) throw new Error(`tmux session already exists: ${name}`);
       const supervisor = readJson(paths(root).supervisor);

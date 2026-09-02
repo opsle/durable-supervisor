@@ -216,7 +216,7 @@ test('fresh recovery preserves canonical terminal state and historical next-acti
 
     const status = await runCli(root, ['status']);
     assert.equal(status.code, 0, status.stderr);
-    assert.match(status.stdout, /^next: none$/m);
+    assert.match(status.stdout, /^Next: none$/m);
     const jsonStatus = await runCli(root, ['status', '--json']);
     assert.equal(jsonStatus.code, 0, jsonStatus.stderr);
     assert.equal(JSON.parse(jsonStatus.stdout).progress.pending_next_action, null);

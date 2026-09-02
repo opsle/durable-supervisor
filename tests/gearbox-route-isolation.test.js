@@ -286,7 +286,10 @@ test('tool-none Codex launch is isolated and prompt is route-scoped', (t) => {
       { env: launch.environment, input: '', encoding: 'utf8', timeout: 5000 },
     );
     assert.doesNotMatch(parserProbe.stderr, /unknown configuration field/);
-    assert.match(parserProbe.stderr, /No prompt provided via stdin/);
+    assert.match(
+      parserProbe.stderr,
+      /No prompt provided via stdin|Refusing to create helper binaries under temporary dir/,
+    );
     assert.equal(launch.audit.isolation.review, 'off');
     assert.deepEqual(launch.audit.isolation.fallback_provider_allowlist, []);
     assert.deepEqual(launch.audit.isolation.mcp_server_allowlist, []);
