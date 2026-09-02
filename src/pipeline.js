@@ -1,7 +1,14 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { basename, join, relative, resolve } from 'node:path';
-import { id, now, readJson, sha256, writeJson } from './io.js';
+import {
+  atomicCompareAndSwapJson,
+  id,
+  now,
+  readJson,
+  sha256,
+  writeJson,
+} from './io.js';
 import {
   emit,
   gitMetadata,
@@ -258,67 +265,116 @@ export function routeTask(root, task) {
   return decision;
 }
 
+const CLAIM_INDEX_CAS_ATTEMPTS = 256;
+
+function claimIndexSnapshot(indexPath) {
+  let raw;
+  try {
+    raw = readFileSync(indexPath);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return {
+        index: { schema: 'opsle.durable-supervisor.claim-index/v1', next_fence: 1 },
+        sha256: null,
+      };
+    }
+    throw error;
+  }
+  let index;
+  try {
+    index = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`invalid durable JSON ${indexPath}: ${error.message}`);
+  }
+  if (index === null || typeof index !== 'object' || Array.isArray(index)) {
+    throw new Error(`durable JSON must be an object: ${indexPath}`);
+  }
+  if (index.schema !== 'opsle.durable-supervisor.claim-index/v1'
+      || !Number.isSafeInteger(index.next_fence)
+      || index.next_fence <= 0) {
+    throw new Error('invalid claim index');
+  }
+  return { index, sha256: sha256(raw) };
+}
+
+function exactIndexedClaim(indexed, claim) {
+  return indexed?.task_id === claim.task_id
+    && indexed?.claim_id === claim.claim_id
+    && indexed?.fence_generation === claim.fence_generation;
+}
+
 export function acquireClaim(root, task, attemptId) {
   const p = paths(root);
   const indexPath = join(p.claims, 'index.json');
-  const index = existsSync(indexPath)
-    ? readJson(indexPath)
-    : { schema: 'opsle.durable-supervisor.claim-index/v1', next_fence: 1 };
-  for (const name of Object.keys(index).filter((key) => key.startsWith('task-'))) {
-    const existing = index[name];
-    if (existing.task_id === task.task_id && existing.status === 'ACTIVE') {
-      throw new Error(`claim conflict: ${existing.claim_id}`);
-    }
-  }
   const supervisor = readJson(p.supervisor);
-  const claim = {
-    schema: 'opsle.durable-supervisor.claim/v1',
-    claim_id: id('claim'),
-    task_id: task.task_id,
-    attempt_id: attemptId,
-    owner_supervisor_id: supervisor.supervisor_id,
-    owner_generation: supervisor.generation,
-    fence_generation: index.next_fence,
-    status: 'ACTIVE',
-    acquired_at: now(),
-    heartbeat_at: now(),
-    completed_at: null,
-  };
-  index.next_fence += 1;
-  index[`task-${task.task_id}`] = claim;
-  writeJson(indexPath, index);
-  writeJson(join(p.claims, `${claim.claim_id}.json`), claim);
-  emit(root, 'CLAIM_ACQUIRED', { task_id: task.task_id, attempt_id: attemptId, claim_id: claim.claim_id, fence_generation: claim.fence_generation });
-  return claim;
+  for (let attempt = 0; attempt < CLAIM_INDEX_CAS_ATTEMPTS; attempt += 1) {
+    const snapshot = claimIndexSnapshot(indexPath);
+    for (const name of Object.keys(snapshot.index).filter((key) => key.startsWith('task-'))) {
+      const existing = snapshot.index[name];
+      if (existing.task_id === task.task_id && existing.status === 'ACTIVE') {
+        throw new Error(`claim conflict: ${existing.claim_id}`);
+      }
+    }
+    const claim = {
+      schema: 'opsle.durable-supervisor.claim/v1',
+      claim_id: id('claim'),
+      task_id: task.task_id,
+      attempt_id: attemptId,
+      owner_supervisor_id: supervisor.supervisor_id,
+      owner_generation: supervisor.generation,
+      fence_generation: snapshot.index.next_fence,
+      status: 'ACTIVE',
+      acquired_at: now(),
+      heartbeat_at: now(),
+      completed_at: null,
+    };
+    const nextIndex = {
+      ...snapshot.index,
+      next_fence: snapshot.index.next_fence + 1,
+      [`task-${task.task_id}`]: claim,
+    };
+    const swapped = atomicCompareAndSwapJson(indexPath, snapshot.sha256, nextIndex);
+    if (!swapped.swapped) continue;
+    writeJson(join(p.claims, `${claim.claim_id}.json`), claim);
+    emit(root, 'CLAIM_ACQUIRED', { task_id: task.task_id, attempt_id: attemptId, claim_id: claim.claim_id, fence_generation: claim.fence_generation });
+    return claim;
+  }
+  throw new Error('claim index contention did not resolve');
 }
 
 export function releaseClaim(root, claim, status = 'COMPLETED') {
   const p = paths(root);
   const path = join(p.claims, `${claim.claim_id}.json`);
   const current = readJson(path);
+  if (current.claim_id !== claim.claim_id || current.task_id !== claim.task_id) {
+    throw new Error('claim identity is ambiguous');
+  }
   if (current.fence_generation !== claim.fence_generation) throw new Error('stale claim fence');
   const indexPath = join(p.claims, 'index.json');
-  const index = readJson(indexPath);
   if (current.status !== 'ACTIVE') {
     if (current.status !== status) {
       throw new Error(`claim is already terminal: ${current.status}`);
     }
-    const indexed = index[`task-${claim.task_id}`];
-    if (indexed?.claim_id !== current.claim_id
-        || indexed.fence_generation !== current.fence_generation
-        || indexed.status !== current.status
-        || indexed.completed_at !== current.completed_at) {
-      index[`task-${claim.task_id}`] = current;
-      writeJson(indexPath, index);
-    }
     return current;
   }
-  current.status = status;
-  current.completed_at = now();
-  writeJson(path, current);
-  index[`task-${claim.task_id}`] = current;
-  writeJson(indexPath, index);
-  return current;
+  for (let attempt = 0; attempt < CLAIM_INDEX_CAS_ATTEMPTS; attempt += 1) {
+    const snapshot = claimIndexSnapshot(indexPath);
+    const taskKey = `task-${current.task_id}`;
+    const indexed = snapshot.index[taskKey];
+    if (!exactIndexedClaim(indexed, current)) {
+      throw new Error('claim index ownership is ambiguous or stale');
+    }
+    if (indexed.status !== 'ACTIVE') {
+      throw new Error(`claim index is already terminal: ${indexed.status}`);
+    }
+    const released = { ...current, status, completed_at: now() };
+    const nextIndex = { ...snapshot.index, [taskKey]: released };
+    const swapped = atomicCompareAndSwapJson(indexPath, snapshot.sha256, nextIndex);
+    if (!swapped.swapped) continue;
+    writeJson(path, released);
+    return released;
+  }
+  throw new Error('claim index contention did not resolve');
 }
 
 export function createAttempt(root, task, gearbox, claimFactory = acquireClaim) {
