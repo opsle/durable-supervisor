@@ -8,6 +8,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -121,6 +122,36 @@ function processAlive(pid) {
 }
 
 async function cleanupDetachedFixture(root) {
+  const workersPath = join(root, '.opsle', 'workers');
+  const workerPaths = existsSync(workersPath)
+    ? readdirSync(workersPath)
+      .filter((name) => name.endsWith('.json'))
+      .map((name) => join(workersPath, name))
+    : [];
+  for (const workerPath of workerPaths) {
+    const worker = readJson(workerPath);
+    if (worker.schema !== 'opsle.durable-supervisor.detached-runner/v1') continue;
+    await waitFor(() => {
+      const status = readJson(workerPath).status;
+      return status === 'TERMINAL' || status === 'FAILED';
+    }, `fixture Runner ${worker.attempt_id} did not reach terminal state before cleanup`);
+    if (Number.isSafeInteger(worker.worker_pid)) {
+      await waitFor(
+        () => !processAlive(worker.worker_pid),
+        `fixture Runner ${worker.attempt_id} did not exit before cleanup`,
+      );
+    }
+    const attemptPath = join(root, '.opsle', 'attempts', `${worker.attempt_id}.json`);
+    if (existsSync(attemptPath)) {
+      const childPid = readJson(attemptPath).pid;
+      if (Number.isSafeInteger(childPid)) {
+        await waitFor(
+          () => !processAlive(childPid),
+          `fixture child ${worker.attempt_id} did not exit before cleanup`,
+        );
+      }
+    }
+  }
   const dispatcherPath = join(root, '.opsle', 'wake', 'dispatcher.json');
   if (existsSync(dispatcherPath)) {
     const pid = readJson(dispatcherPath).process?.pid;
