@@ -1,0 +1,1 @@
+{"actor":"operator-cli","event_id":"event-ecdbf60f-1591-4c77-8e7c-ef04b10bc8ed","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":11,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","time":"2026-09-01T03:10:39.354Z","type":"SUPERVISOR_RESUMED"}

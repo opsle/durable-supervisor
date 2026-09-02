@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-e89bd4db-8326-4bb9-8e55-aedabee5e94d","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":15,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-complete-exact-route-schema","time":"2026-09-01T19:53:06.034Z","type":"TASK_HANDOFF_CREATED"}

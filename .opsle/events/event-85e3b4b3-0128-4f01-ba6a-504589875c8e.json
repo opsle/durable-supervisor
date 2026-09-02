@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-85e3b4b3-0128-4f01-ba6a-504589875c8e","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":1,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-self-host-documentation","time":"2026-08-31T18:50:25.414Z","type":"TASK_HANDOFF_CREATED"}

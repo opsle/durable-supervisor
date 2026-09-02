@@ -1,0 +1,100 @@
+{
+  "task_id": "task-correct-detached-races",
+  "parent_decision_id": "decision-4049ce65-6ba2-4fae-b243-60246b6ca5c6",
+  "title": "Close detached Runner recovery and tmux delivery races",
+  "objective": "Correct the rejected detached execution implementation so Runner ownership fails closed when the worker dies, tmux delivery closes the final inspection-to-submit race as far as the local tmux boundary permits, and recovery proves queued delivery plus exact-once consumption end to end.",
+  "scope": [
+    "detached Runner recovery ownership semantics",
+    "atomic or fail-closed tmux delivery commit boundary",
+    "recovery adoption, safe delivery, and exact-once event consumption tests",
+    "accurate residual limitation documentation"
+  ],
+  "authorization": {
+    "may": [
+      "inspect and modify the uncommitted detached Runner and wakeup implementation from the rejected parent task",
+      "use tmux server-side conditional command sequencing or another narrower local mechanism to minimize the final safety-check-to-submit race",
+      "distinguish a live Runner owner from a merely live orphaned child during recovery",
+      "add deterministic dependency-injected tests for exact race and recovery paths",
+      "run focused and full deterministic verification"
+    ],
+    "may_modify": [
+      "src/**",
+      "bin/**",
+      "tests/**",
+      "README.md",
+      "ARCHITECTURE.md",
+      "SPEC.md",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "directly modify .opsle authority, policy, objective, historical evidence, decisions, tasks, attempts, claims, or events",
+      "modify sibling repositories or global Codex/tmux configuration",
+      "overwrite or clear human-composed input",
+      "weaken generation, pane, process, composer, attached-client, delivery receipt, or claim fences",
+      "enable Claude or review, deploy, merge, push, install server-wide, or initialize another repository"
+    ]
+  },
+  "required_inputs": [
+    "src/runner.js",
+    "src/wakeup.js",
+    "src/host-terminal.js",
+    "src/cli.js",
+    "tests/detached-runner.test.js",
+    "tests/wakeup.test.js",
+    ".opsle/evidence/compact/task-detached-runner-host-wakeup-attempt-001.completion.json"
+  ],
+  "relevant_context": [
+    "The parent implementation and its full suite passed, but the supervisor rejected it after independent source review.",
+    "Recovery currently preserves an active claim when either attempt.pid or worker_pid is live. In detached mode only the exact live worker owns lifecycle; a live child with a dead worker is an orphan and must become UNKNOWN/intervention-required/PAUSED rather than wait indefinitely.",
+    "Current delivery performs a second inspect and then invokes literal send-keys and Enter as separate tmux processes. Replace that with the smallest server-side conditional/transactional sequence available, or fail closed and document a proven residual if tmux exposes no stronger primitive. Never clear the composer.",
+    "The final tmux decision should recheck no attached client plus stable session, pane, PID, command, and cursor immediately within the same server command sequence that submits literal input where practical. A failed predicate must report no delivery and leave the event queued without a replay hazard.",
+    "Extend tests so an alive child with a dead detached worker cannot satisfy recovery ownership, and so a client/input state change at the commit boundary produces no send.",
+    "Extend recovery coverage beyond queue adoption: a later current generation establishes safe readiness, delivers the adopted event once, consumes it once, and rejects a stale generation; duplicate recovery/drain/consume does not send again.",
+    "Keep the default detached path, explicit foreground fallback, Codex enabled, Claude disabled, review off, Gearbox required, Context Firewall required, and zero wait-induced activation semantics."
+  ],
+  "expected_deliverable": "A narrow correction with deterministic evidence that dead Runner ownership fails closed, tmux delivery has a single fail-closed final commit boundary, and recovery delivers and consumes a queued event exactly once.",
+  "expected_evidence": [
+    "orphaned live child plus dead worker becomes UNKNOWN/intervention-required and PAUSED",
+    "live exact worker preserves claim across recovery",
+    "final delivery predicate failure produces zero input and remains queued",
+    "safe final delivery submits literal prompt and Enter once",
+    "recovery adopts, delivers, and consumes a queued event once under the new generation",
+    "stale generation and duplicate paths do not resend or consume twice",
+    "focused tests and npm run verify pass"
+  ],
+  "acceptance_criteria": [
+    "only a live exact detached Runner worker constitutes lifecycle ownership during recovery",
+    "tmux final submission is guarded by an immediate server-side predicate or an equally strong fail-closed local primitive",
+    "human input is never cleared, overwritten, or submitted",
+    "unsafe final races leave durable queued/uncertain evidence and never auto-replay",
+    "recovery exact-once behavior is tested through adoption, delivery, event consumption, duplicate handling, and generation fencing",
+    "the original detached default and zero-wait properties remain intact",
+    "focused and full deterministic tests pass",
+    "Context Firewall packet is complete_for_decision",
+    "no unexpected files change"
+  ],
+  "prohibited_actions": [
+    "blind or unconditional tmux injection",
+    "accepting a child PID as a substitute for its detached Runner owner",
+    "model polling or wait-induced automatic inference",
+    "broad refactoring, history rewriting, release, deployment, merge, or global installation"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled with configured model and reasoning effort",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "requirement_ids": [],
+  "route_hint": "codex",
+  "deterministic_command": null,
+  "verification_command": [
+    "npm",
+    "run",
+    "verify"
+  ],
+  "expects_changes": true,
+  "timeout_seconds": 1800
+}

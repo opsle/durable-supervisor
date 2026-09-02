@@ -1,0 +1,87 @@
+{
+  "task_id": "task-atomic-pause-after-detached-launch",
+  "title": "Arm pause-after-current within detached launch",
+  "objective": "Reconcile pause-after-current with the detached dormancy boundary. Add an atomic detached launch option that persists pause-after-current before successful Runner ownership is returned, so the supervisor can obey END_TURN_IMMEDIATELY without issuing a second command. Preserve evaluation-before-PAUSED ordering and make detached test-fixture dispatcher cleanup deterministic.",
+  "scope": [
+    "src/cli.js task run pause-after-current option",
+    "src/runner.js detached launch result if needed",
+    "tests/detached-runner.test.js atomic pause ordering and cleanup",
+    "docs/OPERATIONS.md canonical invocation"
+  ],
+  "required_inputs": [
+    "src/cli.js",
+    "src/runner.js",
+    "tests/detached-runner.test.js",
+    "docs/OPERATIONS.md"
+  ],
+  "relevant_context": [
+    "After detached ownership, the supervisor must end its turn immediately and perform no follow-up command or check.",
+    "The legacy task run followed by pause --after-current sequence now violates that boundary.",
+    "Pause must remain pending through child completion, allow supervisor evaluation, apply PAUSED only after accept or reject, and block the next child.",
+    "An independent focused rerun exposed ENOTEMPTY while a temporary fixture dispatcher was exiting; cleanup must become deterministic without weakening production dispatch."
+  ],
+  "acceptance_criteria": [
+    "task run TASK_ID --pause-after-current atomically arms the pending pause before returning successful detached ownership",
+    "the returned launch result still requires END_TURN_IMMEDIATELY and reports the armed pause",
+    "no second pause command is required after launch",
+    "child terminal publication leaves the current task AWAITING_SUPERVISOR and the supervisor evaluable rather than prematurely PAUSED",
+    "accept or reject records the decision before PAUSE_AFTER_CURRENT_APPLIED and then reaches PAUSED with no next child",
+    "the existing non-atomic compatibility pause command remains available",
+    "temporary fixture dispatcher cleanup cannot race recursive fixture removal",
+    "focused and full verification pass",
+    "Context Firewall packet is complete_for_decision"
+  ],
+  "expected_deliverable": "Atomic detached pause arming, ordering regressions, deterministic fixture cleanup, and concise operations documentation.",
+  "expected_evidence": [
+    "source diff",
+    "atomic pause and cleanup regressions",
+    "focused and full test output",
+    "git diff --check",
+    "complete Context Firewall packet"
+  ],
+  "authorization": {
+    "may": [
+      "read repository and named files",
+      "modify task-run control flow, detached launch result, directly related tests, and operations documentation",
+      "run focused and full local verification"
+    ],
+    "may_modify": [
+      "src/cli.js",
+      "src/runner.js",
+      "tests/detached-runner.test.js",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "invoke live wake, signal live runtime, replay or rewrite historical events",
+      "change canonical wake message or argv, policy, identity, session binding, host configuration, or decision ordering",
+      "modify siblings, push, merge, deploy, install, or initialize a repository"
+    ]
+  },
+  "prohibited_actions": [
+    "supervisor polling",
+    "live wake",
+    "uncertain-event replay",
+    "terminal input",
+    "model polling",
+    "release or deployment"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "route_hint": "codex",
+  "expects_changes": true,
+  "timeout_seconds": 900,
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/detached-runner.test.js",
+    "tests/operator-controls.test.js"
+  ],
+  "requirement_ids": []
+}

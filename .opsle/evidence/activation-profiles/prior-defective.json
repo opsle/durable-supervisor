@@ -1,0 +1,163 @@
+{
+  "schema": "opsle.durable-supervisor.activation-profile/v1",
+  "task_id": "task-fix-derived-next-action-invariant",
+  "attempt_id": "task-fix-derived-next-action-invariant-attempt-001",
+  "interval": {
+    "start": "2026-08-31T20:52:24.491Z",
+    "end": "2026-08-31T21:03:34.571Z"
+  },
+  "evidence": "observable-codex-trajectory",
+  "trajectory_evidence": {
+    "path": "/home/deploy/.codex/sessions/2026/08/31/rollout-2026-08-31T20-41-48-01a0598e-8965-76f2-beef-5282cda666cc.jsonl",
+    "sha256": "522af8de2d7fd64339d945d2c29374a3fad8f4d251fbde18d83b5a62e16b99f6"
+  },
+  "measurement_basis": "model continuation after an observable tool-output boundary",
+  "counts": {
+    "total_automatic": 23,
+    "terminal_event": 0,
+    "human": 0,
+    "wait_induced_automatic": 23
+  },
+  "provider_model_turns": null,
+  "limitation": "activation counts are trajectory-derived, not provider-recorded billing turns or tokens",
+  "activations": [
+    {
+      "cause_timestamp": "2026-08-31T20:52:25.299Z",
+      "activation_timestamp": "2026-08-31T20:52:29.786Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:53:01.241Z",
+      "activation_timestamp": "2026-08-31T20:53:03.630Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:53:35.113Z",
+      "activation_timestamp": "2026-08-31T20:53:37.800Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:54:10.824Z",
+      "activation_timestamp": "2026-08-31T20:54:14.672Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:54:44.690Z",
+      "activation_timestamp": "2026-08-31T20:54:48.148Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:54:51.404Z",
+      "activation_timestamp": "2026-08-31T20:54:53.652Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:55:25.068Z",
+      "activation_timestamp": "2026-08-31T20:55:28.626Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:55:58.647Z",
+      "activation_timestamp": "2026-08-31T20:56:01.325Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:56:34.466Z",
+      "activation_timestamp": "2026-08-31T20:56:37.394Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:57:07.414Z",
+      "activation_timestamp": "2026-08-31T20:57:12.749Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:57:42.772Z",
+      "activation_timestamp": "2026-08-31T20:57:45.717Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:58:15.739Z",
+      "activation_timestamp": "2026-08-31T20:58:17.994Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:58:20.836Z",
+      "activation_timestamp": "2026-08-31T20:58:22.493Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:58:55.371Z",
+      "activation_timestamp": "2026-08-31T20:58:59.490Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T20:59:29.511Z",
+      "activation_timestamp": "2026-08-31T20:59:33.309Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T21:00:04.328Z",
+      "activation_timestamp": "2026-08-31T21:00:10.894Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T21:00:40.918Z",
+      "activation_timestamp": "2026-08-31T21:00:43.866Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T21:01:13.915Z",
+      "activation_timestamp": "2026-08-31T21:01:16.559Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T21:01:46.579Z",
+      "activation_timestamp": "2026-08-31T21:01:48.554Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T21:01:51.469Z",
+      "activation_timestamp": "2026-08-31T21:01:54.094Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T21:02:27.141Z",
+      "activation_timestamp": "2026-08-31T21:02:30.071Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T21:03:00.094Z",
+      "activation_timestamp": "2026-08-31T21:03:02.928Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    },
+    {
+      "cause_timestamp": "2026-08-31T21:03:32.951Z",
+      "activation_timestamp": "2026-08-31T21:03:36.428Z",
+      "classification": "wait-induced-automatic",
+      "automatic": true
+    }
+  ]
+}

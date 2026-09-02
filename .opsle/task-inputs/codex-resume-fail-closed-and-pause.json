@@ -1,0 +1,134 @@
+{
+  "task_id": "task-codex-resume-fail-closed-and-pause",
+  "parent_decision_id": "decision-e7babec2-1f51-490e-9a2d-978f52960cad",
+  "title": "Fail closed on unsupported session wake and fix pause ordering",
+  "objective": "Reconcile the existing detached wake work into an honest PARTIAL implementation: persist and validate an exact authoritative Codex session binding, make Codex-native session wake the preferred but capability-gated transport, prevent automatic tmux keystroke delivery in normal operation when native resume is unproven, retain and classify queued events idempotently, and apply pause-after-current only after supervisor evaluation of the current completion.",
+  "scope": [
+    "separate durable supervisor identity from frontend/host/session binding without changing the existing supervisor ID or generation",
+    "a versioned Codex session binding containing repository realpath, supervisor ID/generation, explicit Codex UUID, rollout session_meta identity/hash and file identity, installed CLI version, exact host process identity, UID, and tmux pane/session/TTY identity",
+    "deterministic CLI bind/status validation with stale process, generation, repository, rollout, duplicate-candidate, writer-topology, and metadata mismatch failure",
+    "wake transport classification that prefers Codex-native resume only when an explicitly proven supported topology is bound; current standalone embedded-writer topology must fail closed and retain the event without spawning resume or sending terminal input",
+    "remove tmux send-keys/paste-buffer from the normal automatic dispatcher path while preserving the tmux host and mechanical wait-cell code as explicit compatibility fallbacks",
+    "historical wake requests remain byte-identical; stale-generation and already-terminal/evaluated task requests are classified obsolete and never adopted or delivered",
+    "a provider-free durable activation lease schema and exact CAS/fencing/idempotency primitives sufficient to prevent two dispatcher deliveries, duplicate event ownership, and stale-generation delivery, even though live resume delivery remains disabled for the current topology",
+    "tiny wake message constructor that references only event ID and generation and never raw child output",
+    "pause-after-current ordering from running child through terminal event, supervisor evaluation, terminal task state, PAUSED state, and blocked next launch",
+    "directory-based atomic-replace-safe terminal waiting coverage so the compatibility wait does not miss an atomic file rename",
+    "focused/full tests and honest documentation of the installed 0.151.0 writer-lock limitation, operator Desktop evidence, Herdr hosting role, tmux fallback, and required controlled migration for future PASS"
+  ],
+  "authorization": {
+    "may": [
+      "modify this repository source, tests, CLI, runtime-state validation, and directly relevant documentation",
+      "add a versioned session-binding and activation-lease runtime schema plus deterministic fixtures",
+      "inspect exact installed/source/audit evidence and existing dirty work",
+      "rework or remove unaccepted Herdr/tmux automatic delivery source changes while preserving all durable historical records and raw evidence",
+      "run focused/full deterministic verification, validate, diff checks, and read-only session/process checks"
+    ],
+    "may_modify": [
+      "src/cli.js",
+      "src/state.js",
+      "src/io.js",
+      "src/runner.js",
+      "src/wakeup.js",
+      "src/host-terminal.js",
+      "src/activation-telemetry.js",
+      "src/pipeline.js",
+      "bin/opsle-wake-delivery.js",
+      "tests/wakeup.test.js",
+      "tests/recovery-policy.test.js",
+      "tests/operator-controls.test.js",
+      "tests/detached-runner.test.js",
+      "tests/host-adapter.test.js",
+      "README.md",
+      "SPEC.md",
+      "ARCHITECTURE.md",
+      "docs/OPERATIONS.md",
+      "AGENTS.md"
+    ],
+    "may_not": [
+      "invoke codex resume against any real existing session or send any terminal input",
+      "migrate the persistent TUI to a shared app-server, use codex queue as a substitute transport, close or replace the authoritative tmux TUI, or change host authority",
+      "rewrite/delete historical tasks, attempts, claims, decisions, events, wake requests, receipts, raw evidence, objectives, or supervisor generations",
+      "claim native wake PASS, draft safety on the authoritative TUI, live automatic delivery, or shared-app-server behavior not proven by this task",
+      "enable Claude or review, invoke Graphify, modify sibling repositories, initialize another repository, deploy, merge, push, install server-wide, upgrade Codex, or modify Herdr runtime state"
+    ]
+  },
+  "required_inputs": [
+    ".opsle/specification.md",
+    ".opsle/objective.json",
+    ".opsle/policy.json",
+    ".opsle/supervisor.json",
+    ".opsle/state.json",
+    ".opsle/evidence/compact/task-codex-resume-reality-audit-attempt-001.json",
+    ".opsle/evidence/compact/task-correct-detached-terminal-reconciliation-attempt-001.json",
+    "src/cli.js",
+    "src/state.js",
+    "src/runner.js",
+    "src/wakeup.js",
+    "src/host-terminal.js",
+    "tests/wakeup.test.js",
+    "tests/operator-controls.test.js",
+    "tests/recovery-policy.test.js"
+  ],
+  "relevant_context": [
+    "Installed Codex is 0.151.0. Exact source proves a standalone resume launches another embedded app-server and loses the thread writer lock while the persistent standalone TUI is open.",
+    "The operator Desktop experiment remains positive evidence for a shared app-server condition, not proof for the current standalone tmux topology.",
+    "The authoritative persistent TUI session is 01a05952-e1fa-71e2-adea-df7e3f7d99ce; do not prompt it. Current generation is 12 and the durable supervisor ID is unchanged.",
+    "Three receipt-free historical wake requests target stale generation 9. Receipt-free events for already evaluated tasks must become inert without request mutation. Current/new completion events must remain durably queued when no supported native transport exists.",
+    "Current pause-after-current applies PAUSED at child completion, leaving AWAITING_SUPERVISOR. Required ordering is completion, evaluation, terminal task decision, then PAUSED.",
+    "The previous wait-cell observation watched an atomically replaced file inode and missed completion; directory observation plus immediate post-registration state check closes that compatibility race.",
+    "Existing source changes include accepted detached Runner reconciliation work and rejected/unaccepted tmux/Herdr adapter work. Preserve history but leave the source in one coherent tested fail-closed state.",
+    "PR #1 remains open at old head ad5c50f0b819ce8cf22e73f6eec8cb71a572ba91 and must not be merged by the child."
+  ],
+  "expected_deliverable": "A tested repository implementation that safely records and validates the current session identity, attempts no unsupported resume or automatic terminal input, retains/reconciles wake events and races exactly once, evaluates before pause, preserves fallbacks and historical bytes, and documents why the objective verdict remains PARTIAL pending controlled shared-app-server migration.",
+  "expected_evidence": [
+    "session binding schema/CLI tests for exact bind, status, generation adoption or staleness, wrong repository, wrong session_meta hash, missing/replaced rollout, dead/reused process, duplicate candidates, wrong tmux topology, and unsupported standalone writer",
+    "current authoritative session can be bound explicitly without changing its process or sending input; source task may provide the command but must not run it",
+    "normal dispatcher attempts no tmux paste/send and no codex resume when binding topology is unsupported; event remains receipt-free queued",
+    "activation lease tests for one owner, duplicate event, simultaneous events, expiry/takeover, generation advance, stale dispatcher, crash/recovery, and exactly-once decision boundary",
+    "message format test proves only event ID/generation and durable-state instruction are transmitted",
+    "historical wake request hashes unchanged and terminal/evaluated/stale requests are inert without request rewrite",
+    "pause-after-current live-equivalent integration test proves completion remains evaluable, task reaches ACCEPTED or REJECTED, PAUSED applies afterward, and no next child launches",
+    "directory watcher test proves atomic rename cannot be missed and uses no model polling",
+    "focused tests, full npm test, npm run check, git diff --check, and opsle validate all pass",
+    "Context Firewall packet complete_for_decision with no unexpected changed artifacts"
+  ],
+  "acceptance_criteria": [
+    "no automatic terminal keystroke injection remains in the normal wake path",
+    "unsupported current Codex topology fails closed and retains events without provider/model activation",
+    "exact session binding and stale detection are deterministic and durable",
+    "activation ownership is generation-fenced and idempotent",
+    "pause-after-current applies only after supervisor evaluation and terminal task decision",
+    "tmux host, Herdr host candidate, queued recovery, and mechanical wait-cell remain honest fallbacks",
+    "all historical evidence and wake-request bytes are preserved",
+    "focused/full verification passes and packet is complete_for_decision"
+  ],
+  "prohibited_actions": [
+    "live session resume, terminal input, host migration, or fabricated PASS",
+    "history rewrite, provider-policy change, Graphify, Claude, merge, deploy, push, installation, or sibling changes"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled with configured model and reasoning effort",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "Affected Verification advisory only",
+    "model polling prohibited"
+  ],
+  "requirement_ids": [],
+  "route_hint": "codex",
+  "deterministic_command": null,
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/wakeup.test.js",
+    "tests/operator-controls.test.js",
+    "tests/recovery-policy.test.js",
+    "tests/detached-runner.test.js",
+    "tests/host-adapter.test.js"
+  ],
+  "expects_changes": true,
+  "timeout_seconds": 3600
+}

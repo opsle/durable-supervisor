@@ -1,0 +1,150 @@
+{
+  "task_id": "task-self-host-documentation",
+  "title": "Document the operational V0.1 honestly",
+  "objective": "Replace theory-only documentation with accurate public operator, architecture, recovery, evidence, and self-hosting documentation grounded in the implemented code and accepted compact proof artifacts.",
+  "scope": [
+    "public README and architecture/specification explanation",
+    "mobile-safe operator runbook",
+    "bounded V0.1 self-hosting proof report",
+    "release changelog"
+  ],
+  "authorization": {
+    "may": [
+      "inspect repository source and tests",
+      "read compact .opsle evidence and accepted task records",
+      "modify the named project documentation",
+      "run deterministic local verification"
+    ],
+    "may_modify": [
+      "README.md",
+      "ARCHITECTURE.md",
+      "SPEC.md",
+      "CHANGELOG.md",
+      "docs/**"
+    ],
+    "may_not": [
+      "modify source code, tests, AGENTS.md, package.json, or .opsle authority/evidence",
+      "read or quote raw child transcripts",
+      "modify sibling repositories",
+      "invoke Claude or an independent reviewer",
+      "claim token, cost, correctness, or production-readiness savings not proven by evidence",
+      "deploy, merge, push, or create a PR"
+    ]
+  },
+  "required_inputs": [
+    "README.md",
+    "ARCHITECTURE.md",
+    "SPEC.md",
+    "AGENTS.md",
+    "src/cli.js",
+    "src/state.js",
+    "src/pipeline.js",
+    "src/runner.js",
+    "tests/bootstrap.test.js",
+    "tests/recovery-policy.test.js",
+    "tests/operator-controls.test.js",
+    ".opsle/evidence/compact/task-self-host-recovery-policy-tests-attempt-001.json",
+    ".opsle/evidence/compact/task-self-host-recovery-policy-tests-attempt-001.completion.json",
+    ".opsle/evidence/compact/task-self-host-operator-controls-attempt-001.json",
+    ".opsle/evidence/compact/task-self-host-operator-controls-attempt-001.completion.json"
+  ],
+  "relevant_context": [
+    ".opsle/specification.md DS-002, DS-003, DS-006, DS-007, DS-010 through DS-030, DS-033, DS-039 through DS-045, DS-057, DS-068 through DS-072, DS-086 through DS-099",
+    "tmux is convenience; .opsle is authority",
+    "Gearbox, Context Firewall, handoff, ledger, claims, acceptance, and telemetry boundaries must be described without pretending every sibling prototype is imported",
+    "Affected Verification is advisory only and did not authorize test reduction",
+    "Claude remained disabled and review remained off",
+    "Every operator command block must be mobile-safe and short"
+  ],
+  "expected_deliverable": "Clear, accurate public documentation and a concise evidence-linked V0.1 proof report.",
+  "expected_evidence": [
+    "README explains persistent does not mean continuous inference",
+    "README explains disposable context, Runner waiting, Gearbox outbound control, Context Firewall inbound reduction, bounded authorization/handoffs, claims, Acceptance, and human controls",
+    "operations runbook documents init/status/watch/pause/resume/policy/objective/tmux/recovery/evidence commands using short invocations",
+    "recovery procedure does not require pasted conversation summaries",
+    "proof report names cutover and meaningful child task IDs and cites compact evidence paths and measured byte reductions",
+    "integration/deferred boundaries are explicit and non-overclaiming",
+    "npm test exits 0",
+    "actual changed files remain within authorization"
+  ],
+  "acceptance_criteria": [
+    "documentation accurately matches checked-in CLI and code behavior",
+    "all required architectural boundaries are explained",
+    "operator commands are practical and mobile-safe",
+    "self-hosting and no-model-polling evidence is cited precisely",
+    "no unsupported savings or production claims appear",
+    "no unexpected files change",
+    "npm test exits 0",
+    "Context Firewall packet is complete_for_decision"
+  ],
+  "prohibited_actions": [
+    "raw transcript ingestion",
+    "claiming imported sibling implementations when only an adapter exists",
+    "claiming literal Codex UI /clear automation instead of underlying reconstruction",
+    "claiming production readiness",
+    "long fragile operator command lines"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "Affected Verification advisory only",
+    "model polling prohibited"
+  ],
+  "requirement_ids": [
+    "DS-002",
+    "DS-003",
+    "DS-006",
+    "DS-007",
+    "DS-010",
+    "DS-011",
+    "DS-012",
+    "DS-013",
+    "DS-015",
+    "DS-016",
+    "DS-017",
+    "DS-018",
+    "DS-020",
+    "DS-021",
+    "DS-025",
+    "DS-026",
+    "DS-027",
+    "DS-028",
+    "DS-029",
+    "DS-030",
+    "DS-033",
+    "DS-039",
+    "DS-040",
+    "DS-041",
+    "DS-042",
+    "DS-043",
+    "DS-044",
+    "DS-045",
+    "DS-046",
+    "DS-047",
+    "DS-057",
+    "DS-068",
+    "DS-069",
+    "DS-070",
+    "DS-071",
+    "DS-072",
+    "DS-086",
+    "DS-087",
+    "DS-088",
+    "DS-089",
+    "DS-093",
+    "DS-094",
+    "DS-095",
+    "DS-096",
+    "DS-098",
+    "DS-099"
+  ],
+  "route_hint": "codex",
+  "deterministic_command": null,
+  "verification_command": [
+    "npm",
+    "test"
+  ],
+  "expects_changes": true,
+  "timeout_seconds": 1800
+}

@@ -1,0 +1,78 @@
+{
+  "task_id": "task-live-no-unselected-capabilities-proof-v2",
+  "title": "Live corrected no-unselected-capabilities proof",
+  "objective": "Inspect the exact no-tool route and one narrow source fact using direct repository commands, then report the actually visible instruction and callable-tool envelope without changing files.",
+  "scope": [
+    "src/runner.js Codex launch arguments",
+    "src/pipeline.js exact Codex route",
+    "the child model-visible capability envelope",
+    "the child callable tool envelope"
+  ],
+  "authorization": {
+    "may": [
+      "read src/runner.js and src/pipeline.js using only direct shell, rg, and sed inspection",
+      "read the route-scoped handoff supplied to this child",
+      "report whether any skill catalog or optional callable route is present"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "modify any file",
+      "load or invoke Graphify or any other skill",
+      "invoke web, MCP, plugins, subagents, review, another provider, or fallback",
+      "inspect global user configuration or global capability directories",
+      "push, merge, deploy, install, or send terminal input"
+    ]
+  },
+  "required_inputs": [
+    "src/runner.js",
+    "src/pipeline.js"
+  ],
+  "relevant_context": [
+    "Use direct repository inspection only.",
+    "Distinguish platform-managed prose from callable tools and report both separately.",
+    "State whether an unrelated skill catalog, Graphify-specific instructions, MCP/plugin tools, web tools, subagent tools, or reviewer route are model-visible or callable.",
+    "Keep the final report under 250 words."
+  ],
+  "expected_deliverable": "A compact no-change report of the exact selected route, direct source fact, model-visible instructions, and callable tool envelope.",
+  "expected_evidence": [
+    "actual isolated child stdout transcript",
+    "actual isolated launch contract",
+    "no changed files",
+    "complete Context Firewall packet",
+    "terminal wake event"
+  ],
+  "acceptance_criteria": [
+    "Gearbox selects provider Codex, configured model and effort, bounded implementation, and selected_tool none despite route_hint graphify",
+    "skill allowlist, MCP server allowlist, plugin allowlist, and fallback allowlist are empty",
+    "web, subagents, review, and fallback are disabled",
+    "no unrelated skill catalog or Graphify-specific instructions are model-visible",
+    "no MCP, plugin, web, subagent, or reviewer tool is callable",
+    "only direct repository inspection commands are invoked",
+    "no files change",
+    "Context Firewall is complete_for_decision"
+  ],
+  "prohibited_actions": [
+    "file modification",
+    "optional capability invocation",
+    "provider fallback",
+    "review",
+    "terminal input"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "tool none",
+    "no selected skills",
+    "web disabled",
+    "MCP disabled",
+    "plugins disabled",
+    "subagents disabled",
+    "fallback disabled"
+  ],
+  "requirement_ids": [],
+  "route_hint": "graphify",
+  "verification_command": null,
+  "timeout_seconds": 600,
+  "expects_changes": false
+}

@@ -1,0 +1,95 @@
+{
+  "task_id": "task-live-wakeup-invariant-audit",
+  "parent_decision_id": "decision-054bdae2-436d-407f-8055-af2e4cd828c5",
+  "title": "Audit corrected wakeup invariant through the real Runner",
+  "objective": "Perform a bounded read-only evidence audit of the corrected wait registration, host-terminal adapter, wake event classes, activation telemetry, and regression coverage through the real Codex Runner path, without changing repository files or extending runtime artificially.",
+  "scope": [
+    "src/wakeup.js",
+    "src/host-terminal.js",
+    "src/activation-telemetry.js",
+    "src/runner.js",
+    "tests/wakeup.test.js",
+    "tests/bootstrap.test.js",
+    "tests/operator-controls.test.js",
+    "tests/recovery-policy.test.js",
+    "exact current git diff and durable operator policy"
+  ],
+  "authorization": {
+    "may": [
+      "inspect the named source, tests, documentation, diff, policy, and prior compact evidence",
+      "run focused deterministic wakeup and Runner tests",
+      "run git diff --check and read-only status commands",
+      "report whether each event class and fail-closed path is actually evidenced"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "modify any repository, runtime authority, evidence, source, test, documentation, or sibling file",
+      "sleep or perform unrelated work merely to extend runtime",
+      "invoke Claude or another provider, launch nested agents, enable review, deploy, merge, push, create a PR, or install server-wide",
+      "claim provider-measured turns, tokens, or cost without provider evidence"
+    ]
+  },
+  "required_inputs": [
+    "src/wakeup.js",
+    "src/host-terminal.js",
+    "src/activation-telemetry.js",
+    "src/runner.js",
+    "tests/wakeup.test.js",
+    "tests/bootstrap.test.js",
+    "tests/operator-controls.test.js",
+    "tests/recovery-policy.test.js",
+    ".opsle/evidence/compact/task-eliminate-wait-induced-model-reactivation-attempt-001.json"
+  ],
+  "relevant_context": [
+    "The previous implementation child was accepted after independent focused and full 22/22 verification.",
+    "This task exists to exercise the corrected Runner and wake registration in a real post-correction Codex child interval.",
+    "The host will consume all nonterminal terminal-session returns inside one deterministic wait cell and will not run status or reason between launch and terminal completion.",
+    "A healthy heartbeat and wrapper yield are ineligible automatic wake events; explicit human interaction remains allowed and separate; a durable terminal/intervention event may wake automatic supervision.",
+    "The audit must be meaningful but read-only; do not pad runtime."
+  ],
+  "expected_deliverable": "A concise read-only audit reporting exact source/test evidence for registered-before-dormant ordering, ineligible nonterminal wakes, terminal and human classes, timeout/intervention behavior, activation telemetry truthfulness, and any residual limitation.",
+  "expected_evidence": [
+    "focused wakeup/Runner tests exit 0",
+    "git diff --check exits 0",
+    "zero actual changed artifacts",
+    "wait registration precedes Runner launch",
+    "heartbeat/yield/timeout-return cannot set READY",
+    "terminal event sets READY idempotently",
+    "human interaction remains nonautomatic and distinct",
+    "legacy polling zero is untrusted and missing trajectory counts remain unknown"
+  ],
+  "acceptance_criteria": [
+    "the real Runner launches this Codex child under the corrected code",
+    "the audit is substantive and does not use artificial delay",
+    "the child makes no repository changes",
+    "focused deterministic checks pass",
+    "the completion packet is complete_for_decision",
+    "the child reports any residual host-binding limitation honestly"
+  ],
+  "prohibited_actions": [
+    "any file modification",
+    "artificial delay",
+    "provider polling",
+    "nested provider or agent launch",
+    "release, merge, deployment, server-wide installation, or cross-repository initialization"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled with configured model and reasoning effort",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling and wait-induced automatic reasoning prohibited",
+    "Affected Verification advisory only"
+  ],
+  "requirement_ids": [],
+  "route_hint": "codex",
+  "deterministic_command": null,
+  "verification_command": [
+    "node",
+    "--test",
+    "tests/wakeup.test.js"
+  ],
+  "expects_changes": false,
+  "timeout_seconds": 600
+}

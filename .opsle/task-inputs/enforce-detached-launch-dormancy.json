@@ -1,0 +1,84 @@
+{
+  "task_id": "task-enforce-detached-launch-dormancy",
+  "title": "Enforce detached-launch supervisor dormancy",
+  "objective": "Make successful detached Runner ownership an explicit durable supervisor dormancy boundary. Once task run confirms Runner ownership, its result must direct the supervisor to end the current turn immediately. Runner alone owns child, status, heartbeat, and watch monitoring. No automatic supervisor check or turn is permitted before an eligible terminal or intervention event enters the durable wake queue and is delivered by the canonical plain codex resume path.",
+  "scope": [
+    "src/runner.js detached ownership result and durable wait contract",
+    "tests/detached-runner.test.js dormancy and eligible-reactivation regressions",
+    "docs/OPERATIONS.md operator and supervisor contract"
+  ],
+  "required_inputs": [
+    "src/runner.js",
+    "src/cli.js",
+    "tests/detached-runner.test.js",
+    "docs/OPERATIONS.md"
+  ],
+  "relevant_context": [
+    "Detached Runner already owns the OS child lifecycle and emits terminal or intervention events.",
+    "The initiating supervisor must not use status, heartbeat, child-file, filesystem-watch, timeout, or wait checks after successful detached ownership.",
+    "DORMANT is a real turn boundary, not an instruction to remain active while checking durable state.",
+    "Manual operator actions remain distinct; the next automatic activation must be an eligible durable terminal or intervention wake delivered through plain codex resume.",
+    "Live proof will be performed by a subsequent detached audit launch followed by an immediate supervisor turn end."
+  ],
+  "acceptance_criteria": [
+    "successful detached launch returns an explicit END_TURN_IMMEDIATELY action and Runner-only monitoring ownership",
+    "the durable attempt or wait contract records that automatic supervisor child, status, heartbeat, and watch checks are prohibited",
+    "eligible next automatic activation is limited to terminal or intervention durable events through the wake queue",
+    "a deterministic regression proves the launcher returns promptly, state is DORMANT, Runner owns monitoring, nonterminal progress does not activate the supervisor, and terminal publication queues exactly one wake",
+    "foreground-wait behavior remains explicit and unchanged",
+    "focused and full verification pass",
+    "Context Firewall packet is complete_for_decision"
+  ],
+  "expected_deliverable": "A minimal durable detached-dormancy contract with deterministic regressions and operations documentation.",
+  "expected_evidence": [
+    "source diff",
+    "detached dormancy tests",
+    "focused and full test output",
+    "git diff --check",
+    "complete Context Firewall packet"
+  ],
+  "authorization": {
+    "may": [
+      "read repository and named files",
+      "modify Runner detached-launch contract, directly related tests, and operations documentation",
+      "run focused and full local verification"
+    ],
+    "may_modify": [
+      "src/runner.js",
+      "src/cli.js",
+      "tests/detached-runner.test.js",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "invoke live wake, signal live runtime, replay or rewrite historical events",
+      "change canonical message or argv, policy, identity, session binding, pause ordering, or host configuration",
+      "modify siblings, push, merge, deploy, install, or initialize a repository"
+    ]
+  },
+  "prohibited_actions": [
+    "supervisor polling",
+    "live wake",
+    "uncertain-event replay",
+    "terminal input",
+    "model polling",
+    "release or deployment"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "route_hint": "codex",
+  "expects_changes": true,
+  "timeout_seconds": 900,
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/detached-runner.test.js"
+  ],
+  "requirement_ids": []
+}

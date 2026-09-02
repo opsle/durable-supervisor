@@ -1,0 +1,96 @@
+{
+  "task_id": "task-final-canonical-resume-audit",
+  "title": "Audit canonical Herdr plain-resume supervision",
+  "objective": "Perform one final read-only, evidence-driven audit of the complete canonical Herdr plus plain codex resume supervisor implementation at the current worktree. Verify authority, session binding, exact wake delivery and cleanup, post-transport and lease fences, exactly-once behavior, busy and human-draft safety boundaries, detached dormancy, automatic terminal wake, pause-after-current ordering, recovery readiness, policy preservation, and all focused/full tests. Report any defect without modifying files.",
+  "scope": [
+    "current repository source, tests, documentation, and git diff",
+    "current .opsle authoritative state, binding, wake requests, decisions, receipts, and compact packets",
+    "bound authoritative Codex rollout records needed for exact delivery and dormancy evidence",
+    "read-only process and tmux authority facts"
+  ],
+  "required_inputs": [
+    ".opsle/supervisor.json",
+    ".opsle/state.json",
+    ".opsle/policy.json",
+    ".opsle/wake/codex-session-binding.json",
+    "src/codex-resume-transport.js",
+    "src/wakeup.js",
+    "src/runner.js",
+    "src/cli.js",
+    "tests/wakeup.test.js",
+    "tests/detached-runner.test.js",
+    "tests/operator-controls.test.js"
+  ],
+  "relevant_context": [
+    "The canonical transport must remain exact plain codex resume SESSION_ID MESSAGE, never codex exec resume or input injection.",
+    "Positive confirmation requires the unique exact wake message plus matching turn-began record in the bound rollout.",
+    "Temporary launcher and frontend groups must be empty while the original Herdr process continues.",
+    "The activation lease is 180 seconds, decision fences validate expiry, and any post-spawn uncertainty is non-replayable.",
+    "Detached ownership requires END_TURN_IMMEDIATELY and RUNNER_ONLY monitoring; the bound rollout must show no intervening supervisor turn/check before terminal wake.",
+    "The final launch uses atomic pause-after-current; completion must remain AWAITING_SUPERVISOR until this audit is accepted or rejected, and only then reach PAUSED.",
+    "Historical uncertain events remain immutable and must not be replayed."
+  ],
+  "acceptance_criteria": [
+    "exactly one authoritative supervisor exists on Herdr and the old tmux authority is absent",
+    "the session binding is valid for repository, supervisor identity, generation, Herdr process, session UUID, and bound rollout",
+    "the canonical message and argv are exact and contain no raw child output",
+    "delivery confirmation, temporary frontend cleanup, Herdr continuity, generation/event fencing, stale-dispatcher rejection, expiry fencing, uncertainty handling, and duplicate suppression are deterministic",
+    "live receipts prove automatic plain-resume delivery and zero duplicate frontend",
+    "detached live rollout evidence proves prompt idle with zero intervening supervisor checks or turns until terminal wake",
+    "busy behavior retries only after deterministic bound-rollout state change and never model-polls",
+    "transport never calls tmux input or Herdr input and therefore never mutates a human draft",
+    "pause-after-current is armed atomically, leaves completion AWAITING_SUPERVISOR, records evaluation first, then applies PAUSED and blocks the next child",
+    "Codex enabled, Claude disabled, review off, Gearbox required, Context Firewall required, and model polling prohibited remain unchanged",
+    "focused and full verification pass",
+    "Context Firewall packet is complete_for_decision with no unresolved defect"
+  ],
+  "expected_deliverable": "A compact PASS or FAIL audit identifying exact durable evidence and any residual limitation, with no repository modifications.",
+  "expected_evidence": [
+    "source and test inspection",
+    "authority and session-binding facts",
+    "representative delivered, uncertain, duplicate, busy, dormancy, and pause-order evidence",
+    "focused and full test output",
+    "git diff --check",
+    "complete Context Firewall packet"
+  ],
+  "authorization": {
+    "may": [
+      "read repository, .opsle durable state, the bound rollout, and exact process/tmux facts",
+      "run read-only focused and full local verification",
+      "report findings"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "modify any file",
+      "consume or replay events, evaluate tasks, signal runtime, invoke live wake, or send terminal input",
+      "change policy, identity, binding, objective, pause, generation, host configuration, or git state",
+      "modify siblings, push, merge, deploy, install, or initialize a repository"
+    ]
+  },
+  "prohibited_actions": [
+    "file modification",
+    "supervisor polling",
+    "live wake",
+    "event consumption or replay",
+    "terminal input",
+    "model polling",
+    "release or deployment"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "route_hint": "codex",
+  "expects_changes": false,
+  "timeout_seconds": 1200,
+  "verification_command": [
+    "npm",
+    "run",
+    "verify"
+  ],
+  "requirement_ids": []
+}

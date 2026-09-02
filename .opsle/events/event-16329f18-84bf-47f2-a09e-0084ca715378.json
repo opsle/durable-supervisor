@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-16329f18-84bf-47f2-a09e-0084ca715378","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":1,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-self-host-recovery-policy-tests","time":"2026-08-31T18:17:48.499Z","type":"TASK_HANDOFF_CREATED"}

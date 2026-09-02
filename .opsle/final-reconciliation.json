@@ -1,0 +1,50 @@
+{
+  "schema": "opsle.durable-supervisor.final-reconciliation/v1",
+  "created_at": "2026-08-31T19:13:00Z",
+  "supervisor_id": "supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe",
+  "supervisor_generation": 2,
+  "specification": ".opsle/specification.md",
+  "requirement_count": 101,
+  "verified_evidence": [
+    ".opsle/specification.md",
+    ".opsle/evidence/repository-audit.json",
+    ".opsle/evidence/compact/task-final-full-verify-attempt-001.json",
+    ".opsle/evidence/compact/task-self-host-recovery-policy-tests-attempt-001.json",
+    ".opsle/evidence/compact/task-self-host-operator-controls-attempt-001.json",
+    ".opsle/evidence/compact/task-self-host-documentation-attempt-001.json",
+    ".opsle/evidence/compact/task-correct-context-packet-measurement-attempt-001.json",
+    ".opsle/evidence/compact/task-final-reconcile-requirements-attempt-002.json",
+    ".opsle/evidence/compact/task-final-reconcile-requirements-attempt-001.failure.json",
+    ".opsle/evidence/compact/task-bind-tmux-supervisor-model-attempt-001.json",
+    ".opsle/events/event-9fca1322-bbe0-464f-8043-2324a10c775e.json",
+    "tests/bootstrap.test.js",
+    "tests/recovery-policy.test.js",
+    "tests/operator-controls.test.js",
+    "docs/SELF_HOSTING_PROOF.md",
+    "docs/OPERATIONS.md",
+    "ARCHITECTURE.md",
+    "SPEC.md"
+  ],
+  "deferred": [
+    {
+      "id": "DS-046",
+      "justification": "The specification explicitly defers scheduling. V0.1 uses event-driven child completion; no time-based scheduler is necessary for the proven vertical slice."
+    },
+    {
+      "id": "DS-047",
+      "justification": "The specification explicitly defers ephemeral isolated workers. V0.1 uses the replaceable local Runner boundary and ordinary OS processes."
+    }
+  ],
+  "not_applicable": [
+    {
+      "id": "DS-092",
+      "justification": "Bootstrap cutover succeeded and is durably evidenced, so the conditional cutover-failure reporting path was not triggered."
+    }
+  ],
+  "expected_counts": {
+    "VERIFIED": 98,
+    "DEFERRED_WITH_JUSTIFICATION": 2,
+    "NOT_APPLICABLE_WITH_JUSTIFICATION": 1,
+    "unaccounted": 0
+  }
+}

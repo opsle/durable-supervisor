@@ -1,0 +1,75 @@
+{
+  "task_id": "task-codex-resume-final-live-pause-proof",
+  "parent_decision_id": "decision-10055370-67a7-41e6-9a2b-b5b924b02586",
+  "title": "Run final full verification under pause-after-current",
+  "objective": "Execute the complete deterministic verification suite as a detached child, then prove that pause-after-current leaves the completion available for supervisor evaluation and applies PAUSED only after the task reaches a terminal decision.",
+  "scope": [
+    "complete deterministic repository verification",
+    "detached Runner completion event and compact Context Firewall packet",
+    "live pause-after-current evaluation ordering",
+    "no provider or wake transport invocation"
+  ],
+  "authorization": {
+    "may": [
+      "read this repository",
+      "execute npm run verify",
+      "produce normal repository-local Runner evidence"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "modify source or policy",
+      "invoke any AI provider",
+      "invoke codex resume or terminal input",
+      "modify sibling repositories",
+      "push, merge, deploy, install, or initialize a repository"
+    ]
+  },
+  "required_inputs": [
+    "package.json",
+    "src/**",
+    "tests/**",
+    ".opsle durable state"
+  ],
+  "relevant_context": [
+    "The installed standalone Codex writer topology is bound but unsupported for native resume while the persistent TUI remains open.",
+    "This task is the live ordering proof for pause-after-current and must not attempt wake delivery."
+  ],
+  "expected_deliverable": "A source-bound full verification receipt and compact packet ready for supervisor evaluation.",
+  "expected_evidence": [
+    "detached Runner identity and terminal event",
+    "npm run verify exit 0",
+    "all tests pass",
+    "no unexpected changed files",
+    "complete_for_decision Context Firewall packet"
+  ],
+  "acceptance_criteria": [
+    "detached child exits 0",
+    "complete verification passes",
+    "completion remains evaluable before PAUSED applies",
+    "task is terminally accepted before supervisor becomes PAUSED",
+    "no provider or automatic wake activation occurs"
+  ],
+  "prohibited_actions": [
+    "provider invocation",
+    "repository mutation outside normal durable task evidence",
+    "native resume, terminal keystrokes, host migration, push, merge, deploy, or install"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled but unused",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "requirement_ids": [],
+  "route_hint": "deterministic",
+  "deterministic_command": [
+    "npm",
+    "run",
+    "verify"
+  ],
+  "verification_command": null,
+  "expects_changes": false,
+  "timeout_seconds": 300
+}

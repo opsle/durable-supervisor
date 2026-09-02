@@ -1,0 +1,89 @@
+{
+  "task_id": "task-complete-exact-route-schema",
+  "title": "Complete exact route schema and auth isolation",
+  "objective": "Make the no-tool choice explicit in every exact route and replace isolated Codex authentication copying with a crash-safe link while preserving the existing fail-closed launch contract.",
+  "scope": [
+    "exact-child-route selected_tool field",
+    "route and durable-state validation",
+    "isolated CODEX_HOME authentication link lifecycle",
+    "focused deterministic tests and concise documentation"
+  ],
+  "authorization": {
+    "may": [
+      "inspect the named repository files with direct source and rg commands",
+      "modify the named route, Runner, validation, test, and documentation files",
+      "run the focused route-isolation test"
+    ],
+    "may_modify": [
+      "src/pipeline.js",
+      "src/runner.js",
+      "src/state.js",
+      "tests/gearbox-route-isolation.test.js",
+      "ARCHITECTURE.md",
+      "SPEC.md",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "modify global configuration, global skills, plugins, Herdr, wake transport, siblings, or .opsle authority",
+      "invoke another provider, review route, web, MCP, plugin, subagent, or fallback",
+      "push, merge, deploy, or install"
+    ]
+  },
+  "required_inputs": [
+    "src/pipeline.js",
+    "src/runner.js",
+    "src/state.js",
+    "tests/gearbox-route-isolation.test.js"
+  ],
+  "relevant_context": [
+    "A no-optional-capability Codex route currently uses empty tool_allowlist and skill_allowlist arrays.",
+    "The target schema must additionally record selected_tool as the literal none.",
+    "The isolated per-attempt home must contain no credential bytes if Runner is killed before cleanup; a link to the existing auth file is acceptable.",
+    "Do not broaden selected capabilities or change route selection, wake, provider, review, or fallback behavior."
+  ],
+  "expected_deliverable": "An explicit selected_tool field plus crash-safe isolated authentication linking, with fail-closed validation and focused tests.",
+  "expected_evidence": [
+    "source diff",
+    "focused test output",
+    "route snapshot assertions",
+    "symlink target and no-copied-secret assertion",
+    "complete Context Firewall packet"
+  ],
+  "acceptance_criteria": [
+    "Codex exact routes record selected_tool as none",
+    "deterministic exact routes record selected_tool consistently with the authorized command tool",
+    "policy snapshots preserve selected_tool exactly",
+    "Codex launch rejects a missing or non-none selected_tool for the no-tool execution class",
+    "isolated CODEX_HOME contains only an auth.json symbolic link and no copied authentication bytes",
+    "focused route-isolation tests pass",
+    "no unexpected files change"
+  ],
+  "prohibited_actions": [
+    "external capabilities",
+    "provider fallback",
+    "review",
+    "wake changes",
+    "global changes"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled",
+    "Claude disabled",
+    "review off",
+    "tool none",
+    "web disabled",
+    "MCP disabled",
+    "plugins disabled",
+    "subagents disabled",
+    "fallback disabled"
+  ],
+  "requirement_ids": [],
+  "route_hint": "global-capability",
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/gearbox-route-isolation.test.js"
+  ],
+  "timeout_seconds": 900,
+  "expects_changes": true
+}

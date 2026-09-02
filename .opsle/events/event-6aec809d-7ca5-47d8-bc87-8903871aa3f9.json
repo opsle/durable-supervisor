@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-6aec809d-7ca5-47d8-bc87-8903871aa3f9","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":15,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-live-direct-inspection-proof","time":"2026-09-01T19:58:58.159Z","type":"TASK_HANDOFF_CREATED"}

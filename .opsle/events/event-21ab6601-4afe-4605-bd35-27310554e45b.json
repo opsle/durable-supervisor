@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-21ab6601-4afe-4605-bd35-27310554e45b","reconciliation":{"action":"none","classification":"no_active_work"},"schema":"opsle.durable-supervisor.event/v1","supervisor_generation":14,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","time":"2026-09-01T18:42:23.511Z","type":"SUPERVISOR_RECOVERED"}

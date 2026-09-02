@@ -1,0 +1,20 @@
+{
+  "name": "@opsle/durable-supervisor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "opsle": "./bin/opsle.js"
+  },
+  "scripts": {
+    "check": "node --check src/*.js && node --check bin/*.js && node --check tools/*.mjs && node --check tests/*.js",
+    "test": "node --test --test-isolation=none",
+    "test:route-isolation": "node --test --test-isolation=none tests/gearbox-route-isolation.test.js",
+    "test:supervisor-routing": "node --test --test-isolation=none tests/supervisor-routing.test.js",
+    "verify": "npm run check && npm test && node ./bin/opsle.js validate"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "Apache-2.0"
+}

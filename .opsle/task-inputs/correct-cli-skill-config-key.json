@@ -1,0 +1,86 @@
+{
+  "task_id": "task-correct-cli-skill-config-key",
+  "title": "Correct installed CLI skill-disable key",
+  "objective": "Replace the rejected Codex exec skill overrides with the actual installed 0.152.0 nested key and add a focused parser regression without invoking a model.",
+  "scope": [
+    "src/runner.js exact Codex launch argv",
+    "tests/gearbox-route-isolation.test.js installed exec parser regression",
+    "docs/OPERATIONS.md exact operator contract"
+  ],
+  "authorization": {
+    "may": [
+      "perform only the predeclared exact-string mechanical replacements",
+      "run the focused route-isolation test",
+      "invoke Codex exec with empty stdin solely to validate configuration parsing before inference"
+    ],
+    "may_modify": [
+      "src/runner.js",
+      "tests/gearbox-route-isolation.test.js",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "invoke a model, web, MCP, plugins, skills, subagents, review, another provider, or fallback",
+      "modify global configuration, global skills, Herdr, wake transport, siblings, or .opsle authority",
+      "push, merge, deploy, or install"
+    ]
+  },
+  "required_inputs": [
+    "src/runner.js",
+    "tests/gearbox-route-isolation.test.js",
+    "docs/OPERATIONS.md",
+    ".opsle/evidence/raw/task-live-no-unselected-capabilities-proof-attempt-001/stderr.log"
+  ],
+  "relevant_context": [
+    "Codex 0.152.0 exec rejected skills.enabled and accepts skills.bundled.enabled.",
+    "The same exec parser accepts include_apps_instructions and include_collaboration_mode_instructions.",
+    "An empty-stdin exec parser probe exits before authentication or inference and must reject any unknown configuration field."
+  ],
+  "expected_deliverable": "A three-file mechanical correction with a no-inference installed-parser regression.",
+  "expected_evidence": [
+    "deterministic command argv",
+    "three expected changed files",
+    "focused test output",
+    "complete Context Firewall packet"
+  ],
+  "acceptance_criteria": [
+    "runner uses skills.bundled.enabled=false",
+    "runner no longer uses skills.enabled or skills.include_instructions",
+    "focused test invokes the installed exec parser with empty stdin and rejects unknown configuration fields",
+    "focused route-isolation tests pass",
+    "only the three authorized files change"
+  ],
+  "prohibited_actions": [
+    "model inference",
+    "external capabilities",
+    "provider fallback",
+    "review",
+    "wake changes",
+    "global changes"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled but not invoked",
+    "Claude disabled",
+    "review off",
+    "deterministic tool only",
+    "web disabled",
+    "MCP disabled",
+    "plugins disabled",
+    "subagents disabled",
+    "fallback disabled"
+  ],
+  "requirement_ids": [],
+  "route_hint": "codex",
+  "deterministic_command": [
+    "node",
+    "-e",
+    "const fs=require('node:fs'); const replace=(p,a,b)=>{const s=fs.readFileSync(p,'utf8'); if(s.split(a).length!==2) throw new Error('expected one match in '+p); fs.writeFileSync(p,s.replace(a,b));}; replace('src/runner.js',\"    '-c', 'skills.enabled=false',\\n    '-c', 'skills.include_instructions=false',\\n\",\"    '-c', 'skills.bundled.enabled=false',\\n\"); replace('tests/gearbox-route-isolation.test.js',\"import assert from 'node:assert/strict';\\n\",\"import assert from 'node:assert/strict';\\nimport { spawnSync } from 'node:child_process';\\n\"); replace('tests/gearbox-route-isolation.test.js',\"      'skills.enabled=false',\\n      'skills.include_instructions=false',\\n\",\"      'skills.bundled.enabled=false',\\n\"); replace('tests/gearbox-route-isolation.test.js',\"    ]) assert.ok(launch.args.includes(override), `missing override ${override}`);\\n    assert.equal(launch.audit.isolation.review, 'off');\",\"    ]) assert.ok(launch.args.includes(override), `missing override ${override}`);\\n    const parserProbe = spawnSync(\\n      launch.command,\\n      [...launch.args.slice(0, -1), '-'],\\n      { env: launch.environment, input: '', encoding: 'utf8', timeout: 5000 },\\n    );\\n    assert.doesNotMatch(parserProbe.stderr, /unknown configuration field/);\\n    assert.match(parserProbe.stderr, /No prompt provided via stdin/);\\n    assert.equal(launch.audit.isolation.review, 'off');\"); replace('docs/OPERATIONS.md',\"The launch explicitly sets `skills.enabled=false`,\\n`skills.include_instructions=false`, `include_apps_instructions=false`, and\\n\",\"The launch explicitly sets `skills.bundled.enabled=false`,\\n`include_apps_instructions=false`, and\\n\");"
+  ],
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/gearbox-route-isolation.test.js"
+  ],
+  "timeout_seconds": 180,
+  "expects_changes": true
+}

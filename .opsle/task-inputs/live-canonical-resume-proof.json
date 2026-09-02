@@ -1,0 +1,80 @@
+{
+  "task_id": "task-live-canonical-resume-proof",
+  "parent_decision_id": "decision-a6255f9f-5ecc-4668-adea-9174c4e06629",
+  "title": "Audit and prove the canonical resume wake live",
+  "objective": "Perform a meaningful read-only audit of the canonical wake implementation and its focused tests so the detached completion itself exercises the live provider-free plain codex resume wake path and pause-after-current ordering.",
+  "scope": [
+    "read-only source audit of session binding, resume transport, rollout confirmation, cleanup, and exactly-once fences",
+    "focused deterministic wake and pause verification",
+    "compact Context Firewall result for supervisor evaluation"
+  ],
+  "authorization": {
+    "may": [
+      "read repository source, tests, documentation, and current durable task context",
+      "run the predeclared focused verification command",
+      "report actionable defects or confirm the bounded invariants"
+    ],
+    "may_modify": [],
+    "may_not": [
+      "modify source, .opsle authority, policy, objective, session binding, wake records, or host configuration",
+      "invoke codex resume, terminal input, tmux send-keys, Herdr agent.prompt, or another provider",
+      "modify siblings, push, merge, deploy, install, or initialize a repository"
+    ]
+  },
+  "required_inputs": [
+    "src/codex-resume-transport.js",
+    "src/wakeup.js",
+    "src/cli.js",
+    "src/host-terminal.js",
+    "tests/wakeup.test.js",
+    "tests/operator-controls.test.js",
+    "docs/OPERATIONS.md"
+  ],
+  "relevant_context": [
+    "The authoritative session binding is v2, valid, generation 13, Herdr-hosted, and names session 01a05dd0-0773-79a2-83b9-4fa2cf7c8ec3.",
+    "The old tmux session is absent and dispatcher generation 9 is loaded from the new source.",
+    "This child must not invoke wake itself. Runner terminal publication and the provider-free dispatcher own automatic wake after the packet is finalized.",
+    "The supervisor will request pause-after-current immediately after launch. Current completion must remain evaluable, be accepted or rejected, and only then transition to PAUSED."
+  ],
+  "expected_deliverable": "A concise source-bound audit result with focused verification evidence and no repository changes.",
+  "expected_evidence": [
+    "exact source locations for canonical argv, rollout acceptance, process-group cleanup, and duplicate/generation fences",
+    "focused wake and pause tests exit 0",
+    "no changed artifacts",
+    "complete_for_decision Context Firewall packet"
+  ],
+  "acceptance_criteria": [
+    "audit reports no unresolved correctness defect or precisely identifies one",
+    "focused verification passes",
+    "no repository files change",
+    "Context Firewall packet is complete_for_decision",
+    "completion is ready for a distinct supervisor decision"
+  ],
+  "prohibited_actions": [
+    "repository mutation",
+    "manual wake or terminal input",
+    "provider nesting",
+    "model polling",
+    "release or infrastructure action"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled with configured model and reasoning effort",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "model polling prohibited"
+  ],
+  "requirement_ids": [],
+  "route_hint": "codex",
+  "deterministic_command": null,
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/wakeup.test.js",
+    "tests/operator-controls.test.js"
+  ],
+  "expects_changes": false,
+  "timeout_seconds": 900
+}

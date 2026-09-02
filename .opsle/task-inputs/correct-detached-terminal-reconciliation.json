@@ -1,0 +1,117 @@
+{
+  "schema": "opsle.durable-supervisor.task-handoff/v1",
+  "task_id": "task-correct-detached-terminal-reconciliation",
+  "title": "Correct detached terminal reconciliation",
+  "objective": "Fix the detached Runner lifecycle defect exposed by task-herdr-host-adapter-attempt-001 so malformed verification command shape is rejected before launch, provider process termination is durably recorded before post-processing, Runner terminalization failures publish an eligible durable intervention event, and an UNKNOWN attempt with an exact FAILED worker record can be reconciled idempotently without inventing child success or failure.",
+  "scope": [
+    "task handoff validation for deterministic_command and verification_command argv shapes",
+    "write-ahead provider process result evidence before verification, Context Firewall reduction, Acceptance, or terminal-event publication",
+    "detached worker failure durability and intervention wake state",
+    "idempotent evidence-gated reconciliation of UNKNOWN attempts with exact dead Runner/child, active claim/fence, and FAILED worker record",
+    "claim release only after reconciliation is durably committed",
+    "preservation of the rejected Herdr adapter attempt, raw evidence, worker failure, claim identity, and existing wake/event hashes",
+    "focused lifecycle, recovery, validation, and regression tests"
+  ],
+  "authorization": {
+    "may": [
+      "modify this repository Runner, task validation, recovery/reconciliation, CLI, focused tests, and lifecycle documentation",
+      "inspect the rejected attempt and its raw evidence read-only",
+      "run focused and full deterministic tests and opsle validation",
+      "preserve the unaccepted Herdr adapter source changes already present in the worktree"
+    ],
+    "may_modify": [
+      "src/runner.js",
+      "src/cli.js",
+      "src/pipeline.js",
+      "src/wakeup.js",
+      "src/state.js",
+      "tests/detached-runner.test.js",
+      "tests/recovery-policy.test.js",
+      "tests/operator-controls.test.js",
+      "README.md",
+      "SPEC.md",
+      "ARCHITECTURE.md",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "modify any .opsle attempt, task, claim, worker, event, wake request, receipt, objective, policy, or supervisor authority file except Runner-owned evidence for this new attempt",
+      "rewrite or delete task-herdr-host-adapter-attempt-001 evidence or claim fence 24",
+      "claim the rejected Herdr adapter implementation is accepted",
+      "relaunch or retry task-herdr-host-adapter or its attempt",
+      "change host authority, start a Herdr Codex supervisor, inject terminal input, enable Claude or review, modify sibling repositories, deploy, merge, push, install server-wide, or initialize another repository"
+    ]
+  },
+  "required_inputs": [
+    ".opsle/objective.json",
+    ".opsle/policy.json",
+    ".opsle/state.json",
+    ".opsle/tasks/task-herdr-host-adapter.json",
+    ".opsle/children/task-herdr-host-adapter-attempt-001.json",
+    ".opsle/workers/task-herdr-host-adapter-attempt-001.json",
+    ".opsle/claims/claim-30cae3d9-c865-4f44-b7e5-a3e1d06ae619.json",
+    "src/runner.js",
+    "src/cli.js",
+    "src/pipeline.js",
+    "tests/detached-runner.test.js",
+    "tests/recovery-policy.test.js"
+  ],
+  "requirement_ids": [],
+  "relevant_context": [
+    "Recovery at generation 11 classified attempt 001 unknown_unreconciled and kept the supervisor PAUSED.",
+    "The worker record is exact and terminal: status FAILED, terminal_at 2026-09-01T02:54:28.794Z, failure Node ERR_INVALID_ARG_TYPE because verification_command was a string while Runner expected argv.",
+    "The provider stream contains turn.completed and a final message, but no Runner execution.json, compact packet, completion handoff, Acceptance result, CHILD_COMPLETION event, or trustworthy child exit_code exists. Child outcome must remain unknown.",
+    "Supervisor decision decision-a5a392ec-a7ee-45aa-8e9e-b69adc20be5b rejected the task and intentionally preserved claim-30cae3d9-c865-4f44-b7e5-a3e1d06ae619 fence 24 ACTIVE pending safe reconciliation.",
+    "An exact worker failure is terminal Runner evidence, distinct from child success/failure evidence. Persist and expose that distinction.",
+    "The normal recovery path must never infer success from process disappearance and must never auto-retry an uncertain attempt.",
+    "Graphify is unnecessary for this narrow lifecycle slice and must not be invoked."
+  ],
+  "expected_deliverable": "A source- and test-proven correction that rejects malformed command shapes before claims launch, seals process termination before fallible post-processing, and supplies an idempotent exact-fence reconciliation path for the preserved UNKNOWN adapter attempt while keeping its child outcome unknown.",
+  "expected_evidence": [
+    "task creation rejects string verification_command before claim or attempt creation",
+    "provider process result evidence survives injected verification/reduction/terminal-publication failure",
+    "Runner failure creates durable intervention evidence and leaves no false CHILD_COMPLETION",
+    "reconciliation requires exact task/attempt/worker/claim/fence/process-death facts and rejects ambiguity",
+    "reconciliation records Runner failure, preserves child_outcome unknown, releases claim FAILED exactly once, and cannot relaunch",
+    "duplicate reconciliation is idempotent and stale generation/fence is rejected",
+    "focused tests, full npm test, npm run check, git diff --check, and opsle validate pass",
+    "old adapter raw evidence and wake request hashes remain unchanged",
+    "Context Firewall packet is complete_for_decision with no unexpected changed artifacts"
+  ],
+  "acceptance_criteria": [
+    "malformed verification command shape cannot reach Runner execution",
+    "terminal process evidence is durable before any fallible post-processing",
+    "Runner terminal failure and unknown child outcome are represented separately and truthfully",
+    "safe reconciliation releases the preserved exact claim only after durable state commit and is idempotent",
+    "no automatic retry or host migration occurs",
+    "focused and full verification pass",
+    "Context Firewall packet is complete_for_decision with no unexpected changed artifacts"
+  ],
+  "prohibited_actions": [
+    "rewriting historical evidence",
+    "accepting or retrying the rejected adapter attempt",
+    "manual claim release without exact reconciliation gates",
+    "model polling, Graphify, Claude, Herdr input, host migration, merge, deployment, server-wide installation, or foreign repository initialization"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled with configured model and reasoning effort",
+    "Claude disabled",
+    "review off",
+    "Gearbox required",
+    "Context Firewall required",
+    "Affected Verification advisory only",
+    "model polling prohibited"
+  ],
+  "expects_changes": true,
+  "route_hint": "codex",
+  "timeout_seconds": 2400,
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/detached-runner.test.js",
+    "tests/recovery-policy.test.js",
+    "tests/operator-controls.test.js"
+  ],
+  "deterministic_command": null,
+  "parent_decision_id": "decision-a5a392ec-a7ee-45aa-8e9e-b69adc20be5b"
+}

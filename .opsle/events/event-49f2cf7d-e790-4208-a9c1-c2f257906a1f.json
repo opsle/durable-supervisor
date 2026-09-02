@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-49f2cf7d-e790-4208-a9c1-c2f257906a1f","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":12,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-codex-resume-fail-closed-and-pause","time":"2026-09-01T13:30:43.845Z","type":"TASK_HANDOFF_CREATED"}

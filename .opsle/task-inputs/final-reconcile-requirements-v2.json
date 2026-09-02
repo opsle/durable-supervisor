@@ -1,0 +1,79 @@
+{
+  "task_id": "task-final-reconcile-requirements-v2",
+  "parent_decision_id": "decision-a4562df8-d652-4698-b529-d8921a62a707",
+  "title": "Reconcile requirements after corrective pipeline proof",
+  "objective": "Apply the updated final manifest so DS-056 records the demonstrated corrective pipeline and all 101 requirements have truthful terminal dispositions.",
+  "scope": [
+    ".opsle/requirements.json",
+    ".opsle/state.json"
+  ],
+  "authorization": {
+    "may": [
+      "read the updated reconciliation manifest",
+      "update requirement states and evidence",
+      "set the objective phase to COMPLETE",
+      "validate terminal counts and durable state"
+    ],
+    "may_modify": [
+      ".opsle/requirements.json",
+      ".opsle/state.json"
+    ],
+    "may_not": [
+      "modify specification, policy, objective history, source, tests, docs, evidence artifacts, or sibling repositories",
+      "invoke an AI provider",
+      "deploy, merge, push, or create a PR"
+    ]
+  },
+  "required_inputs": [
+    ".opsle/final-reconciliation.json",
+    ".opsle/evidence/compact/task-correct-context-packet-measurement-attempt-001.json",
+    ".opsle/evidence/compact/task-final-reconcile-requirements-attempt-001.failure.json",
+    ".opsle/evidence/compact/task-final-reconcile-requirements-attempt-002.json"
+  ],
+  "relevant_context": [
+    "DS-056 is now VERIFIED because a rejected packet failure led to a bounded corrective child and a distinct reconciliation retry"
+  ],
+  "expected_deliverable": "Exactly 98 VERIFIED, 2 DEFERRED_WITH_JUSTIFICATION, 1 NOT_APPLICABLE_WITH_JUSTIFICATION, and zero unaccounted requirements.",
+  "expected_evidence": [
+    "terminal matrix counts",
+    "evidence on every VERIFIED entry",
+    "justification on every exception",
+    "validator exit 0"
+  ],
+  "acceptance_criteria": [
+    "all 101 stable IDs remain",
+    "DS-056 is VERIFIED with corrective evidence",
+    "DS-046 and DS-047 are explicitly deferred",
+    "DS-092 alone is not applicable with justification",
+    "unaccounted count is zero",
+    "validation exits 0",
+    "no unexpected files change"
+  ],
+  "prohibited_actions": [
+    "model invocation",
+    "requirement omission",
+    "silent deferral"
+  ],
+  "operator_policy_constraints": [
+    "deterministic route required",
+    "Claude disabled",
+    "review off",
+    "Affected Verification advisory only"
+  ],
+  "requirement_ids": [],
+  "route_hint": "deterministic",
+  "deterministic_command": [
+    "node",
+    "--input-type=module",
+    "-e",
+    "import{readJson}from'./src/io.js';import{setRequirements,updateState}from'./src/state.js';const root=process.cwd();const manifest=readJson('.opsle/final-reconciliation.json');const matrix=readJson('.opsle/requirements.json');const exceptions=new Set([...manifest.deferred,...manifest.not_applicable].map(x=>x.id));for(const item of matrix.requirements){if(!exceptions.has(item.id))setRequirements(root,[item.id],'VERIFIED',manifest.verified_evidence)}for(const item of manifest.deferred)setRequirements(root,[item.id],'DEFERRED_WITH_JUSTIFICATION',manifest.verified_evidence,item.justification);for(const item of manifest.not_applicable)setRequirements(root,[item.id],'NOT_APPLICABLE_WITH_JUSTIFICATION',manifest.verified_evidence,item.justification);updateState(root,{phase:'COMPLETE',pending_next_action:'Objective complete; remain inspectable and await operator direction.'})"
+  ],
+  "verification_command": [
+    "node",
+    "--input-type=module",
+    "-e",
+    "import{readJson}from'./src/io.js';import{validateDurableState}from'./src/state.js';const root=process.cwd();const m=readJson('.opsle/requirements.json');const counts=Object.groupBy(m.requirements,x=>x.state);const byId=new Map(m.requirements.map(x=>[x.id,x]));const ok=m.requirements.length===101&&(counts.VERIFIED?.length??0)===98&&(counts.DEFERRED_WITH_JUSTIFICATION?.length??0)===2&&(counts.NOT_APPLICABLE_WITH_JUSTIFICATION?.length??0)===1&&byId.get('DS-056').state==='VERIFIED'&&m.requirements.filter(x=>x.state==='VERIFIED').every(x=>x.evidence.length>0)&&m.requirements.filter(x=>x.state!=='VERIFIED').every(x=>x.justification)&&validateDurableState(root).valid;process.exit(ok?0:1)"
+  ],
+  "expects_changes": true,
+  "timeout_seconds": 60
+}

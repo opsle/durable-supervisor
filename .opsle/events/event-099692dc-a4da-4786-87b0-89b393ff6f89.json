@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-099692dc-a4da-4786-87b0-89b393ff6f89","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":13,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-correct-live-rollout-confirmation","time":"2026-09-01T17:17:35.044Z","type":"TASK_HANDOFF_CREATED"}

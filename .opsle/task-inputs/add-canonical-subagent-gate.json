@@ -1,0 +1,86 @@
+{
+  "task_id": "task-add-canonical-subagent-gate",
+  "title": "Add canonical Codex subagent gate",
+  "objective": "Add the installed and documented agents.enabled=false override to no-tool Codex launches, keeping existing multi-agent feature denials and parser regression.",
+  "scope": [
+    "src/runner.js exact Codex launch argv",
+    "tests/gearbox-route-isolation.test.js installed parser and launch assertions",
+    "docs/OPERATIONS.md exact operator contract"
+  ],
+  "authorization": {
+    "may": [
+      "perform only the predeclared exact-string mechanical insertions",
+      "run the focused route-isolation test",
+      "invoke Codex exec with empty stdin solely to validate configuration parsing before inference"
+    ],
+    "may_modify": [
+      "src/runner.js",
+      "tests/gearbox-route-isolation.test.js",
+      "docs/OPERATIONS.md"
+    ],
+    "may_not": [
+      "invoke a model, web, MCP, plugins, skills, subagents, review, another provider, or fallback",
+      "modify global configuration, global skills, Herdr, wake transport, siblings, or .opsle authority",
+      "push, merge, deploy, or install"
+    ]
+  },
+  "required_inputs": [
+    "src/runner.js",
+    "tests/gearbox-route-isolation.test.js",
+    "docs/OPERATIONS.md",
+    ".opsle/evidence/compact/task-live-no-unselected-capabilities-proof-v2-attempt-001.json"
+  ],
+  "relevant_context": [
+    "Codex 0.152.0 exec accepts agents.enabled=false.",
+    "Official Codex configuration reference defines agents.enabled as the multi-agent tool gate.",
+    "The prior live child saw collaboration tools despite multi_agent feature flags being disabled."
+  ],
+  "expected_deliverable": "A three-file mechanical insertion of the canonical subagent gate with focused installed-parser proof.",
+  "expected_evidence": [
+    "deterministic command argv",
+    "three expected changed files",
+    "focused test output",
+    "complete Context Firewall packet"
+  ],
+  "acceptance_criteria": [
+    "runner sets agents.enabled=false",
+    "multi_agent and multi_agent_v2 feature flags remain disabled",
+    "installed exec parser accepts the complete launch override set",
+    "focused route-isolation tests pass",
+    "only the three authorized files change"
+  ],
+  "prohibited_actions": [
+    "model inference",
+    "external capabilities",
+    "provider fallback",
+    "review",
+    "wake changes",
+    "global changes"
+  ],
+  "operator_policy_constraints": [
+    "Codex enabled but not invoked",
+    "Claude disabled",
+    "review off",
+    "deterministic tool only",
+    "web disabled",
+    "MCP disabled",
+    "plugins disabled",
+    "subagents disabled",
+    "fallback disabled"
+  ],
+  "requirement_ids": [],
+  "route_hint": "codex",
+  "deterministic_command": [
+    "node",
+    "-e",
+    "const fs=require('node:fs'); const replace=(p,a,b)=>{const s=fs.readFileSync(p,'utf8'); if(s.split(a).length!==2) throw new Error('expected one match in '+p); fs.writeFileSync(p,s.replace(a,b));}; replace('src/runner.js',\"    '-c', 'approval_policy=\\\"never\\\"',\\n    '-c', 'web_search=\\\"disabled\\\"',\\n\",\"    '-c', 'approval_policy=\\\"never\\\"',\\n    '-c', 'agents.enabled=false',\\n    '-c', 'web_search=\\\"disabled\\\"',\\n\"); replace('tests/gearbox-route-isolation.test.js',\"      'web_search=\\\"disabled\\\"',\\n      'mcp_servers={}',\\n\",\"      'web_search=\\\"disabled\\\"',\\n      'mcp_servers={}',\\n      'agents.enabled=false',\\n\"); replace('docs/OPERATIONS.md',\"`include_apps_instructions=false`, and\\n`include_collaboration_mode_instructions=false`. Validation continues to accept\\n\",\"`include_apps_instructions=false`, `agents.enabled=false`, and\\n`include_collaboration_mode_instructions=false`. Validation continues to accept\\n\");"
+  ],
+  "verification_command": [
+    "node",
+    "--test",
+    "--test-isolation=none",
+    "tests/gearbox-route-isolation.test.js"
+  ],
+  "timeout_seconds": 180,
+  "expects_changes": true
+}

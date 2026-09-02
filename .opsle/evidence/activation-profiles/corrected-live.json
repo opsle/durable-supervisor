@@ -1,0 +1,24 @@
+{
+  "schema": "opsle.durable-supervisor.activation-profile/v1",
+  "task_id": "task-live-wakeup-invariant-audit",
+  "attempt_id": "task-live-wakeup-invariant-audit-attempt-001",
+  "interval": {
+    "start": "2026-08-31T22:02:56.621Z",
+    "end": "2026-08-31T22:08:03.111Z"
+  },
+  "evidence": "observable-codex-trajectory",
+  "trajectory_evidence": {
+    "path": "/home/deploy/.codex/sessions/2026/08/31/rollout-2026-08-31T21-19-41-01a059b1-3963-7162-9d07-a72602222ae0.jsonl",
+    "sha256": "16f23642c8635db372fd0931f793dbbb60bc87639f23c8ab5167aa27e236d277"
+  },
+  "measurement_basis": "model continuation after an observable tool-output boundary",
+  "counts": {
+    "total_automatic": 0,
+    "terminal_event": 0,
+    "human": 0,
+    "wait_induced_automatic": 0
+  },
+  "provider_model_turns": null,
+  "limitation": "activation counts are trajectory-derived, not provider-recorded billing turns or tokens",
+  "activations": []
+}

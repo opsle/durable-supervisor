@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-2863a13a-3062-4fe4-acca-2337fef54e47","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":9,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-herdr-reality-audit","time":"2026-09-01T02:28:52.350Z","type":"TASK_HANDOFF_CREATED"}

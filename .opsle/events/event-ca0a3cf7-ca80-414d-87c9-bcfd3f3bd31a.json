@@ -1,0 +1,1 @@
+{"actor":"durable-supervisor","event_id":"event-ca0a3cf7-ca80-414d-87c9-bcfd3f3bd31a","schema":"opsle.durable-supervisor.event/v1","supervisor_generation":12,"supervisor_id":"supervisor-1005d601-4da1-4f6b-a7fa-f0b71dedabbe","task_id":"task-codex-resume-final-live-pause-proof","time":"2026-09-01T14:02:02.545Z","type":"TASK_HANDOFF_CREATED"}
