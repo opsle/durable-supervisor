@@ -446,25 +446,50 @@ second supervisor. Loss of tmux does not lose the objective or ledger.
 Use this procedure after `/clear`, Codex restart, tmux loss, SSH loss, or process
 loss. It does not need a pasted conversation summary.
 
-First inspect and validate the files:
+After `/clear` or model compaction with the same live supervisor activation,
+generate the canonical packet. This command is the normal first model-facing
+read:
 
 ```bash
-./bin/opsle.js status
-./bin/opsle.js validate
+./bin/opsle.js resume-packet generate
 ```
 
-If this is genuinely a new supervisor activation, run recovery once:
+If process, tmux, or host loss means this is genuinely a new supervisor
+activation, reconcile once and emit only the resulting packet:
 
 ```bash
-./bin/opsle.js recover
+./bin/opsle.js resume-packet generate --recover
 ```
 
-Then inspect the reconciliation result:
+The packet is canonical `resume-packet/v1` JSON and answers current repository,
+supervisor/generation, authority and Herdr binding, objective, phase, policy,
+pause, active task/attempt/claim/fence, wake attention, latest relevant decision,
+unresolved state, and next action. Its hard ceilings are 4,000 UTF-8 bytes,
+4,000 characters, and 1,000 clearly labeled estimated tokens using
+`ceil(UTF-8 bytes / 4)`. Generation time and reconstruction telemetry are
+written separately to `.opsle/evidence/reconstruction/telemetry.json` and never
+enter the packet.
+
+For a `complete_for_resume` packet, do not read broader durable files. For
+`incomplete`, `contradictory`, or `requires_escalation`, load only a path named
+in `evidence.escalation`:
 
 ```bash
-./bin/opsle.js status
-./bin/opsle.js validate
+./bin/opsle.js resume-packet evidence --path PATH
 ```
+
+That command verifies the referenced file hash and emits only its selected JSON
+slice, capped at 16 KiB. It rejects unselected paths, changed evidence, symlinks,
+repository escapes, unsupported selectors, and oversized selected output.
+`resume-packet show` rereads only the already generated packet. Append-only
+events and decisions, raw evidence, the specification, and objective history
+remain durable but are not normal model inputs.
+
+`status` and `validate` remain useful operator diagnostics and release checks.
+Do not paste their output into the normal activation context. Direct `recover`
+also remains available for deterministic operator diagnosis; use the combined
+packet command for a model activation so broad reconciliation output is not
+exposed.
 
 Recovery increments the existing generation. It does not create a new identity
 or retry work. A known terminal attempt is not relaunched. Detached ownership

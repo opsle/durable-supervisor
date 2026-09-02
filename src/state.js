@@ -147,6 +147,8 @@ export const paths = (root) => {
     raw: join(opsle, 'evidence', 'raw'),
     compact: join(opsle, 'evidence', 'compact'),
     audit: join(opsle, 'evidence', 'repository-audit.json'),
+    resumePacket: join(opsle, 'resume-packet.json'),
+    reconstructionTelemetry: join(opsle, 'evidence', 'reconstruction', 'telemetry.json'),
     supervisorRouting: join(opsle, 'supervisor-routing'),
   };
 };

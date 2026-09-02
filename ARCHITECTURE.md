@@ -59,7 +59,8 @@ path controls how much execution detail enters the next decision.
 | Runner | `src/runner.js` defaults to a detached repository-local worker. A durable PID/nonce/fence handshake completes before the launcher returns; the worker enforces the exact snapshotted route, then owns child PID, heartbeat, timeout, evidence, verification, Context Firewall, Acceptance, claim release, pause-after-current, terminal event, and wake creation. |
 | Event-driven wakeup | `src/wakeup.js` queues only terminal/intervention events and maintains one persistent detached provider-free dispatcher. Observation is registered before the receipt-free scan. Requests have no expiry and never bind a frontend. Stale/evaluated requests are obsolete without byte mutation. Session validation, activation leases, per-event decision CAS, receipts, consumption, and telemetry are durable and idempotent. Heartbeat and nonterminal progress remain ineligible. |
 | Supervisor/session boundary | Durable supervisor identity is separate from `codex-session-binding/v2`, which binds repository, generation, Codex UUID, rollout metadata/inode, CLI version, UID, and exact authoritative Herdr process/workspace/pane/terminal facts. A live old tmux authority invalidates the binding. Normal dispatch uses only plain Codex resume; Herdr and tmux input APIs remain unused. |
-| Context Firewall | A local reducer creates a bounded packet with completeness, measured bytes, changed-file scope, verification result, hashes, and raw references. |
+| Context Firewall | A local reducer creates bounded child-result packets with completeness, measured bytes, changed-file scope, verification result, hashes, and raw references. |
+| Authoritative reconstruction | `src/reconstruction.js` reduces current repository-local authority to canonical `resume-packet/v1` JSON. It validates objective, task, attempt, claim/fence, pause, terminal, session-binding, and wake relationships without reading append-only history. The packet is capped at 4,000 bytes/characters and 1,000 clearly estimated tokens; telemetry is separate. |
 | Decision evidence | Completion handoff separates child claims from deterministic observations and unknowns. |
 | Acceptance | Deterministic criteria gate the attempt before a separate supervisor accept/reject decision can advance requirements. |
 | Human controls | Deterministic CLI status/watch, pause/resume, objective revisions, policy changes, evidence display, and tmux helpers. |
@@ -70,7 +71,9 @@ path controls how much execution detail enters the next decision.
 `.opsle/specification.md` and `.opsle/requirements.json` define the complete
 contract. `.opsle/objective.json`, `policy.json`, `supervisor.json`, and
 `state.json` hold current authority. Tasks, attempts, claims, events, decisions,
-and evidence provide reconstructable history.
+and evidence provide reconstructable history. `.opsle/resume-packet.json` is a
+derived model-facing view, never an independent authority. Reconstruction
+telemetry lives separately under `.opsle/evidence/reconstruction/telemetry.json`.
 
 README prose and model context are not parsed to recover authority. Raw child
 transcripts are evidence artifacts, not routine supervisor input.
@@ -137,11 +140,14 @@ requests remain readable and byte-identical.
 
 ## Recovery and duplicate prevention
 
-Fresh activation reconstructs status from the durable identity, objective,
-policy, requirements, task, attempt, decisions, and state. The `recover`
-command itself reconciles the existing identity, state, and active attempt. It
-increments the existing supervisor generation; it does not create another
-identity.
+Fresh activation invokes the deterministic reducer and exposes only its compact
+packet to the model. The reducer reads current authority and exact active-work
+records, not the specification, event or decision logs, raw evidence, or broad
+history. A normal packet is `complete_for_resume`; stale or uncertain facts name
+only exact bounded escalation references. Genuine process recovery is performed
+before reduction by `resume-packet generate --recover`, so reconciliation output
+does not become a separate broad model input. Recovery increments the existing
+supervisor generation; it does not create another identity.
 
 For a durable active attempt, recovery does not relaunch a known terminal child.
 For detached work, only a live worker whose durable `OWNED` record exactly

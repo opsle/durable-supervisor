@@ -159,9 +159,11 @@ supervisor already exists.
 
 The [mobile-safe operator runbook](docs/OPERATIONS.md) covers initialization,
 status/watch, pause/resume, objective and policy changes, tmux, recovery, and
-evidence inspection. The recovery path reads durable files and reconciles the
-active attempt; it does not replay chat history or silently retry uncertain
-work.
+evidence inspection. After `/clear` or compaction, `resume-packet generate`
+emits the canonical bounded model-facing reconstruction. A genuine new
+activation uses `resume-packet generate --recover`, reconciling first without
+exposing broad recovery output. The path does not replay chat history, ingest
+append-only logs or raw evidence, or silently retry uncertain work.
 
 ## Self-hosting evidence
 

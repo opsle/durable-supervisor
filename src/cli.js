@@ -39,6 +39,11 @@ import {
 } from './supervisor-routing.js';
 import { activationSummary } from './activation-telemetry.js';
 import {
+  generateResumePacket,
+  readResumeEvidence,
+  readResumePacket,
+} from './reconstruction.js';
+import {
   adoptCodexSessionBinding,
   adoptQueuedWakes,
   applyWakeEvent,
@@ -58,6 +63,9 @@ commands:
   status [--json] [--watch [--iterations N] [--interval-ms MS]]
   validate
   recover
+  resume-packet generate [--recover]
+  resume-packet show
+  resume-packet evidence --path RELATIVE_PATH
   reconcile runner-failure --task TASK_ID --attempt ATTEMPT_ID
     --claim CLAIM_ID --fence N --generation N
   cutover --first-task TASK_ID
@@ -925,6 +933,22 @@ export async function main(args) {
   }
   if (command === 'recover') {
     print(recover(root));
+    return;
+  }
+  if (command === 'resume-packet') {
+    if (subcommand === 'generate') {
+      if (rest.includes('--recover')) recover(root);
+      const result = generateResumePacket(root);
+      process.stdout.write(result.serialized);
+    } else if (subcommand === 'show') {
+      process.stdout.write(canonicalJson(readResumePacket(root)));
+    } else if (subcommand === 'evidence') {
+      const path = valueAfter(rest, '--path');
+      if (!path) throw new Error('resume-packet evidence requires --path RELATIVE_PATH');
+      print(readResumeEvidence(root, path));
+    } else {
+      throw new Error('resume-packet requires generate, show, or evidence');
+    }
     return;
   }
   if (command === 'reconcile' && subcommand === 'runner-failure') {

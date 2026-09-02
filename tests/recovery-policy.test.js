@@ -33,6 +33,7 @@ import {
 import { runAttempt } from '../src/runner.js';
 import { registerWait } from '../src/wakeup.js';
 import { reconcileRunnerFailure, recover } from '../src/cli.js';
+import { generateResumePacket } from '../src/reconstruction.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 const cliPath = join(sourceRoot, 'bin', 'opsle.js');
@@ -454,6 +455,12 @@ test('exact failed-worker reconciliation commits before idempotent claim release
     assert.equal(recovered.reconciliation.classification, 'known_runner_failed_child_unknown');
     assert.equal(recovered.reconciliation.action, 'do_not_relaunch');
     assert.equal(recovered.reconciliation.claim_status, 'FAILED');
+    const reconstructed = generateResumePacket(root, { persist: false }).packet;
+    assert.equal(reconstructed.supervisor.generation, recovered.supervisor.generation);
+    assert.equal(reconstructed.active_work.child_state, 'UNKNOWN');
+    assert.equal(reconstructed.active_work.claim_status, 'FAILED');
+    assert.equal(reconstructed.requires_escalation, true);
+    assert.ok(reconstructed.issues.includes('active-child-state-unknown'));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
