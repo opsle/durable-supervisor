@@ -124,6 +124,17 @@ function eventLines(root) {
   return value ? value.split('\n').map((line) => JSON.parse(line)) : [];
 }
 
+function satisfyFixtureRequirements(root) {
+  const requirements = readJson(paths(root).requirements).requirements
+    .filter((requirement) => ![
+      'VERIFIED',
+      'DEFERRED_WITH_JUSTIFICATION',
+      'NOT_APPLICABLE_WITH_JUSTIFICATION',
+    ].includes(requirement.state))
+    .map((requirement) => requirement.id);
+  if (requirements.length > 0) setRequirements(root, requirements, 'VERIFIED');
+}
+
 test('fresh-process recovery reconstructs accepted work using durable repository files only', async () => {
   const root = fixture();
   try {
@@ -181,6 +192,7 @@ test('fresh recovery preserves canonical terminal state and historical next-acti
   const root = fixture();
   try {
     const p = paths(root);
+    satisfyFixtureRequirements(root);
     updateState(root, {
       phase: 'COMPLETE',
       pending_next_action: NEXT_UNSATISFIED_REQUIREMENT_ACTION,

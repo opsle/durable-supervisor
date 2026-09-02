@@ -143,7 +143,10 @@ Inspect queued, delivered, uncertain, or consumed events without model use:
 For a valid authoritative Herdr v2 binding, normal dispatch spawns plain
 `codex resume SESSION_ID MESSAGE` under a repository-local PTY launcher. It
 confirms one exact accepted-message record and its matching turn-began record in
-the bound rollout and hashes their complete raw JSONL line bytes. Live PTY output
+the bound rollout and hashes their complete raw JSONL line bytes. Before spawn,
+an unmatched `task_started` in that exact rollout is durably classified busy;
+retry remains blocked until the registered watcher observes that rollout change.
+Live PTY output
 detects a busy rejection without waiting for the stdin keeper to exit; an exact
 confirmation already present in the rollout remains authoritative. Before
 delivery, the dispatcher registers a watcher for only that bound rollout and
@@ -154,13 +157,26 @@ both acceptance records are complete, the default 120-second confirmation
 deadline makes one final exact rollout-state check before recording uncertainty.
 The helper's 135-second process bound exceeds confirmation plus both bounded
 5-second cleanup phases. The records, not either timeout or elapsed time, remain
-the only positive proof. Cleanup compares exact session
-UUID and wake-message frontend identities with the pre-spawn baseline, then
-terminates the detached launcher group and every newly discovered frontend
-group. The authoritative Herdr host group is excluded explicitly. Delivery is
-proven only after the launcher exits, every tracked group is empty, and a final
-exact scan finds no new matching frontend. It never calls tmux input or Herdr
-input.
+the only positive proof. Each transport attempt is journaled under
+`.opsle/wake/transport-attempts/`, including its complete fence/binding,
+canonical argv and message hash, executable/version/environment/cwd evidence,
+launcher and frontend identities, bounded output, exit state, timestamps,
+confirmation or explicit absence, and cleanup proof. Exact confirmation is
+atomically checkpointed there before cleanup begins. The helper then revalidates
+the exact request, delivery, dispatcher, supervisor generation, activation
+decision and lease, session binding, rollout device/inode, canonical message
+hash, and both confirmation records. It atomically commits the fenced
+`DELIVERED` receipt before the first temporary launcher or frontend signal.
+Cleanup compares exact session UUID and wake-message frontend identities with
+the pre-spawn baseline, then terminates the detached launcher group and every
+newly discovered frontend group. The authoritative Herdr host group is excluded
+explicitly. Cleanup CAS-updates that same receipt to `PROVEN` or
+`INTERVENTION_REQUIRED`. A cleanup failure cannot erase confirmed delivery,
+make the request replayable, or convert it to `UNCERTAIN`; the receipt retains
+the exact remaining process evidence for intervention. The helper still accepts
+the immediately prior invocation without `--evidence` and always emits one
+complete JSON result, allowing an already-running dispatcher to finish across a
+source cutover. It never calls tmux input or Herdr input.
 
 ### Bind and inspect the exact Codex session
 
@@ -208,10 +224,18 @@ owner/process, event, expiry, and monotonic token, and expiry at or before a
 decision fence is stale. The
 per-event decision record is the exactly-once boundary. Busy rejection before
 acceptance remains queued until an observed state change. Uncertainty after
-spawn is never replayed. After confirmed transport cleanup, the exact request,
-queue version, supervisor, dispatcher process/generation, and activation lease
-token are revalidated before delivery is committed; any drift records a
-non-replayable uncertain decision and no delivered receipt. The tiny message
+spawn is never replayed. The dispatcher retains its already-registered bound-
+rollout watcher so a late exact message plus matching turn-began append can
+reconcile the original uncertain decision and transport attempt idempotently.
+Late reconciliation requires the original cleanup proof and current exact
+request, session, rollout, supervisor, and dispatcher fences; it emits at most
+one delivery/activation and never launches another resume. After confirmed transport cleanup, the exact request,
+queue version, supervisor, dispatcher process/generation, activation lease,
+session binding, and exact rollout confirmation are revalidated before the
+pre-cleanup delivery receipt is committed; any drift records a non-replayable
+uncertain decision and no delivered receipt. Parent observation after the helper
+is reconciliation only: an already committed matching receipt remains delivered
+even if helper output is lost or cleanup requires intervention. The tiny message
 contains only event ID, generation, and an instruction to read durable state.
 
 ### Compatibility hosts and Herdr

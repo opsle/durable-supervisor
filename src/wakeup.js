@@ -14,8 +14,12 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
+  boundRolloutActivity,
+  codexExecutableEvidence,
   CODEX_RESUME_CONFIRMATION_TIMEOUT_MS,
   CODEX_RESUME_WORST_CASE_CLEANUP_TIMEOUT_MS,
+  rolloutConfirmation,
+  sanitizedEnvironmentEvidence,
 } from './codex-resume-transport.js';
 import {
   atomicCreateJson,
@@ -136,12 +140,19 @@ function wakePaths(root) {
     sessionBinding: join(base, 'codex-session-binding.json'),
     activationLease: join(base, 'activation-lease.json'),
     activationDecisions: join(base, 'activation-decisions'),
+    transportAttempts: join(base, 'transport-attempts'),
   };
 }
 
 function directories(root) {
   const value = wakePaths(root);
-  for (const directory of [value.base, value.requests, value.deliveries, value.activationDecisions]) {
+  for (const directory of [
+    value.base,
+    value.requests,
+    value.deliveries,
+    value.activationDecisions,
+    value.transportAttempts,
+  ]) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
   }
   return value;
@@ -157,6 +168,10 @@ function requestPath(root, eventId) {
 
 function receiptPath(root, eventId) {
   return join(directories(root).deliveries, `${eventId}.json`);
+}
+
+function transportAttemptPath(root, transportAttemptId) {
+  return join(directories(root).transportAttempts, `${transportAttemptId}.json`);
 }
 
 function sameProcess(left, right) {
@@ -636,6 +651,8 @@ export function decisionFenceCurrent(root, lease, { nowMs = Date.now() } = {}) {
 
 export function claimActivationDecision(root, eventId, lease, {
   message = null,
+  transportAttemptId = null,
+  deliveryId = null,
   nowMs = Date.now(),
 } = {}) {
   if (!decisionFenceCurrent(root, lease, { nowMs })) {
@@ -656,6 +673,8 @@ export function claimActivationDecision(root, eventId, lease, {
     lease_id: lease.lease_id,
     fencing_token: lease.fencing_token,
     message_sha256: sha256(message ?? constructWakeMessage(eventId, supervisor.generation)),
+    transport_attempt_id: transportAttemptId,
+    delivery_id: deliveryId,
     status: 'CLAIMED',
     claimed_at: now(),
     delivered_at: null,
@@ -675,6 +694,8 @@ export function claimActivationDecision(root, eventId, lease, {
         status: current.status,
         claimed_at: current.claimed_at,
         failure: current.failure,
+        transport_attempt_id: current.transport_attempt_id ?? null,
+        delivery_id: current.delivery_id ?? null,
       },
     ];
     const cas = atomicCompareAndSwapJson(path, expected, decision);
@@ -887,8 +908,8 @@ export function plainCodexResumeTransport({
 } = {}) {
   return {
     kind: 'plain-codex-resume',
-    resume({ session_id: sessionId, message, binding }) {
-      const result = run(process.execPath, [
+    resume({ session_id: sessionId, message, binding, transport_attempt_path: evidencePath }) {
+      const helperArgs = [
         helper,
         '--session', sessionId,
         '--message', message,
@@ -896,11 +917,49 @@ export function plainCodexResumeTransport({
         '--host-pid', String(binding.host.process.pid),
         '--host-start', binding.host.process.start_time_ticks,
         '--host-executable', binding.host.process.executable,
-      ], {
+        '--evidence', evidencePath,
+      ];
+      const before = readJson(evidencePath);
+      before.helper = {
+        executable: process.execPath,
+        argv: [process.execPath, ...helperArgs],
+        cwd: binding.repository_realpath,
+        invoked_at: now(),
+        completed_at: null,
+        exit_code: null,
+        signal: null,
+        error: null,
+        stdout_bytes: null,
+        stderr_bytes: null,
+      };
+      before.transport ??= {};
+      before.transport.resolved_executable = codexExecutableEvidence('codex');
+      before.transport.environment = sanitizedEnvironmentEvidence();
+      before.transport.cwd = binding.repository_realpath;
+      writeJson(evidencePath, before);
+      const result = run(process.execPath, helperArgs, {
         encoding: 'utf8',
         maxBuffer: 256 * 1024,
         timeout: CODEX_RESUME_HELPER_TIMEOUT_MS,
+        cwd: binding.repository_realpath,
+        env: process.env,
       });
+      const after = readJson(evidencePath);
+      after.helper = {
+        ...before.helper,
+        ...(after.helper ?? {}),
+        completed_at: now(),
+        exit_code: result.status ?? null,
+        signal: result.signal ?? null,
+        error: result.error?.message ?? null,
+        stdout_bytes: Buffer.byteLength(result.stdout ?? ''),
+        stderr_bytes: Buffer.byteLength(result.stderr ?? ''),
+      };
+      if (result.error) {
+        after.status = 'HELPER_FAILED_OR_TIMED_OUT';
+        after.confirmation_absence ??= 'helper-failed-without-confirmation';
+      }
+      writeJson(evidencePath, after);
       if (result.error) {
         return {
           classification: 'uncertain',
@@ -950,6 +1009,492 @@ function validateDeliveryFence(root, eventId, expected, dispatcher) {
   return { current: true, request, supervisor };
 }
 
+function commitDeliveredReceipt(root, request, receipt) {
+  const existingPath = receiptPath(root, request.event_id);
+  receipt.status = 'DELIVERED';
+  receipt.delivered_at ??= now();
+  if (!atomicCreateJson(existingPath, receipt)) {
+    return {
+      classification: 'duplicate',
+      reason: 'event-already-delivered',
+      receipt: readJson(existingPath),
+      delivered: false,
+    };
+  }
+  const state = readJson(paths(root).state);
+  if (!state.pause?.active || state.pause.after_current) updateState(root, { supervisor_state: 'ACTIVE' });
+  const childAttemptPath = join(paths(root).attempts, `${request.attempt_id}.json`);
+  if (existsSync(childAttemptPath)) {
+    const attempt = readJson(childAttemptPath);
+    if (attempt.telemetry?.activation_counts) {
+      attempt.telemetry.activation_counts = {
+        evidence: 'durable-host-delivery',
+        total_automatic: 1,
+        terminal_event: 1,
+        human: attempt.telemetry.activation_counts.human,
+        wait_induced_automatic: 0,
+      };
+      writeJson(childAttemptPath, attempt);
+    }
+  }
+  emit(root, 'SUPERVISOR_ACTIVATION', {
+    classification: 'terminal-event',
+    automatic: true,
+    cause_event_id: request.event_id,
+    task_id: request.task_id,
+    attempt_id: request.attempt_id,
+    wait_id: request.wait_id,
+    delivery_id: receipt.delivery_id,
+  });
+  emit(root, 'SUPERVISOR_REACTIVATED', {
+    cause_event_id: request.event_id,
+    task_id: request.task_id,
+    attempt_id: request.attempt_id,
+    classification: 'terminal-event',
+    delivery_id: receipt.delivery_id,
+    resulting_state: state.pause?.active && !state.pause.after_current ? 'PAUSED' : 'ACTIVE',
+  });
+  emit(root, 'HOST_WAKE_DELIVERED', {
+    source_event_id: request.event_id,
+    delivery_id: receipt.delivery_id,
+    queue_version: receipt.queue_version,
+    native_transport: receipt.native_transport,
+    codex_session_uuid: receipt.codex_session_uuid,
+  });
+  return {
+    classification: 'native-delivered',
+    reason: 'supported-native-session-transport',
+    receipt,
+    delivered: true,
+  };
+}
+
+function exactRolloutConfirmation(value) {
+  if (!value
+      || !Number.isSafeInteger(value.accepted_ordinal)
+      || !/^[a-f0-9]{64}$/.test(value.accepted_record_sha256 ?? '')
+      || !Number.isSafeInteger(value.turn_began_ordinal)
+      || !/^[a-f0-9]{64}$/.test(value.turn_began_record_sha256 ?? '')
+      || typeof value.turn_id !== 'string'
+      || !Number.isSafeInteger(value.turn_started_at_ms)) return null;
+  return {
+    accepted_ordinal: value.accepted_ordinal,
+    accepted_record_sha256: value.accepted_record_sha256,
+    turn_began_ordinal: value.turn_began_ordinal,
+    turn_began_record_sha256: value.turn_began_record_sha256,
+    turn_id: value.turn_id,
+    turn_started_at_ms: value.turn_started_at_ms,
+  };
+}
+
+export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
+  nowMs = Date.now(),
+} = {}) {
+  const repositoryRoot = realpathSync(root);
+  const wake = directories(repositoryRoot);
+  const evidence = readJson(evidencePath);
+  if (realpathSync(dirname(evidencePath)) !== realpathSync(wake.transportAttempts)
+      || evidencePath !== transportAttemptPath(repositoryRoot, evidence.transport_attempt_id)) {
+    return { committed: false, reason: 'transport-attempt-path-fence-mismatch' };
+  }
+  const request = readJson(requestPath(repositoryRoot, evidence.event_id));
+  const supervisor = readJson(paths(repositoryRoot).supervisor);
+  const binding = readJson(wake.sessionBinding);
+  const decision = readJson(activationDecisionPath(repositoryRoot, evidence.event_id));
+  const lease = readJson(wake.activationLease);
+  const expectedDispatcher = {
+    ...evidence.dispatcher,
+    supervisor_id: evidence.supervisor?.supervisor_id,
+    supervisor_generation: evidence.supervisor?.generation,
+  };
+  const message = evidence.canonical_argv?.[3];
+  const baselineOrdinal = evidence.transport?.baseline_ordinal;
+  const currentConfirmation = exactRolloutConfirmation(confirmation);
+  const rolloutStat = statSync(binding.rollout.realpath);
+  const durableConfirmation = currentConfirmation && exactRolloutConfirmation(rolloutConfirmation(
+    binding.rollout.realpath,
+    {
+      sessionId: binding.codex_session_uuid,
+      message,
+      baselineOrdinal,
+    },
+  ));
+  const deliveryFence = validateDeliveryFence(repositoryRoot, evidence.event_id, {
+    queueVersion: evidence.request?.queue_version,
+    requestSha256: evidence.request?.sha256,
+    supervisorId: evidence.supervisor?.supervisor_id,
+    supervisorGeneration: evidence.supervisor?.generation,
+  }, expectedDispatcher);
+  const fencesCurrent = deliveryFence.current
+    && Number.isFinite(nowMs)
+    && decisionFenceCurrent(repositoryRoot, lease, { nowMs })
+    && evidence.repository_realpath === repositoryRoot
+    && evidence.request?.sha256 === sha256(canonicalJson(request))
+    && evidence.request?.queue_version === request.queue_version
+    && evidence.supervisor?.supervisor_id === supervisor.supervisor_id
+    && evidence.supervisor?.generation === supervisor.generation
+    && evidence.dispatcher?.dispatcher_id === lease.owner?.dispatcher_id
+    && evidence.dispatcher?.dispatcher_generation === lease.owner?.dispatcher_generation
+    && sameProcess(evidence.dispatcher?.process, lease.owner?.process)
+    && evidence.activation?.lease_id === lease.lease_id
+    && evidence.activation?.fencing_token === lease.fencing_token
+    && decision.status === 'CLAIMED'
+    && decision.decision_id === evidence.activation?.decision_id
+    && decision.lease_id === lease.lease_id
+    && decision.fencing_token === lease.fencing_token
+    && decision.transport_attempt_id === evidence.transport_attempt_id
+    && decision.delivery_id === evidence.delivery_id
+    && decision.message_sha256 === evidence.message_sha256
+    && binding.repository_realpath === repositoryRoot
+    && binding.supervisor_id === supervisor.supervisor_id
+    && binding.supervisor_generation === supervisor.generation
+    && evidence.session?.binding_sha256 === fileSha256(wake.sessionBinding)
+    && evidence.session?.session_id === binding.codex_session_uuid
+    && evidence.session?.rollout?.realpath === binding.rollout.realpath
+    && evidence.session?.rollout?.device === binding.rollout.device
+    && evidence.session?.rollout?.inode === binding.rollout.inode
+    && rolloutStat.dev === binding.rollout.device
+    && rolloutStat.ino === binding.rollout.inode
+    && Number.isSafeInteger(baselineOrdinal)
+    && canonicalJson(evidence.canonical_argv) === canonicalJson([
+      'codex', 'resume', binding.codex_session_uuid, message,
+    ])
+    && typeof message === 'string'
+    && evidence.message_sha256 === sha256(message)
+    && evidence.transport?.message_sha256 === sha256(message)
+    && currentConfirmation
+    && durableConfirmation
+    && canonicalJson(currentConfirmation) === canonicalJson(durableConfirmation);
+  if (!fencesCurrent) return { committed: false, reason: 'confirmed-delivery-fence-not-current' };
+
+  const receipt = {
+    schema: DELIVERY_SCHEMA,
+    delivery_id: evidence.delivery_id,
+    event_id: request.event_id,
+    queue_version: request.queue_version,
+    supervisor_id: supervisor.supervisor_id,
+    supervisor_generation: supervisor.generation,
+    dispatcher_id: evidence.dispatcher.dispatcher_id,
+    dispatcher_generation: evidence.dispatcher.dispatcher_generation,
+    dispatcher_process: evidence.dispatcher.process,
+    activation_lease_id: lease.lease_id,
+    activation_fencing_token: lease.fencing_token,
+    activation_decision_id: decision.decision_id,
+    codex_session_binding_sha256: evidence.session.binding_sha256,
+    host_kind: binding.host.kind,
+    native_transport: binding.native_wake.transport,
+    codex_session_uuid: binding.codex_session_uuid,
+    message_sha256: evidence.message_sha256,
+    transport_attempt_id: evidence.transport_attempt_id,
+    status: 'CLAIMED',
+    claimed_at: evidence.prepared_at,
+    delivered_at: null,
+    consumed_at: null,
+    failure: null,
+    rollout_confirmation: currentConfirmation,
+    temporary_frontend: {
+      argv: evidence.canonical_argv,
+      process_group: evidence.process?.launcher?.process_group ?? null,
+      cleanup_status: 'PENDING',
+      cleanup_proven: null,
+      cleanup_intervention: null,
+    },
+    transport_evidence: {
+      path: evidencePath,
+      confirmation_sha256: fileSha256(evidencePath),
+      status: 'CONFIRMED_RECEIPT_COMMITTED',
+    },
+  };
+  const committed = commitDeliveredReceipt(repositoryRoot, request, receipt);
+  if (committed.delivered !== true) {
+    const existing = committed.receipt;
+    if (existing?.delivery_id !== receipt.delivery_id
+        || existing?.transport_attempt_id !== evidence.transport_attempt_id
+        || !['DELIVERED', 'CONSUMED'].includes(existing?.status)) {
+      return { committed: false, reason: committed.reason };
+    }
+    return { committed: true, duplicate: true, path: receiptPath(repositoryRoot, request.event_id), receipt: existing };
+  }
+  const deliveredDecision = updateActivationDecision(repositoryRoot, decision, 'DELIVERED');
+  return {
+    committed: true,
+    duplicate: false,
+    path: receiptPath(repositoryRoot, request.event_id),
+    receipt: committed.receipt,
+    decision_updated: deliveredDecision.updated,
+    decision_update_reason: deliveredDecision.updated ? null : deliveredDecision.reason,
+  };
+}
+
+export function updateCommittedWakeCleanup(root, evidencePath, evidence) {
+  const repositoryRoot = realpathSync(root);
+  const durable = readJson(evidencePath);
+  const path = receiptPath(repositoryRoot, durable.event_id);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const receipt = readJson(path);
+    if (!['DELIVERED', 'CONSUMED'].includes(receipt.status)
+        || receipt.delivery_id !== durable.delivery_id
+        || receipt.transport_attempt_id !== durable.transport_attempt_id
+        || receipt.event_id !== evidence.event_id
+        || evidence.delivery_receipt?.committed !== true) {
+      return { updated: false, reason: 'delivery-receipt-cleanup-fence-mismatch' };
+    }
+    if (['PROVEN', 'INTERVENTION_REQUIRED'].includes(receipt.temporary_frontend?.cleanup_status)) {
+      return { updated: true, duplicate: true, receipt };
+    }
+    const expected = sha256(canonicalJson(receipt));
+    const cleanup = evidence.cleanup ?? {};
+    const cleanupProven = transportCleanupEvidenceComplete(cleanup);
+    receipt.temporary_frontend = {
+      argv: evidence.canonical_argv,
+      process_group: cleanup.process_group ?? null,
+      launcher_exit_observed: cleanup.launcher_exit_observed === true,
+      frontend_exit_observed: cleanup.frontend_exit_observed === true,
+      tracked_process_groups: cleanup.tracked_process_groups ?? [],
+      frontend_process_groups: cleanup.frontend_process_groups ?? [],
+      signaled_process_groups: cleanup.signaled_process_groups ?? [],
+      process_group_member_counts: cleanup.process_group_member_counts ?? [],
+      process_group_member_count: cleanup.process_group_member_count ?? -1,
+      duplicate_frontend_count: cleanup.duplicate_frontend_count ?? -1,
+      invalid_frontend_identity_count: cleanup.invalid_frontend_identity_count ?? -1,
+      blocked_process_groups: cleanup.blocked_process_groups ?? [],
+      authoritative_host_process_group: cleanup.authoritative_host_process_group ?? null,
+      authoritative_host_signaled: cleanup.authoritative_host_signaled === true,
+      authoritative_host_continuity_proven: cleanup.authoritative_host_continuity_proven === true,
+      cleanup_status: cleanupProven ? 'PROVEN' : 'INTERVENTION_REQUIRED',
+      cleanup_proven: cleanupProven,
+      cleanup_intervention: cleanupProven ? null : {
+        reason: 'temporary-process-group-cleanup-unproven-after-delivery',
+        blocked_process_groups: cleanup.blocked_process_groups ?? [],
+        process_group_member_count: cleanup.process_group_member_count ?? -1,
+        duplicate_frontend_count: cleanup.duplicate_frontend_count ?? -1,
+        invalid_frontend_identity_count: cleanup.invalid_frontend_identity_count ?? -1,
+      },
+    };
+    receipt.transport_evidence = {
+      ...receipt.transport_evidence,
+      path: evidencePath,
+      cleanup_sha256: fileSha256(evidencePath),
+      status: cleanupProven ? 'CONFIRMED_AND_CLEANED' : 'DELIVERED_CLEANUP_INTERVENTION_REQUIRED',
+    };
+    receipt.cleanup_updated_at = now();
+    const updated = atomicCompareAndSwapJson(path, expected, receipt);
+    if (updated.swapped) return { updated: true, duplicate: false, receipt };
+    if (updated.reason !== 'cas-content-changed') return { updated: false, reason: updated.reason };
+  }
+  return { updated: false, reason: 'delivery-receipt-cleanup-cas-raced' };
+}
+
+function transportCleanupEvidenceComplete(cleanup) {
+  return cleanup?.cleanup_proven === true
+    && cleanup.launcher_exit_observed === true
+    && cleanup.frontend_exit_observed === true
+    && Number.isSafeInteger(cleanup.process_group)
+    && cleanup.process_group > 0
+    && positiveSortedProcessGroups(cleanup.tracked_process_groups)
+    && cleanup.tracked_process_groups.includes(cleanup.process_group)
+    && positiveSortedProcessGroups(cleanup.frontend_process_groups, { allowEmpty: true })
+    && cleanup.frontend_process_groups.every((group) => (
+      cleanup.tracked_process_groups.includes(group)
+    ))
+    && positiveSortedProcessGroups(cleanup.signaled_process_groups, { allowEmpty: true })
+    && cleanup.signaled_process_groups.every((group) => (
+      cleanup.tracked_process_groups.includes(group)
+    ))
+    && Array.isArray(cleanup.process_group_member_counts)
+    && cleanup.process_group_member_counts.length === cleanup.tracked_process_groups.length
+    && cleanup.process_group_member_counts.every((entry, index) => (
+      entry?.process_group === cleanup.tracked_process_groups[index]
+      && entry?.member_count === 0
+    ))
+    && cleanup.process_group_member_count === 0
+    && cleanup.duplicate_frontend_count === 0
+    && cleanup.invalid_frontend_identity_count === 0
+    && Array.isArray(cleanup.blocked_process_groups)
+    && cleanup.blocked_process_groups.length === 0
+    && Number.isSafeInteger(cleanup.authoritative_host_process_group)
+    && cleanup.authoritative_host_process_group > 0
+    && !cleanup.tracked_process_groups.includes(cleanup.authoritative_host_process_group)
+    && cleanup.authoritative_host_signaled === false
+    && cleanup.authoritative_host_continuity_proven === true;
+}
+
+function reconcileLateConfirmation(root, request, deliveryFence, bindingStatus, dispatcher) {
+  const decisionPath = activationDecisionPath(root, request.event_id);
+  const decision = readOptional(decisionPath);
+  if (!['CLAIMED', 'UNCERTAIN', 'DELIVERED'].includes(decision?.status)
+      || typeof decision.transport_attempt_id !== 'string') return null;
+  const evidencePath = transportAttemptPath(root, decision.transport_attempt_id);
+  const evidence = readOptional(evidencePath);
+  const binding = bindingStatus.binding;
+  if (!evidence
+      || evidence.event_id !== request.event_id
+      || evidence.request?.sha256 !== deliveryFence.requestSha256
+      || evidence.request?.queue_version !== deliveryFence.queueVersion
+      || evidence.delivery_id == null
+      || evidence.activation?.decision_id !== decision.decision_id
+      || evidence.activation?.fencing_token !== decision.fencing_token
+      || evidence.supervisor?.supervisor_id !== binding.supervisor_id
+      || evidence.supervisor?.generation !== binding.supervisor_generation
+      || evidence.session?.binding_sha256 !== fileSha256(directories(root).sessionBinding)
+      || evidence.session?.session_id !== binding.codex_session_uuid
+      || evidence.session?.rollout?.realpath !== binding.rollout.realpath
+      || evidence.session?.rollout?.device !== binding.rollout.device
+      || evidence.session?.rollout?.inode !== binding.rollout.inode
+      || !transportCleanupEvidenceComplete(evidence.cleanup)) return null;
+  if (!dispatcher
+      || evidence.dispatcher?.dispatcher_id !== dispatcher.dispatcher_id
+      || evidence.dispatcher?.dispatcher_generation !== dispatcher.dispatcher_generation
+      || !sameProcess(evidence.dispatcher?.process, dispatcher.process)
+      || !dispatcherFence(root, dispatcher).current) {
+    return {
+      classification: 'stale-generation',
+      reason: 'late-confirmation-dispatcher-fence-not-current',
+      delivered: false,
+      replayed: false,
+    };
+  }
+  const message = evidence.canonical_argv?.[3];
+  const baselineOrdinal = evidence.transport?.baseline_ordinal;
+  if (canonicalJson(evidence.canonical_argv) !== canonicalJson([
+    'codex', 'resume', binding.codex_session_uuid, message,
+  ])
+      || typeof message !== 'string'
+      || sha256(message) !== decision.message_sha256
+      || evidence.message_sha256 !== decision.message_sha256
+      || !Number.isSafeInteger(baselineOrdinal)) return null;
+  let confirmation;
+  try {
+    confirmation = rolloutConfirmation(binding.rollout.realpath, {
+      sessionId: binding.codex_session_uuid,
+      message,
+      baselineOrdinal,
+    });
+  } catch (error) {
+    return {
+      classification: 'uncertain',
+      reason: `late-rollout-evidence-unreadable: ${error.message}`,
+      delivered: false,
+      replayed: false,
+    };
+  }
+  if (!confirmation) return null;
+  if (confirmation.classification !== 'confirmed') {
+    return {
+      classification: 'uncertain',
+      reason: confirmation.reason,
+      delivered: false,
+      replayed: false,
+    };
+  }
+  const currentFence = validateDeliveryFence(
+    root,
+    request.event_id,
+    deliveryFence,
+    dispatcher,
+  );
+  if (!currentFence.current) {
+    return {
+      classification: 'stale-generation',
+      reason: `${currentFence.reason}-during-late-confirmation`,
+      delivered: false,
+      replayed: false,
+    };
+  }
+  evidence.rollout_confirmation = {
+    accepted_ordinal: confirmation.accepted_ordinal,
+    accepted_record_sha256: confirmation.accepted_record_sha256,
+    turn_began_ordinal: confirmation.turn_began_ordinal,
+    turn_began_record_sha256: confirmation.turn_began_record_sha256,
+    turn_id: confirmation.turn_id,
+    turn_started_at_ms: confirmation.turn_started_at_ms,
+  };
+  evidence.confirmation_absence = null;
+  evidence.status = 'LATE_CONFIRMED_AFTER_CLEANUP';
+  evidence.timestamps ??= {};
+  evidence.timestamps.late_confirmation_checkpointed_at = now();
+  writeJson(evidencePath, evidence);
+
+  const current = readJson(decisionPath);
+  if (current.decision_id !== decision.decision_id
+      || current.transport_attempt_id !== decision.transport_attempt_id
+      || !['CLAIMED', 'UNCERTAIN', 'DELIVERED'].includes(current.status)) {
+    return {
+      classification: 'uncertain',
+      reason: 'activation-decision-fence-mismatch-during-late-confirmation',
+      delivered: false,
+      replayed: false,
+    };
+  }
+  if (current.status !== 'DELIVERED') {
+    const expected = sha256(canonicalJson(current));
+    current.status = 'DELIVERED';
+    current.delivered_at = now();
+    current.failure = null;
+    current.late_confirmation = true;
+    const updated = atomicCompareAndSwapJson(decisionPath, expected, current);
+    if (!updated.swapped) {
+      return {
+        classification: 'uncertain',
+        reason: updated.reason ?? 'activation-decision-cas-raced-during-late-confirmation',
+        delivered: false,
+        replayed: false,
+      };
+    }
+  }
+  const cleanup = evidence.cleanup;
+  const receipt = {
+    schema: DELIVERY_SCHEMA,
+    delivery_id: evidence.delivery_id,
+    event_id: request.event_id,
+    queue_version: request.queue_version,
+    supervisor_id: binding.supervisor_id,
+    supervisor_generation: binding.supervisor_generation,
+    dispatcher_id: evidence.dispatcher.dispatcher_id,
+    dispatcher_generation: evidence.dispatcher.dispatcher_generation,
+    dispatcher_process: evidence.dispatcher.process,
+    activation_lease_id: evidence.activation.lease_id,
+    activation_fencing_token: evidence.activation.fencing_token,
+    activation_decision_id: evidence.activation.decision_id,
+    codex_session_binding_sha256: evidence.session.binding_sha256,
+    host_kind: binding.host.kind,
+    native_transport: binding.native_wake.transport,
+    codex_session_uuid: binding.codex_session_uuid,
+    message_sha256: evidence.message_sha256,
+    transport_attempt_id: evidence.transport_attempt_id,
+    status: 'CLAIMED',
+    claimed_at: evidence.prepared_at,
+    delivered_at: null,
+    consumed_at: null,
+    failure: null,
+    late_confirmation: true,
+    rollout_confirmation: evidence.rollout_confirmation,
+    temporary_frontend: {
+      argv: evidence.canonical_argv,
+      process_group: cleanup.process_group,
+      launcher_exit_observed: cleanup.launcher_exit_observed,
+      frontend_exit_observed: cleanup.frontend_exit_observed,
+      tracked_process_groups: cleanup.tracked_process_groups,
+      frontend_process_groups: cleanup.frontend_process_groups,
+      signaled_process_groups: cleanup.signaled_process_groups,
+      process_group_member_counts: cleanup.process_group_member_counts,
+      process_group_member_count: cleanup.process_group_member_count,
+      duplicate_frontend_count: cleanup.duplicate_frontend_count,
+      invalid_frontend_identity_count: cleanup.invalid_frontend_identity_count,
+      authoritative_host_process_group: cleanup.authoritative_host_process_group,
+      authoritative_host_signaled: cleanup.authoritative_host_signaled,
+      cleanup_proven: cleanup.cleanup_proven,
+      authoritative_host_continuity_proven: cleanup.authoritative_host_continuity_proven,
+    },
+    transport_evidence: {
+      path: evidencePath,
+      sha256: fileSha256(evidencePath),
+      status: evidence.status,
+    },
+  };
+  return commitDeliveredReceipt(root, request, receipt);
+}
+
 export function deliverWake(root, eventId, {
   nativeTransport = null,
   bindingDependencies = {},
@@ -978,12 +1523,22 @@ export function deliverWake(root, eventId, {
     return { classification: 'queued', reason: 'crash-uncertain-delivery-claim', receipt: existing, replayed: false };
   }
   const supervisor = readJson(paths(root).supervisor);
+  const bindingStatus = codexSessionBindingStatus(root, { dependencies: bindingDependencies });
+  if (bindingStatus.valid && bindingStatus.supported) {
+    const reconciled = reconcileLateConfirmation(
+      root,
+      request,
+      deliveryFence,
+      bindingStatus,
+      dispatcher,
+    );
+    if (reconciled) return reconciled;
+  }
   const lifecycle = classifyQueuedWake(root, request, supervisor);
   if (lifecycle.classification !== 'queued'
       || lifecycle.reason !== 'awaiting-supported-native-transport') {
     return { ...lifecycle, event_id: eventId, delivered: false };
   }
-  const bindingStatus = codexSessionBindingStatus(root, { dependencies: bindingDependencies });
   if (!bindingStatus.valid) {
     return {
       classification: 'queued',
@@ -1036,8 +1591,41 @@ export function deliverWake(root, eventId, {
   }
   const lease = leaseResult.lease;
   const message = constructWakeMessage(eventId, supervisor.generation);
+  let rolloutActivity;
+  try {
+    rolloutActivity = boundRolloutActivity(bindingStatus.binding.rollout.realpath);
+  } catch (error) {
+    rolloutActivity = { classification: 'unknown', reason: error.message };
+  }
+  if (rolloutActivity.classification === 'busy') {
+    const busyClaim = claimActivationDecision(root, eventId, lease, {
+      message,
+      nowMs: getActivationNowMs(),
+    });
+    if (busyClaim.claimed) {
+      updateActivationDecision(
+        root,
+        busyClaim.decision,
+        'BUSY',
+        `bound-rollout-known-busy-at-ordinal-${rolloutActivity.latest_ordinal}`,
+      );
+    }
+    releaseActivationLease(root, lease);
+    return {
+      classification: 'busy',
+      reason: 'bound-rollout-known-busy-before-transport',
+      rollout_activity: rolloutActivity,
+      event_id: eventId,
+      delivered: false,
+      replayed: false,
+    };
+  }
+  const transportAttemptId = id('transport-attempt');
+  const deliveryId = id('delivery');
   const claim = claimActivationDecision(root, eventId, lease, {
     message,
+    transportAttemptId,
+    deliveryId,
     nowMs: getActivationNowMs(),
   });
   if (!claim.claimed) {
@@ -1057,7 +1645,7 @@ export function deliverWake(root, eventId, {
   }
   const receipt = {
     schema: DELIVERY_SCHEMA,
-    delivery_id: id('delivery'),
+    delivery_id: deliveryId,
     event_id: eventId,
     queue_version: queueVersion,
     supervisor_id: supervisor.supervisor_id,
@@ -1073,12 +1661,72 @@ export function deliverWake(root, eventId, {
     native_transport: bindingStatus.binding.native_wake.transport,
     codex_session_uuid: bindingStatus.binding.codex_session_uuid,
     message_sha256: sha256(message),
+    transport_attempt_id: transportAttemptId,
     status: 'CLAIMED',
     claimed_at: now(),
     delivered_at: null,
     consumed_at: null,
     failure: null,
   };
+  const transportEvidencePath = transportAttemptPath(root, transportAttemptId);
+  const transportAttempt = {
+    schema: 'opsle.durable-supervisor.codex-resume-transport-attempt/v1',
+    transport_attempt_id: transportAttemptId,
+    status: 'PREPARED',
+    prepared_at: now(),
+    repository_realpath: bindingStatus.binding.repository_realpath,
+    event_id: eventId,
+    request: {
+      schema: request.schema,
+      queue_version: queueVersion,
+      sha256: deliveryFence.requestSha256,
+      task_id: request.task_id,
+      attempt_id: request.attempt_id,
+      wait_id: request.wait_id,
+    },
+    delivery_id: deliveryId,
+    dispatcher: {
+      dispatcher_id: dispatcher?.dispatcher_id ?? lease.owner.dispatcher_id,
+      dispatcher_generation: dispatcher?.dispatcher_generation
+        ?? lease.owner.dispatcher_generation,
+      process: dispatcher?.process ?? lease.owner.process,
+    },
+    supervisor: {
+      supervisor_id: supervisor.supervisor_id,
+      generation: supervisor.generation,
+    },
+    activation: {
+      lease_id: lease.lease_id,
+      fencing_token: lease.fencing_token,
+      decision_id: claim.decision.decision_id,
+    },
+    session: {
+      binding_sha256: receipt.codex_session_binding_sha256,
+      session_id: bindingStatus.binding.codex_session_uuid,
+      rollout: {
+        realpath: bindingStatus.binding.rollout.realpath,
+        device: bindingStatus.binding.rollout.device,
+        inode: bindingStatus.binding.rollout.inode,
+        baseline_ordinal: rolloutActivity.latest_ordinal,
+      },
+    },
+    canonical_argv: [
+      'codex', 'resume', bindingStatus.binding.codex_session_uuid, message,
+    ],
+    message_sha256: sha256(message),
+    confirmation_absence: 'native-transport-not-started',
+    rollout_confirmation: null,
+  };
+  if (!atomicCreateJson(transportEvidencePath, transportAttempt)) {
+    updateActivationDecision(root, claim.decision, 'UNCERTAIN', 'transport-attempt-identity-collision');
+    releaseActivationLease(root, lease);
+    return {
+      classification: 'uncertain',
+      reason: 'transport-attempt-identity-collision',
+      delivered: false,
+      replayed: false,
+    };
+  }
   const finalFence = validateDeliveryFence(root, eventId, deliveryFence, dispatcher);
   const finalLeaseFenceCurrent = decisionFenceCurrent(root, lease, {
     nowMs: getActivationNowMs(),
@@ -1102,7 +1750,38 @@ export function deliverWake(root, eventId, {
       generation: supervisor.generation,
       message,
       binding: bindingStatus.binding,
+      transport_attempt_id: transportAttemptId,
+      transport_attempt_path: transportEvidencePath,
     });
+    const observedAttempt = readJson(transportEvidencePath);
+    observedAttempt.wakeup_observed_at = now();
+    observedAttempt.wakeup_result = {
+      classification: committed?.classification ?? null,
+      reason: committed?.reason ?? null,
+    };
+    writeJson(transportEvidencePath, observedAttempt);
+    const durableTransportEvidence = readJson(transportEvidencePath);
+    const preCleanupReceipt = readOptional(existingPath);
+    if (preCleanupReceipt
+        && ['DELIVERED', 'CONSUMED'].includes(preCleanupReceipt.status)
+        && preCleanupReceipt.delivery_id === deliveryId
+        && preCleanupReceipt.transport_attempt_id === transportAttemptId
+        && preCleanupReceipt.activation_decision_id === claim.decision.decision_id) {
+      const currentDecision = readJson(activationDecisionPath(root, eventId));
+      if (currentDecision.status === 'CLAIMED') {
+        updateActivationDecision(root, claim.decision, 'DELIVERED');
+      }
+      releaseActivationLease(root, lease);
+      return {
+        classification: 'native-delivered',
+        reason: preCleanupReceipt.temporary_frontend?.cleanup_status === 'INTERVENTION_REQUIRED'
+          ? 'supported-native-session-transport-cleanup-intervention-required'
+          : 'supported-native-session-transport',
+        receipt: readJson(existingPath),
+        delivered: true,
+        transport_attempt_id: transportAttemptId,
+      };
+    }
     if (['busy', 'rejected'].includes(committed?.classification)) {
       updateActivationDecision(root, claim.decision, 'BUSY', committed.reason);
       releaseActivationLease(root, lease);
@@ -1116,6 +1795,7 @@ export function deliverWake(root, eventId, {
         reason: committed.reason,
         delivered: false,
         replayed: false,
+        transport_attempt_id: transportAttemptId,
       };
     }
     const confirmationComplete = Number.isSafeInteger(committed?.accepted_ordinal)
@@ -1156,10 +1836,37 @@ export function deliverWake(root, eventId, {
       && committed.authoritative_host_process_group > 0
       && !committed.tracked_process_groups.includes(committed.authoritative_host_process_group)
       && committed?.authoritative_host_signaled === false;
+    const confirmationDurablyPrecedesCleanup = committed?.transport_attempt_id == null || (
+      durableTransportEvidence.transport_attempt_id === transportAttemptId
+      && durableTransportEvidence.event_id === eventId
+      && durableTransportEvidence.delivery_id === deliveryId
+      && durableTransportEvidence.activation?.decision_id === claim.decision.decision_id
+      && durableTransportEvidence.session?.session_id
+        === bindingStatus.binding.codex_session_uuid
+      && durableTransportEvidence.session?.rollout?.realpath
+        === bindingStatus.binding.rollout.realpath
+      && durableTransportEvidence.message_sha256 === sha256(message)
+      && canonicalJson(durableTransportEvidence.canonical_argv) === canonicalJson([
+        'codex', 'resume', bindingStatus.binding.codex_session_uuid, message,
+      ])
+      && durableTransportEvidence.rollout_confirmation?.accepted_ordinal
+        === committed?.accepted_ordinal
+      && durableTransportEvidence.rollout_confirmation?.accepted_record_sha256
+        === committed?.accepted_record_sha256
+      && durableTransportEvidence.rollout_confirmation?.turn_began_ordinal
+        === committed?.turn_began_ordinal
+      && durableTransportEvidence.rollout_confirmation?.turn_began_record_sha256
+        === committed?.turn_began_record_sha256
+      && typeof durableTransportEvidence.timestamps?.confirmation_checkpointed_at === 'string'
+      && typeof durableTransportEvidence.timestamps?.cleanup_started_at === 'string'
+      && durableTransportEvidence.timestamps.confirmation_checkpointed_at
+        <= durableTransportEvidence.timestamps.cleanup_started_at
+    );
     if (committed?.classification !== 'confirmed'
         || committed.cleanup_proven !== true
         || committed.authoritative_host_continuity_proven !== true
-        || !confirmationComplete) {
+        || !confirmationComplete
+        || !confirmationDurablyPrecedesCleanup) {
       updateActivationDecision(root, claim.decision, 'UNCERTAIN', committed?.reason ?? 'native transport confirmation or cleanup unproven');
       releaseActivationLease(root, lease);
       return {
@@ -1167,6 +1874,7 @@ export function deliverWake(root, eventId, {
         reason: committed?.reason ?? 'native-transport-confirmation-or-cleanup-unproven',
         delivered: false,
         replayed: false,
+        transport_attempt_id: transportAttemptId,
       };
     }
     receipt.rollout_confirmation = {
@@ -1193,6 +1901,11 @@ export function deliverWake(root, eventId, {
       authoritative_host_signaled: committed.authoritative_host_signaled,
       cleanup_proven: committed.cleanup_proven,
       authoritative_host_continuity_proven: committed.authoritative_host_continuity_proven,
+    };
+    receipt.transport_evidence = {
+      path: transportEvidencePath,
+      sha256: fileSha256(transportEvidencePath),
+      status: readJson(transportEvidencePath).status,
     };
     const postTransportFence = validateDeliveryFence(
       root,
@@ -1236,54 +1949,8 @@ export function deliverWake(root, eventId, {
       replayed: false,
     };
   }
-  receipt.status = 'DELIVERED';
-  receipt.delivered_at = now();
-  if (!atomicCreateJson(existingPath, receipt)) {
-    releaseActivationLease(root, lease);
-    return { classification: 'duplicate', reason: 'event-already-delivered', receipt: readJson(existingPath), delivered: false };
-  }
   releaseActivationLease(root, lease);
-  const state = readJson(paths(root).state);
-  if (!state.pause?.active || state.pause.after_current) updateState(root, { supervisor_state: 'ACTIVE' });
-  const attemptPath = join(paths(root).attempts, `${request.attempt_id}.json`);
-  if (existsSync(attemptPath)) {
-    const attempt = readJson(attemptPath);
-    if (attempt.telemetry?.activation_counts) {
-      attempt.telemetry.activation_counts = {
-        evidence: 'durable-host-delivery',
-        total_automatic: 1,
-        terminal_event: 1,
-        human: attempt.telemetry.activation_counts.human,
-        wait_induced_automatic: 0,
-      };
-      writeJson(attemptPath, attempt);
-    }
-  }
-  emit(root, 'SUPERVISOR_ACTIVATION', {
-    classification: 'terminal-event',
-    automatic: true,
-    cause_event_id: eventId,
-    task_id: request.task_id,
-    attempt_id: request.attempt_id,
-    wait_id: request.wait_id,
-    delivery_id: receipt.delivery_id,
-  });
-  emit(root, 'SUPERVISOR_REACTIVATED', {
-    cause_event_id: eventId,
-    task_id: request.task_id,
-    attempt_id: request.attempt_id,
-    classification: 'terminal-event',
-    delivery_id: receipt.delivery_id,
-    resulting_state: state.pause?.active && !state.pause.after_current ? 'PAUSED' : 'ACTIVE',
-  });
-  emit(root, 'HOST_WAKE_DELIVERED', {
-    source_event_id: eventId,
-    delivery_id: receipt.delivery_id,
-    queue_version: queueVersion,
-    native_transport: receipt.native_transport,
-    codex_session_uuid: receipt.codex_session_uuid,
-  });
-  return { classification: 'native-delivered', reason: 'supported-native-session-transport', receipt, delivered: true };
+  return commitDeliveredReceipt(root, request, receipt);
 }
 
 export function consumeWakeDelivery(root, eventId, { deliveryId, generation }) {
@@ -1719,8 +2386,12 @@ export async function runWakeDispatcher(root, {
       result.classification === 'uncertain'
       || result.reason?.includes('uncertain')
     ))) {
-      opportunity.close();
-      return { status: 'OWNED', reason: 'delivery-not-replayable', results };
+      let signal;
+      try { signal = await opportunity.wait(); } finally { opportunity.close(); }
+      if (signal.type !== 'bound-rollout-state-change') {
+        return { status: 'OWNED', reason: 'late-confirmation-observation-unavailable', results };
+      }
+      continue;
     }
     if (results.some((result) => result.classification === 'busy')) {
       let signal;

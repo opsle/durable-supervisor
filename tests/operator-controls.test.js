@@ -25,6 +25,7 @@ import {
   emit,
   initialize,
   paths,
+  setRequirements,
   updateState,
   validateDurableState,
 } from '../src/state.js';
@@ -120,6 +121,17 @@ function runCli(root, args) {
 function eventLines(root) {
   const value = readFileSync(paths(root).eventsLog, 'utf8').trim();
   return value ? value.split('\n').map((line) => JSON.parse(line)) : [];
+}
+
+function satisfyFixtureRequirements(root) {
+  const requirements = readJson(paths(root).requirements).requirements
+    .filter((requirement) => ![
+      'VERIFIED',
+      'DEFERRED_WITH_JUSTIFICATION',
+      'NOT_APPLICABLE_WITH_JUSTIFICATION',
+    ].includes(requirement.state))
+    .map((requirement) => requirement.id);
+  if (requirements.length > 0) setRequirements(root, requirements, 'VERIFIED');
 }
 
 async function waitFor(check, message, timeoutMs = 2000) {
@@ -252,6 +264,7 @@ test('terminal next action is derived, validated, and reopened by objective revi
   const root = fixture();
   try {
     const p = paths(root);
+    satisfyFixtureRequirements(root);
     updateState(root, {
       phase: 'COMPLETE',
       pending_next_action: 'Select the next unsatisfied requirement slice.',
@@ -289,6 +302,7 @@ test('accepted task cannot recreate an automatic next action after terminal comp
   const root = fixture();
   try {
     const p = paths(root);
+    satisfyFixtureRequirements(root);
     updateState(root, { phase: 'COMPLETE', pending_next_action: null });
     const task = createTask(root, handoff('task-terminal-acceptance', { requirement_ids: [] }));
     const decision = routeTask(root, task);
