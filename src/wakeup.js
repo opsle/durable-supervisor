@@ -2402,7 +2402,20 @@ export async function runWakeDispatcher(root, {
       continue;
     }
     opportunity.close();
+    // Replace observation before rescanning so a request created during the
+    // drain is either found now or signals the already registered watcher.
     const nextObservation = registerObservation(root);
+    let nextQueued;
+    try {
+      nextQueued = receiptFreeRequests(root);
+    } catch (error) {
+      nextObservation.close();
+      throw error;
+    }
+    if (nextQueued.length > 0) {
+      nextObservation.close();
+      continue;
+    }
     try { await nextObservation.wait(); } finally { nextObservation.close(); }
   }
   return { status: 'OWNED', reason: 'dispatcher-loop-ended' };

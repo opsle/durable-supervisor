@@ -2101,6 +2101,62 @@ test('busy-before-acceptance remains queued and dispatcher retry follows an obse
   }
 });
 
+test('dispatcher rechecks the queue after replacing its post-drain observation', async () => {
+  const root = fixture();
+  try {
+    const firstEvent = terminalEvent(root, 'drain-resubscribe-first');
+    enqueueTerminalWake(root, firstEvent);
+    const owner = processIdentity(process.pid);
+    const dispatcher = stageDispatcher(root, {
+      pid: owner.pid,
+      startTime: owner.start_time_ticks,
+    });
+    dispatcher.process.executable = owner.executable;
+    writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
+    let gapEvent;
+    let observationRegistrations = 0;
+    let observationWaits = 0;
+    let opportunityCloses = 0;
+    const result = await runWakeDispatcher(root, {
+      dispatcherId: dispatcher.dispatcher_id,
+      dispatcherGeneration: dispatcher.dispatcher_generation,
+      launchNonce: dispatcher.launch_nonce,
+      pid: dispatcher.process.pid,
+      getProcessIdentity: () => dispatcher.process,
+      registerObservation: () => {
+        observationRegistrations += 1;
+        return {
+          close() {},
+          wait: async () => {
+            observationWaits += 1;
+            throw new Error('dispatcher slept with receipt-free work queued');
+          },
+        };
+      },
+      observeBoundRollout: () => ({
+        close: () => {
+          opportunityCloses += 1;
+          if (opportunityCloses === 1) {
+            // Insert after the first batch drain and before its replacement
+            // queue observation is registered.
+            gapEvent = terminalEvent(root, 'drain-resubscribe-gap');
+            enqueueTerminalWake(root, gapEvent);
+          }
+        },
+        wait: async () => ({ type: 'bound-rollout-state-change' }),
+      }),
+      maxCycles: 2,
+    });
+    assert.equal(result.reason, 'test-cycle-limit');
+    assert.equal(observationRegistrations, 3);
+    assert.equal(observationWaits, 0);
+    assert.ok(gapEvent);
+    assert.ok(result.results.some((entry) => entry.event_id === gapEvent.event_id));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('uncertain dispatcher delivery is not replayed while late confirmation gets one opportunity', async () => {
   const root = fixture();
   try {
