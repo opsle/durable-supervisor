@@ -19,6 +19,7 @@ import {
   sha256,
   writeJson,
 } from './io.js';
+import { supervisorRoutingDecisionErrors } from './supervisor-routing.js';
 
 export const OPSLE_SCHEMA = 'opsle.durable-supervisor';
 export const VALID_SUPERVISOR_STATES = new Set(['ACTIVE', 'DORMANT', 'PAUSED']);
@@ -146,6 +147,7 @@ export const paths = (root) => {
     raw: join(opsle, 'evidence', 'raw'),
     compact: join(opsle, 'evidence', 'compact'),
     audit: join(opsle, 'evidence', 'repository-audit.json'),
+    supervisorRouting: join(opsle, 'supervisor-routing'),
   };
 };
 
@@ -185,7 +187,9 @@ export function initialize(root, { actor = 'bootstrap-codex' } = {}) {
   if (!existsSync(p.specification) || !existsSync(p.requirements)) {
     throw new Error('DS-000 durable specification and requirements matrix must exist first');
   }
-  for (const directory of [p.tasks, p.attempts, p.claims, p.events, p.raw, p.compact]) {
+  for (const directory of [
+    p.tasks, p.attempts, p.claims, p.events, p.raw, p.compact, p.supervisorRouting,
+  ]) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
   }
   if (existsSync(p.supervisor)) {
@@ -348,6 +352,15 @@ export function validateDurableState(root) {
     && state.pending_next_action !== null
   ) {
     errors.push('complete state with no unsatisfied requirements must not have a pending next action');
+  }
+  if (existsSync(p.supervisorRouting)) {
+    for (const file of readdirSync(p.supervisorRouting).filter((name) => name.endsWith('.json'))) {
+      const decision = readJson(join(p.supervisorRouting, file));
+      const decisionErrors = supervisorRoutingDecisionErrors(decision);
+      for (const error of decisionErrors) {
+        errors.push(`invalid supervisor routing decision in ${file}: ${error}`);
+      }
+    }
   }
   for (const file of readdirSync(p.attempts).filter((name) => name.endsWith('.json'))) {
     const attempt = readJson(join(p.attempts, file));

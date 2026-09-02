@@ -20,6 +20,16 @@ This repository uses Durable Supervisor V0.1.
   dispatch must retain events without `codex resume` or terminal input.
 - New bounded work after cutover must use task handoff, discovery, Gearbox,
   claims, Runner, Context Firewall, Acceptance, and supervisor evaluation.
+- The persistent supervisor must run repository-local capability Discovery and
+  persist an exact supervisor Gearbox decision before reading, loading, or
+  invoking any optional skill or tool. Category matching for code, Codex, or
+  OpenAI topics is non-authoritative: it never selects Graphify, OpenAI Docs,
+  web, plugins, MCP, subagents, or another optional capability. Discovery may
+  identify or stat an advertised capability, but must not read its instructions.
+  Narrow repository/source analysis defaults to direct deterministic inspection;
+  optional routes fail closed unless the current durable decision selects them
+  exactly. Platform safety mandates remain authoritative and are not optional
+  routes. This supervisor-local contract is separate from child route isolation.
 - Do not modify sibling repositories, deploy, merge, or broaden child authority.
 - Keep operator commands mobile-safe: use short invocations and never depend on
   visual line wrapping.

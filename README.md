@@ -104,6 +104,13 @@ The boundaries are deliberate:
   web/MCP/plugin/subagent/review/fallback permissions. New artifacts use exact
   route v2, Gearbox decision v3, and policy snapshot v3; historical snapshots
   retain validation under their immutable schema contract.
+- Persistent-supervisor optional routing is a separate durable boundary in
+  `src/supervisor-routing.js`. Discovery records advertised availability using
+  metadata only. A current exact decision is required before any optional skill
+  instruction read or capability invocation; static subject/category matches
+  are non-authoritative. Narrow source analysis selects direct deterministic
+  inspection by default, while OpenAI Docs and web require an exact current-
+  external-documentation route. Unselected optional capabilities fail closed.
 - Every task has bounded authorization, required evidence, acceptance criteria,
   and prohibited actions.
 - Claims and monotonically increasing fence generations prevent an obvious

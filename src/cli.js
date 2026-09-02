@@ -32,6 +32,11 @@ import {
   routeTask,
 } from './pipeline.js';
 import { launchDetachedAttempt, runAttempt } from './runner.js';
+import {
+  loadSelectedSupervisorSkillInstructions,
+  readSupervisorRoutingDecision,
+  selectSupervisorRoute,
+} from './supervisor-routing.js';
 import { activationSummary } from './activation-telemetry.js';
 import {
   adoptCodexSessionBinding,
@@ -82,6 +87,9 @@ commands:
   session adopt
   telemetry import-activation-profile --input FILE
   supervisor session-name|start|attach|is-alive
+  supervisor route select --input FILE
+  supervisor route show DECISION_ID
+  supervisor route load-skill DECISION_ID --skill SKILL_ID
 `;
 }
 
@@ -1102,6 +1110,34 @@ export async function main(args) {
     return;
   }
   if (command === 'supervisor') {
+    if (subcommand === 'route') {
+      const action = rest[0];
+      if (action === 'select') {
+        const input = valueAfter(rest, '--input');
+        if (!input) throw new Error('supervisor route select requires --input FILE');
+        const decision = selectSupervisorRoute(root, readJson(input));
+        emit(root, 'SUPERVISOR_GEARBOX_ROUTED', {
+          decision_id: decision.decision_id,
+          task_id: decision.subject.task_id,
+          objective_id: decision.subject.objective_id,
+          route: decision.selected_route.execution_route,
+          selected_tool: decision.selected_route.selected_tool,
+          selected_skill: decision.selected_skill,
+        });
+        print(decision);
+      } else if (action === 'show') {
+        print(readSupervisorRoutingDecision(root, rest[1]));
+      } else if (action === 'load-skill') {
+        const skill = valueAfter(rest, '--skill');
+        if (!rest[1] || !skill) {
+          throw new Error('supervisor route load-skill requires DECISION_ID --skill SKILL_ID');
+        }
+        print(loadSelectedSupervisorSkillInstructions(root, rest[1], skill));
+      } else {
+        throw new Error('supervisor route requires select, show, or load-skill');
+      }
+      return;
+    }
     const name = tmuxName(root);
     if (subcommand === 'session-name') print(name);
     else if (subcommand === 'is-alive') {

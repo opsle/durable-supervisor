@@ -51,6 +51,57 @@ Activation telemetry reports terminal-event, human, and wait-induced automatic
 counts. A value is `unknown` when complete trajectory evidence is absent. The
 legacy polling-zero field is not accepted as evidence of zero inference.
 
+## Select supervisor-local optional capabilities
+
+The persistent supervisor has a pre-tool invariant separate from child routing.
+Before it reads, loads, or invokes any optional skill or tool, it must perform
+advertisement/metadata-only Discovery and persist an exact repository Gearbox
+decision under `.opsle/supervisor-routing/`. Static platform category matching
+for code, Codex, OpenAI, or documentation is non-authoritative. It cannot select
+Graphify, OpenAI Docs, web, plugins, MCP, subagents, or any other optional route.
+
+Create a small JSON input and select the route:
+
+```bash
+./bin/opsle.js supervisor route select \
+  --input ROUTE_INPUT.json
+```
+
+The input records `work_description`, optional `task_id`, `work_class`,
+`requested_route`, advertised capability metadata, why intelligence/tooling is
+needed, and why cheaper direct inspection is insufficient. The decision also
+captures the current objective and policy. For narrow repository or source
+analysis, omit `requested_route` or set it to
+`direct_deterministic_source_inspection`. This records advertised Graphify
+availability while selecting `direct-source-inspection`, with no instruction
+file read and every optional capability denied.
+
+OpenAI Docs or web may be selected only with the exact
+`current_external_documentation` route and an exact available
+`requested_capability`. Other optional capabilities require
+`explicit_optional_capability`. Both optional routes require nonempty
+intelligence/tooling and direct-inspection-insufficiency rationales. Availability
+alone, an advertised name, or a subject category grants nothing.
+
+Inspect a persisted decision:
+
+```bash
+./bin/opsle.js supervisor route show DECISION_ID
+```
+
+A selected skill's instructions have one post-selection entry point:
+
+```bash
+./bin/opsle.js supervisor route load-skill DECISION_ID \
+  --skill SKILL_ID
+```
+
+That command fails closed unless the decision is current, policy-valid, selects
+that exact skill, and the regular instruction file still has the metadata seen
+during Discovery. Unselected tools have no invocation entry point in this
+contract. Genuine platform safety mandates remain authoritative outside optional
+routing. Runner-launched child exact routes and isolation are unchanged.
+
 ## Launch detached work and inspect wake delivery
 
 Canonical task execution is detached:
@@ -315,6 +366,12 @@ Run the deterministic route fixture without invoking a provider:
 
 ```bash
 npm run test:route-isolation
+```
+
+Run the supervisor-local routing fixture:
+
+```bash
+npm run test:supervisor-routing
 ```
 
 ```bash

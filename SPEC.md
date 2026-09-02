@@ -36,6 +36,19 @@ decision v3, and policy snapshot v3 and fail closed without a valid
 `selected_tool`; immutable v1/v2 snapshots validate against their historical
 contracts.
 
+The persistent supervisor uses a distinct exact-supervisor-route contract before
+optional capability use. Its durable decision records the task/objective,
+selected execution route and tool, selected skill or null, metadata-only
+discovery, intelligence/tooling rationale, and the reason direct inspection is
+insufficient (or, for the direct route, why it is sufficient). Static category
+matching is explicitly non-authoritative. Narrow repository/source analysis
+defaults to direct deterministic inspection. Graphify, OpenAI Docs, web, plugins,
+MCP, subagents, and other optional capabilities fail closed unless selected
+exactly; OpenAI Docs and web additionally require the exact
+`current_external_documentation` route. Platform safety mandates remain outside
+this optional-routing contract and retain authority. Child route isolation is
+unchanged.
+
 ## Execution contract
 
 1. Capability Discovery records available commands and sibling revisions.
