@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Replaced persistent frontend attachment assumptions with automatically
+  refreshed ephemeral v3 Herdr/Codex binding revisions, atomic fail-closed
+  invalidation, immutable supersession history, and deterministic v2 migration.
+- Fenced dispatcher delivery to the immediately refreshed binding revision and
+  added immutable terminal-wake consumption evidence required before task
+  evaluation.
+- Added neutral ordinary-Git initialization, objective-only lifecycle support,
+  repository-independent version provenance, and deterministic A-M portability
+  coverage while retaining requirement-driven and V0.1 self-host state.
+- Added explicit Context Firewall policy with a safe enabled historical default,
+  nullable tmux fallback fencing for authoritative Herdr bindings, and semantic
+  freshness validation for complete resume packets.
+- Replaced ambiguous READY/DORMANT status labels with derived INITIALIZED,
+  ACTIVE, IDLE, PAUSED, COMPLETE, and ATTENTION lifecycle semantics.
 - Replaced theory-only public docs with the implemented V0.1 operator,
   architecture, recovery, evidence, and self-hosting contracts.
 - Documented the local Runner, Gearbox, Context Firewall, handoff, claim/fence,

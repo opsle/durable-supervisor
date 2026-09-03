@@ -39,7 +39,19 @@ const WAKE_REQUEST_SCHEMA = 'opsle.durable-supervisor.host-wake-request/v1';
 const NATIVE_WAKE_REQUEST_SCHEMA = 'opsle.durable-supervisor.native-wake-request/v2';
 const DELIVERY_SCHEMA = 'opsle.durable-supervisor.host-wake-delivery/v1';
 const DISPATCHER_SCHEMA = 'opsle.durable-supervisor.host-wake-dispatcher/v1';
-export const CODEX_SESSION_BINDING_SCHEMA = 'opsle.durable-supervisor.codex-session-binding/v2';
+const WAKEUP_SOURCE_PATH = fileURLToPath(import.meta.url);
+const DEFAULT_DISPATCHER_SCRIPT = fileURLToPath(
+  new URL('../bin/opsle-wake-delivery.js', import.meta.url),
+);
+export const WAKE_DISPATCHER_IMPLEMENTATION_SHA256 = sha256(canonicalJson({
+  schema: 'opsle.durable-supervisor.wake-dispatcher-implementation/v1',
+  wakeup_source_sha256: fileSha256(WAKEUP_SOURCE_PATH),
+  dispatcher_entrypoint_sha256: fileSha256(DEFAULT_DISPATCHER_SCRIPT),
+}));
+export const CODEX_SESSION_BINDING_SCHEMA = 'opsle.durable-supervisor.codex-session-binding/v3';
+export const LEGACY_CODEX_SESSION_BINDING_SCHEMA = 'opsle.durable-supervisor.codex-session-binding/v2';
+export const CODEX_SESSION_BINDING_INVALID_SCHEMA = 'opsle.durable-supervisor.codex-session-binding-invalid/v1';
+export const WAKE_CONSUMPTION_SCHEMA = 'opsle.durable-supervisor.wake-consumption/v1';
 export const ACTIVATION_LEASE_SCHEMA = 'opsle.durable-supervisor.activation-lease/v1';
 export const ACTIVATION_DECISION_SCHEMA = 'opsle.durable-supervisor.activation-decision/v1';
 export const CODEX_RESUME_HELPER_TIMEOUT_MS = (
@@ -138,6 +150,8 @@ function wakePaths(root) {
     dispatcher: join(base, 'dispatcher.json'),
     dispatcherLock: join(base, 'dispatcher.lock'),
     sessionBinding: join(base, 'codex-session-binding.json'),
+    sessionBindingHistory: join(base, 'session-binding-history'),
+    consumptions: join(base, 'consumptions'),
     activationLease: join(base, 'activation-lease.json'),
     activationDecisions: join(base, 'activation-decisions'),
     transportAttempts: join(base, 'transport-attempts'),
@@ -152,6 +166,8 @@ function directories(root) {
     value.deliveries,
     value.activationDecisions,
     value.transportAttempts,
+    value.sessionBindingHistory,
+    value.consumptions,
   ]) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
   }
@@ -168,6 +184,27 @@ function requestPath(root, eventId) {
 
 function receiptPath(root, eventId) {
   return join(directories(root).deliveries, `${eventId}.json`);
+}
+
+function consumptionPath(root, eventId) {
+  return join(directories(root).consumptions, `${eventId}.json`);
+}
+
+function deliveryReceiptFence(receipt) {
+  return sha256(canonicalJson({
+    schema: receipt?.schema,
+    delivery_id: receipt?.delivery_id,
+    event_id: receipt?.event_id,
+    queue_version: receipt?.queue_version,
+    supervisor_id: receipt?.supervisor_id,
+    supervisor_generation: receipt?.supervisor_generation,
+    activation_decision_id: receipt?.activation_decision_id,
+    codex_session_binding_sha256: receipt?.codex_session_binding_sha256,
+    codex_session_uuid: receipt?.codex_session_uuid,
+    message_sha256: receipt?.message_sha256,
+    transport_attempt_id: receipt?.transport_attempt_id,
+    delivered_at: receipt?.delivered_at,
+  }));
 }
 
 function transportAttemptPath(root, transportAttemptId) {
@@ -316,11 +353,177 @@ function bindingDependencies(overrides = {}) {
     codexVersion: overrides.codexVersion ?? installedCodexVersion,
     uid: overrides.uid ?? (() => process.getuid?.() ?? null),
     legacyTmuxAuthority: overrides.legacyTmuxAuthority ?? legacyTmuxAuthority,
+    environment: overrides.environment ?? (() => process.env),
+    herdrSnapshot: overrides.herdrSnapshot ?? (() => {
+      const result = spawnSync('herdr', ['api', 'snapshot'], { encoding: 'utf8' });
+      if (result.status !== 0) throw new Error('Herdr snapshot unavailable');
+      return JSON.parse(result.stdout);
+    }),
+    herdrPaneProcessInfo: overrides.herdrPaneProcessInfo ?? ((paneId) => {
+      const result = spawnSync('herdr', ['pane', 'process-info', '--pane', paneId], { encoding: 'utf8' });
+      if (result.status !== 0) throw new Error('Herdr pane process facts unavailable');
+      return JSON.parse(result.stdout);
+    }),
   };
 }
 
+function normalizedHerdrSnapshot(value) {
+  if (value?.type === 'session_snapshot') return value.snapshot;
+  if (value?.result?.type === 'session_snapshot') return value.result.snapshot;
+  if (Array.isArray(value?.workspaces) && Array.isArray(value?.panes)) return value;
+  throw new Error('Herdr API did not return one session snapshot');
+}
+
+function normalizedPaneProcessInfo(value) {
+  if (value?.type === 'pane_process_info') return value.process_info;
+  if (value?.result?.type === 'pane_process_info') return value.result.process_info;
+  if (typeof value?.pane_id === 'string') return value;
+  throw new Error('Herdr API did not return pane process facts');
+}
+
+function sessionReference(value) {
+  if (value?.agent_session?.agent !== 'codex' || value.agent_session.kind !== 'id') return null;
+  return value.agent_session.value;
+}
+
+function repositoryPath(value, deps) {
+  if (typeof value !== 'string') return null;
+  try { return deps.realpath(value); } catch { return null; }
+}
+
+function exactHerdrFrontend(
+  snapshot,
+  repositoryRealpath,
+  environment,
+  deps,
+  allowEnvironmentMismatch,
+  priorBinding = null,
+) {
+  const paneRows = [...(snapshot.panes ?? []), ...(snapshot.agents ?? [])]
+    .filter((pane) => pane?.workspace_id);
+  const panes = [...new Map(paneRows.map((pane) => [pane.pane_id, pane])).values()]
+    .filter((pane) => (
+      pane.agent === 'codex'
+      && pane.terminal_id
+      && repositoryPath(pane.foreground_cwd ?? pane.cwd, deps) === repositoryRealpath
+    ));
+  if (panes.length !== 1) {
+    throw new Error(`Herdr discovery requires one attached repository Codex frontend; observed ${panes.length}`);
+  }
+  const pane = panes[0];
+  const workspaces = (snapshot.workspaces ?? []).filter((workspace) => (
+    workspace?.workspace_id === pane.workspace_id
+    && (repositoryPath(
+      workspace?.worktree?.checkout_path ?? workspace?.worktree?.repo_root,
+      deps,
+    ) ?? repositoryRealpath) === repositoryRealpath
+  ));
+  if (workspaces.length !== 1) {
+    throw new Error(`Herdr discovery requires one repository workspace; observed ${workspaces.length}`);
+  }
+  const workspace = workspaces[0];
+  const envSession = environment.CODEX_SESSION_ID?.trim() || null;
+  const envThread = environment.CODEX_THREAD_ID?.trim() || null;
+  if (!allowEnvironmentMismatch
+      && (envSession || envThread)
+      && (!envSession || !envThread || envSession !== envThread)) {
+    throw new Error('CODEX_SESSION_ID and CODEX_THREAD_ID are incomplete or disagree');
+  }
+  const herdrSession = sessionReference(pane);
+  if (herdrSession && envSession && envSession !== herdrSession && !allowEnvironmentMismatch) {
+    throw new Error('detached child or obsolete Codex environment does not match the live Herdr frontend');
+  }
+  let sessionId = herdrSession;
+  if (!sessionId && !allowEnvironmentMismatch && envSession && envThread === envSession) {
+    sessionId = envSession;
+  }
+  if (!sessionId
+      && allowEnvironmentMismatch
+      && priorBinding?.schema === CODEX_SESSION_BINDING_SCHEMA
+      && priorBinding.state === 'CURRENT'
+      && priorBinding.host?.workspace_id === workspace.workspace_id
+      && priorBinding.host?.pane_id === pane.pane_id
+      && priorBinding.host?.terminal_id === pane.terminal_id) {
+    sessionId = priorBinding.codex_session_uuid;
+  }
+  if (!sessionId) {
+    throw new Error('Herdr frontend session identity is unavailable to the authoritative frontend');
+  }
+  return {
+    workspace,
+    pane,
+    sessionId,
+    threadId: envThread === sessionId ? envThread : sessionId,
+  };
+}
+
+function exactFrontendProcess(info, pane, repositoryRealpath, deps) {
+  if (info?.pane_id !== pane.pane_id || typeof pane.terminal_id !== 'string') {
+    throw new Error('Herdr pane, terminal, and process facts are incomplete');
+  }
+  const candidates = (info.foreground_processes ?? []).filter((entry) => {
+    const command = `${entry.name ?? ''} ${entry.argv0 ?? ''} ${entry.cmdline ?? ''}`;
+    return /(^|[ /])codex([ /]|$)|@openai\/codex/.test(command)
+      && repositoryPath(entry.cwd, deps) === repositoryRealpath;
+  });
+  const leaders = candidates.filter((entry) => entry.pid === info.foreground_process_group_id);
+  const selected = leaders.length === 1
+    ? leaders[0]
+    : (candidates.length === 1 ? candidates[0] : null);
+  if (!selected) {
+    throw new Error(`Herdr discovery requires one exact Codex frontend process; observed ${candidates.length}`);
+  }
+  const identity = deps.processIdentity(selected.pid);
+  if (!validProcessIdentity(identity) || (info.tty != null && identity.tty !== info.tty)) {
+    throw new Error('live Codex frontend process identity is unavailable or mismatched');
+  }
+  return identity;
+}
+
+function bindingIdentity(value) {
+  if (value?.schema !== CODEX_SESSION_BINDING_SCHEMA || value.state !== 'CURRENT') return null;
+  return {
+    repository_realpath: value.repository_realpath,
+    supervisor_id: value.supervisor_id,
+    supervisor_generation: value.supervisor_generation,
+    codex_session_uuid: value.codex_session_uuid,
+    codex_thread_uuid: value.codex_thread_uuid,
+    rollout: {
+      realpath: value.rollout?.realpath,
+      device: value.rollout?.device,
+      inode: value.rollout?.inode,
+      session_meta_line_sha256: value.rollout?.session_meta_line_sha256,
+      session_meta_payload_sha256: value.rollout?.session_meta_payload_sha256,
+    },
+    sessions_root_realpath: value.sessions_root_realpath,
+    codex_cli_version: value.codex_cli_version,
+    uid: value.uid,
+    host: {
+      workspace_id: value.host?.workspace_id,
+      workspace_cwd: value.host?.workspace_cwd,
+      pane_id: value.host?.pane_id,
+      terminal_id: value.host?.terminal_id,
+      process: value.host?.process,
+    },
+  };
+}
+
+function sameBindingIdentity(left, right) {
+  return left && right && canonicalJson(bindingIdentity(left)) === canonicalJson(bindingIdentity(right));
+}
+
 function validateSessionBindingShape(binding) {
-  if (binding?.schema !== CODEX_SESSION_BINDING_SCHEMA) throw new Error('unsupported Codex session binding');
+  if (![CODEX_SESSION_BINDING_SCHEMA, LEGACY_CODEX_SESSION_BINDING_SCHEMA].includes(binding?.schema)) {
+    throw new Error('unsupported Codex session binding');
+  }
+  if (binding.schema === CODEX_SESSION_BINDING_SCHEMA
+      && (binding.state !== 'CURRENT'
+        || !Number.isSafeInteger(binding.binding_revision)
+        || binding.binding_revision <= 0
+        || !/^[0-9a-f-]{36}$/i.test(binding.codex_thread_uuid ?? '')
+        || binding.codex_thread_uuid !== binding.codex_session_uuid)) {
+    throw new Error('incomplete ephemeral Codex session binding');
+  }
   if (typeof binding.repository_realpath !== 'string'
       || typeof binding.supervisor_id !== 'string'
       || !Number.isSafeInteger(binding.supervisor_generation)
@@ -341,7 +544,8 @@ function validateSessionBindingShape(binding) {
       || binding.host?.workspace_cwd !== binding.repository_realpath
       || typeof binding.host?.pane_id !== 'string'
       || typeof binding.host?.terminal_id !== 'string'
-      || typeof binding.authority_fence?.legacy_tmux_session !== 'string') {
+      || (binding.authority_fence?.legacy_tmux_session !== null
+        && typeof binding.authority_fence?.legacy_tmux_session !== 'string')) {
     throw new Error('incomplete Codex session binding');
   }
   if (binding.native_wake?.supported !== true
@@ -354,6 +558,7 @@ function validateSessionBindingShape(binding) {
 
 export function createCodexSessionBinding(root, {
   sessionId,
+  threadId = sessionId,
   rolloutPath,
   sessionsRoot,
   hostPid,
@@ -362,6 +567,8 @@ export function createCodexSessionBinding(root, {
   paneId,
   terminalId,
   legacyTmuxSession = null,
+  bindingRevision = null,
+  discoveryEvidence = null,
 }, dependencyOverrides = {}) {
   const deps = bindingDependencies(dependencyOverrides);
   const p = paths(root);
@@ -374,7 +581,7 @@ export function createCodexSessionBinding(root, {
   const hostProcess = deps.processIdentity(Number(hostPid));
   const cliVersion = deps.codexVersion();
   const uid = deps.uid();
-  const fencedTmuxSession = legacyTmuxSession ?? supervisor.session_id;
+  const fencedTmuxSession = legacyTmuxSession;
   if (!hostProcess || !cliVersion || !Number.isSafeInteger(uid)) {
     throw new Error('session binding probes did not produce exact Herdr process, CLI, and UID facts');
   }
@@ -396,13 +603,37 @@ export function createCodexSessionBinding(root, {
   }
   const oldPath = wakePaths(root).sessionBinding;
   const supersedes = existsSync(oldPath) ? fileSha256(oldPath) : null;
+  const oldBinding = readOptional(oldPath);
+  const revision = bindingRevision ?? ((Number(oldBinding?.binding_revision) || 0) + 1);
+  const identity = {
+    repositoryRealpath,
+    supervisorId: supervisor.supervisor_id,
+    supervisorGeneration: supervisor.generation,
+    sessionId,
+    threadId,
+    rolloutRealpath,
+    rolloutDevice: rollout.dev,
+    rolloutInode: rollout.ino,
+    workspaceId,
+    workspaceCwd,
+    paneId,
+    terminalId,
+    hostProcess,
+  };
   return validateSessionBindingShape({
     schema: CODEX_SESSION_BINDING_SCHEMA,
-    binding_id: id('codex-session-binding'),
+    state: 'CURRENT',
+    binding_id: `codex-session-binding-${sha256(canonicalJson({
+      identity,
+      revision,
+      supersedes,
+    }))}`,
+    binding_revision: revision,
     repository_realpath: repositoryRealpath,
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
     codex_session_uuid: sessionId,
+    codex_thread_uuid: threadId,
     rollout: {
       realpath: rolloutRealpath,
       device: rollout.dev,
@@ -425,9 +656,11 @@ export function createCodexSessionBinding(root, {
       pane_id: paneId,
       terminal_id: terminalId,
       process: hostProcess,
+      discovery: discoveryEvidence,
     },
     authority_fence: {
       legacy_tmux_session: fencedTmuxSession,
+      legacy_tmux_fallback_configured: typeof fencedTmuxSession === 'string' && fencedTmuxSession.length > 0,
       legacy_tmux_absent_at_bind: true,
     },
     native_wake: {
@@ -441,6 +674,190 @@ export function createCodexSessionBinding(root, {
   });
 }
 
+function archiveBinding(wake, binding, sourceSha256) {
+  if (!binding || !sourceSha256) return;
+  atomicCreateJson(join(wake.sessionBindingHistory, `${sourceSha256}.json`), binding);
+}
+
+function replaceBindingPointer(root, build) {
+  const wake = directories(root);
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const prior = readOptional(wake.sessionBinding);
+    const priorSha256 = prior ? fileSha256(wake.sessionBinding) : null;
+    const replacement = build(prior, priorSha256);
+    if (replacement === prior) return { changed: false, binding: prior };
+    archiveBinding(wake, prior, priorSha256);
+    const replacementSha256 = sha256(canonicalJson(replacement));
+    archiveBinding(wake, replacement, replacementSha256);
+    const swapped = atomicCompareAndSwapJson(wake.sessionBinding, priorSha256, replacement);
+    if (swapped.swapped) return { changed: true, binding: replacement };
+    if (!['cas-content-changed', 'cas-lock-busy'].includes(swapped.reason)) {
+      throw new Error(`session binding atomic replacement failed: ${swapped.reason}`);
+    }
+  }
+  throw new Error('session binding replacement raced repeatedly');
+}
+
+function invalidBinding(root, prior, priorSha256, reasons) {
+  const supervisor = readJson(paths(root).supervisor);
+  const normalizedReasons = [...new Set(reasons)].sort();
+  const revision = (Number(prior?.binding_revision) || 0) + 1;
+  return {
+    schema: CODEX_SESSION_BINDING_INVALID_SCHEMA,
+    state: 'INVALID',
+    binding_id: `codex-session-binding-invalid-${sha256(canonicalJson({
+      supervisor_id: supervisor.supervisor_id,
+      supervisor_generation: supervisor.generation,
+      prior_sha256: priorSha256,
+      reasons: normalizedReasons,
+    }))}`,
+    binding_revision: revision,
+    supervisor_id: supervisor.supervisor_id,
+    supervisor_generation: supervisor.generation,
+    reasons: normalizedReasons,
+    supersedes_binding_sha256: priorSha256,
+    invalidated_at: now(),
+  };
+}
+
+function invalidStatus(binding, error = null) {
+  return {
+    classification: 'attention',
+    valid: false,
+    supported: false,
+    reasons: binding?.reasons ?? ['session-binding-refresh-unproven'],
+    binding,
+    binding_revision: binding?.binding_revision ?? null,
+    ...(error ? { error } : {}),
+  };
+}
+
+export function refreshCodexSessionBinding(root, {
+  dependencies = {},
+  allowEnvironmentMismatch = false,
+} = {}) {
+  const deps = bindingDependencies(dependencies);
+  const wake = directories(root);
+  let discovered;
+  try {
+    const repositoryRealpath = deps.realpath(root);
+    const supervisor = readJson(paths(root).supervisor);
+    if (deps.legacyTmuxAuthority(supervisor.session_id)) {
+      throw new Error('concurrent live tmux supervisor authority detected');
+    }
+    const environment = deps.environment();
+    const priorBinding = readOptional(wake.sessionBinding);
+    const firstRaw = deps.herdrSnapshot();
+    const first = normalizedHerdrSnapshot(firstRaw);
+    const frontend = exactHerdrFrontend(
+      first,
+      repositoryRealpath,
+      environment,
+      deps,
+      allowEnvironmentMismatch,
+      priorBinding,
+    );
+    const processInfo = normalizedPaneProcessInfo(deps.herdrPaneProcessInfo(frontend.pane.pane_id));
+    const frontendProcess = exactFrontendProcess(
+      processInfo,
+      frontend.pane,
+      repositoryRealpath,
+      deps,
+    );
+    if (allowEnvironmentMismatch
+        && !sessionReference(frontend.pane)
+        && !exactProcess(priorBinding?.host?.process, frontendProcess)) {
+      throw new Error('dispatcher cannot infer a changed Herdr frontend session identity');
+    }
+    const sessionsRoot = dependencies.sessionsRoot
+      ? dependencies.sessionsRoot(environment)
+      : (environment.CODEX_HOME
+        ? join(environment.CODEX_HOME, 'sessions')
+        : priorBinding?.sessions_root_realpath ?? null);
+    if (!sessionsRoot) throw new Error('CODEX_HOME sessions root is unavailable');
+    const sessionsRootRealpath = deps.realpath(sessionsRoot);
+    const candidates = deps.sessionCandidates(sessionsRootRealpath, frontend.sessionId);
+    if (candidates.length !== 1) {
+      throw new Error(`Codex refresh requires one exact rollout candidate; observed ${candidates.length}`);
+    }
+    const secondRaw = deps.herdrSnapshot();
+    const second = normalizedHerdrSnapshot(secondRaw);
+    const confirmed = exactHerdrFrontend(
+      second,
+      repositoryRealpath,
+      environment,
+      deps,
+      allowEnvironmentMismatch,
+      priorBinding,
+    );
+    if (confirmed.workspace.workspace_id !== frontend.workspace.workspace_id
+        || confirmed.pane.pane_id !== frontend.pane.pane_id
+        || confirmed.pane.terminal_id !== frontend.pane.terminal_id
+        || confirmed.sessionId !== frontend.sessionId) {
+      throw new Error('Herdr frontend changed during binding discovery');
+    }
+    if (!exactProcess(frontendProcess, deps.processIdentity(frontendProcess.pid))) {
+      throw new Error('Codex frontend process changed during binding discovery');
+    }
+    discovered = {
+      sessionId: frontend.sessionId,
+      threadId: frontend.threadId,
+      rolloutPath: candidates[0],
+      sessionsRoot: sessionsRootRealpath,
+      hostPid: frontendProcess.pid,
+      workspaceId: frontend.workspace.workspace_id,
+      workspaceCwd: repositoryRealpath,
+      paneId: frontend.pane.pane_id,
+      terminalId: frontend.pane.terminal_id,
+      legacyTmuxSession: supervisor.session_id ?? null,
+      discoveryEvidence: {
+        source: 'herdr-api-snapshot-and-pane-process-info',
+        protocol: first.protocol ?? null,
+        version: first.version ?? null,
+        tab_id: frontend.pane.tab_id ?? null,
+        pane_revision: frontend.pane.revision ?? null,
+        snapshot_sha256: sha256(canonicalJson(firstRaw)),
+        confirmation_snapshot_sha256: sha256(canonicalJson(secondRaw)),
+        process_tty: frontendProcess.tty,
+      },
+    };
+  } catch (error) {
+    const reason = error.message || 'session binding refresh failed';
+    if (!existsSync(wake.sessionBinding)) {
+      return {
+        classification: 'unbound',
+        valid: false,
+        supported: false,
+        attention: true,
+        reasons: [reason],
+        binding: null,
+        binding_revision: null,
+        refreshed: false,
+        error: reason,
+      };
+    }
+    const replaced = replaceBindingPointer(root, (prior, priorSha256) => {
+      if (prior?.schema === CODEX_SESSION_BINDING_INVALID_SCHEMA
+          && canonicalJson(prior.reasons) === canonicalJson([reason].sort())
+          && prior.supervisor_id === readJson(paths(root).supervisor).supervisor_id
+          && prior.supervisor_generation === readJson(paths(root).supervisor).generation) return prior;
+      return invalidBinding(root, prior, priorSha256, [reason]);
+    });
+    return { ...invalidStatus(replaced.binding, reason), refreshed: replaced.changed };
+  }
+
+  const replaced = replaceBindingPointer(root, (prior) => {
+    const candidate = createCodexSessionBinding(root, {
+      ...discovered,
+      bindingRevision: (Number(prior?.binding_revision) || 0) + 1,
+    }, dependencies);
+    if (sameBindingIdentity(prior, candidate)) return prior;
+    return candidate;
+  });
+  const status = codexSessionBindingStatus(root, { binding: replaced.binding, dependencies });
+  return { ...status, refreshed: replaced.changed };
+}
+
 export function codexSessionBindingStatus(root, {
   binding = null,
   ignoreSupersession = false,
@@ -449,6 +866,9 @@ export function codexSessionBindingStatus(root, {
   const deps = bindingDependencies(dependencies);
   const record = binding ?? readOptional(wakePaths(root).sessionBinding);
   if (!record) return { classification: 'unbound', valid: false, supported: false, reasons: ['session-binding-missing'] };
+  if (record.schema === CODEX_SESSION_BINDING_INVALID_SCHEMA && record.state === 'INVALID') {
+    return invalidStatus(record);
+  }
   try { validateSessionBindingShape(record); } catch (error) {
     return { classification: 'stale', valid: false, supported: false, reasons: ['binding-schema-invalid'], error: error.message };
   }
@@ -505,19 +925,26 @@ export function codexSessionBindingStatus(root, {
     supported: record.native_wake.supported,
     reason: record.native_wake.reason,
     binding: record,
+    binding_revision: record.binding_revision ?? 0,
   };
 }
 
 export function bindCodexSession(root, input, options = {}) {
-  const binding = createCodexSessionBinding(root, input, options.dependencies);
+  const replaced = replaceBindingPointer(root, (prior) => {
+    const candidate = createCodexSessionBinding(root, {
+      ...input,
+      bindingRevision: (Number(prior?.binding_revision) || 0) + 1,
+    }, options.dependencies);
+    return sameBindingIdentity(prior, candidate) ? prior : candidate;
+  });
+  const binding = replaced.binding;
   const status = codexSessionBindingStatus(root, {
     binding,
     ignoreSupersession: true,
     dependencies: options.dependencies,
   });
   if (!status.valid) throw new Error(`Codex session binding validation failed: ${status.reasons.join(', ')}`);
-  writeJson(directories(root).sessionBinding, binding);
-  return status;
+  return { ...status, refreshed: replaced.changed };
 }
 
 export function adoptCodexSessionBinding(root, { dependencies = {} } = {}) {
@@ -812,6 +1239,7 @@ function sameDispatcher(left, right) {
   return left && right
     && left.dispatcher_id === right.dispatcher_id
     && left.dispatcher_generation === right.dispatcher_generation
+    && left.implementation_sha256 === right.implementation_sha256
     && left.supervisor_id === right.supervisor_id
     && left.supervisor_generation === right.supervisor_generation
     && sameProcess(left.process, right.process);
@@ -1001,6 +1429,12 @@ function validateDeliveryFence(root, eventId, expected, dispatcher) {
       && (request.target.host_binding.supervisor_id !== supervisor.supervisor_id
         || request.target.host_binding.supervisor_generation !== supervisor.generation)) {
     return { current: false, reason: 'wake-host-binding-generation-mismatch' };
+  }
+  if (expected.bindingSha256 != null) {
+    const bindingPath = wakePaths(root).sessionBinding;
+    if (!existsSync(bindingPath) || fileSha256(bindingPath) !== expected.bindingSha256) {
+      return { current: false, reason: 'session-binding-revision-changed' };
+    }
   }
   const dispatcherDecision = dispatcherFence(root, dispatcher);
   if (!dispatcherDecision.current) {
@@ -1505,11 +1939,27 @@ export function deliverWake(root, eventId, {
   const wake = directories(root);
   const request = readJson(requestPath(root, eventId));
   const queueVersion = expectedQueueVersion ?? request.queue_version;
+  if (dispatcher && !dispatcherFence(root, dispatcher).current) {
+    const decision = readOptional(activationDecisionPath(root, eventId));
+    return {
+      classification: 'stale-generation',
+      reason: decision?.status === 'UNCERTAIN'
+        ? 'late-confirmation-dispatcher-fence-not-current'
+        : 'dispatcher-fence-no-longer-current',
+      delivered: false,
+    };
+  }
+  const refreshOptions = {
+    dependencies: bindingDependencies,
+    allowEnvironmentMismatch: Boolean(dispatcher),
+  };
+  const bindingStatus = refreshCodexSessionBinding(root, refreshOptions);
   const deliveryFence = {
     queueVersion,
     requestSha256: sha256(canonicalJson(request)),
     supervisorId: request.target.supervisor_id,
     supervisorGeneration: request.target.supervisor_generation,
+    bindingSha256: bindingStatus.valid ? fileSha256(wake.sessionBinding) : null,
   };
   const existingPath = receiptPath(root, eventId);
   if (existsSync(existingPath)) {
@@ -1523,7 +1973,6 @@ export function deliverWake(root, eventId, {
     return { classification: 'queued', reason: 'crash-uncertain-delivery-claim', receipt: existing, replayed: false };
   }
   const supervisor = readJson(paths(root).supervisor);
-  const bindingStatus = codexSessionBindingStatus(root, { dependencies: bindingDependencies });
   if (bindingStatus.valid && bindingStatus.supported) {
     const reconciled = reconcileLateConfirmation(
       root,
@@ -1652,6 +2101,7 @@ export function deliverWake(root, eventId, {
     supervisor_generation: supervisor.generation,
     dispatcher_id: dispatcher?.dispatcher_id ?? null,
     dispatcher_generation: dispatcher?.dispatcher_generation ?? null,
+    dispatcher_implementation_sha256: dispatcher?.implementation_sha256 ?? null,
     dispatcher_process: dispatcher?.process ?? lease.owner.process,
     activation_lease_id: lease.lease_id,
     activation_fencing_token: lease.fencing_token,
@@ -1689,6 +2139,8 @@ export function deliverWake(root, eventId, {
       dispatcher_id: dispatcher?.dispatcher_id ?? lease.owner.dispatcher_id,
       dispatcher_generation: dispatcher?.dispatcher_generation
         ?? lease.owner.dispatcher_generation,
+      implementation_sha256: dispatcher?.implementation_sha256
+        ?? WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
       process: dispatcher?.process ?? lease.owner.process,
     },
     supervisor: {
@@ -1741,6 +2193,27 @@ export function deliverWake(root, eventId, {
       classification: 'stale-generation',
       reason: finalFence.current ? 'activation-lease-fence-no-longer-current' : finalFence.reason,
       delivered: false,
+    };
+  }
+  const preDeliveryBinding = refreshCodexSessionBinding(root, refreshOptions);
+  const preDeliveryFence = validateDeliveryFence(root, eventId, deliveryFence, dispatcher);
+  if (!preDeliveryBinding.valid || !preDeliveryBinding.supported || !preDeliveryFence.current) {
+    updateActivationDecision(
+      root,
+      claim.decision,
+      'BUSY',
+      preDeliveryBinding.valid ? preDeliveryFence.reason : 'live session binding refresh unproven',
+    );
+    releaseActivationLease(root, lease);
+    return {
+      classification: 'queued',
+      reason: preDeliveryBinding.valid
+        ? preDeliveryFence.reason
+        : 'codex-session-binding-refresh-unproven',
+      binding_status: preDeliveryBinding,
+      event_id: eventId,
+      delivered: false,
+      replayed: false,
     };
   }
   try {
@@ -1953,30 +2426,90 @@ export function deliverWake(root, eventId, {
   return commitDeliveredReceipt(root, request, receipt);
 }
 
-export function consumeWakeDelivery(root, eventId, { deliveryId, generation }) {
+export function consumeWakeDelivery(root, eventId, { deliveryId = null, generation }) {
   const request = readOptional(requestPath(root, eventId));
   if (!request) return null;
   const receipt = readJson(receiptPath(root, eventId));
   const supervisor = readJson(paths(root).supervisor);
   const wake = directories(root);
-  if (receipt.status === 'CONSUMED') {
-    const busy = readOptional(wake.busy);
-    if (busy?.delivery_id === receipt.delivery_id) removeIfPresent(wake.busy);
-    return { duplicate: true, receipt };
+  if (!['DELIVERED', 'CONSUMED'].includes(receipt.status)) {
+    throw new Error('wake delivery is not durably delivered');
   }
-  if (receipt.status !== 'DELIVERED') throw new Error('wake delivery is not durably delivered');
-  if (receipt.delivery_id !== deliveryId) throw new Error('wake delivery identity mismatch');
+  const exactDeliveryId = deliveryId ?? receipt.delivery_id;
+  if (receipt.delivery_id !== exactDeliveryId) throw new Error('wake delivery identity mismatch');
   if (Number(generation) !== receipt.supervisor_generation
       || receipt.supervisor_generation !== supervisor.generation
       || request.target.supervisor_generation !== supervisor.generation) {
     throw new Error('stale supervisor generation cannot consume wake event');
   }
-  receipt.status = 'CONSUMED';
-  receipt.consumed_at = now();
-  writeJson(receiptPath(root, eventId), receipt);
+  const consumption = {
+    schema: WAKE_CONSUMPTION_SCHEMA,
+    consumption_id: `wake-consumption-${sha256(canonicalJson({
+      event_id: eventId,
+      delivery_id: exactDeliveryId,
+      supervisor_id: supervisor.supervisor_id,
+      supervisor_generation: supervisor.generation,
+    }))}`,
+    event_id: eventId,
+    task_id: request.task_id,
+    attempt_id: request.attempt_id,
+    delivery_id: receipt.delivery_id,
+    supervisor_id: supervisor.supervisor_id,
+    supervisor_generation: supervisor.generation,
+    request_sha256: fileSha256(requestPath(root, eventId)),
+    delivery_receipt_fence_sha256: deliveryReceiptFence(receipt),
+    consumed_at: now(),
+  };
+  const path = consumptionPath(root, eventId);
+  const created = atomicCreateJson(path, consumption);
+  const durable = created ? consumption : readJson(path);
+  if (durable.schema !== WAKE_CONSUMPTION_SCHEMA
+      || durable.event_id !== eventId
+      || durable.delivery_id !== receipt.delivery_id
+      || durable.supervisor_id !== supervisor.supervisor_id
+      || durable.supervisor_generation !== supervisor.generation
+      || durable.request_sha256 !== consumption.request_sha256
+      || durable.delivery_receipt_fence_sha256 !== consumption.delivery_receipt_fence_sha256) {
+    throw new Error('wake consumption evidence fence mismatch');
+  }
   const busy = readOptional(wake.busy);
   if (busy?.delivery_id === receipt.delivery_id) removeIfPresent(wake.busy);
-  return { duplicate: false, receipt };
+  return { duplicate: !created, receipt, consumption: durable };
+}
+
+export function wakeDeliveryConsumptionStatus(root, eventId) {
+  const receipt = readOptional(receiptPath(root, eventId));
+  if (!receipt || !['DELIVERED', 'CONSUMED'].includes(receipt.status)) {
+    return { delivered: false, consumed: false, receipt };
+  }
+  if (receipt.status === 'CONSUMED') {
+    return { delivered: true, consumed: true, legacy: true, receipt };
+  }
+  const consumption = readOptional(consumptionPath(root, eventId));
+  const request = readOptional(requestPath(root, eventId));
+  const consumed = consumption?.schema === WAKE_CONSUMPTION_SCHEMA
+    && consumption.event_id === eventId
+    && consumption.delivery_id === receipt.delivery_id
+    && consumption.supervisor_id === receipt.supervisor_id
+    && consumption.supervisor_generation === receipt.supervisor_generation
+    && request
+    && consumption.task_id === request.task_id
+    && consumption.attempt_id === request.attempt_id
+    && consumption.request_sha256 === fileSha256(requestPath(root, eventId))
+    && consumption.delivery_receipt_fence_sha256 === deliveryReceiptFence(receipt);
+  return { delivered: true, consumed, receipt, consumption: consumed ? consumption : null };
+}
+
+export function unconsumedDeliveredWakes(root, taskId, attemptId) {
+  const wake = directories(root);
+  return readdirSync(wake.requests).filter((name) => name.endsWith('.json')).sort()
+    .map((name) => readJson(join(wake.requests, name)))
+    .filter((request) => request.task_id === taskId && request.attempt_id === attemptId)
+    .filter((request) => {
+      const status = wakeDeliveryConsumptionStatus(root, request.event_id);
+      return status.delivered && !status.consumed;
+    })
+    .map((request) => request.event_id);
 }
 
 export function wakeQueueStatus(root, {
@@ -1992,13 +2525,14 @@ export function wakeQueueStatus(root, {
     && dispatcher.supervisor_id === supervisor.supervisor_id
     && dispatcher.supervisor_generation === supervisor.generation
     && sameProcess(dispatcher.process, getProcessIdentity(dispatcher.process?.pid));
-  const bindingStatus = codexSessionBindingStatus(root, { dependencies: bindingDependencies });
+  const bindingStatus = refreshCodexSessionBinding(root, { dependencies: bindingDependencies });
   const requests = readdirSync(wake.requests).filter((name) => name.endsWith('.json')).sort().map((name) => {
     const request = readJson(join(wake.requests, name));
     const authoritative = request.target?.supervisor_id === supervisor.supervisor_id
       && request.target?.supervisor_generation === supervisor.generation;
     const receipt = readOptional(receiptPath(root, request.event_id));
     if (receipt) {
+      const consumption = wakeDeliveryConsumptionStatus(root, request.event_id);
       return {
         event_id: request.event_id,
         terminal_type: request.terminal_type,
@@ -2006,9 +2540,12 @@ export function wakeQueueStatus(root, {
         attempt_id: request.attempt_id,
         queued_at: request.queued_at,
         authoritative,
-        classification: ['DELIVERED', 'CONSUMED'].includes(receipt.status) ? 'duplicate' : 'queued',
-        reason: receipt.status,
+        classification: consumption.consumed
+          ? 'duplicate'
+          : (['DELIVERED', 'CONSUMED'].includes(receipt.status) ? 'awaiting-consumption' : 'queued'),
+        reason: consumption.consumed ? 'CONSUMED' : receipt.status,
         receipt,
+        consumption: consumption.consumption ?? null,
       };
     }
     const lifecycle = classifyQueuedWake(root, request, supervisor);
@@ -2068,9 +2605,16 @@ export function drainWakeQueue(root, options = {}) {
     });
 }
 
-function dispatcherIsCurrent(record, supervisor, getProcessIdentity, statuses = ['LAUNCHED', 'OWNED']) {
+function dispatcherIsCurrent(
+  record,
+  supervisor,
+  getProcessIdentity,
+  statuses = ['LAUNCHED', 'OWNED'],
+  implementationSha256 = WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+) {
   return record?.schema === DISPATCHER_SCHEMA
     && statuses.includes(record.status)
+    && record.implementation_sha256 === implementationSha256
     && record.supervisor_id === supervisor.supervisor_id
     && record.supervisor_generation === supervisor.generation
     && sameProcess(record.process, getProcessIdentity(record.process?.pid));
@@ -2094,12 +2638,19 @@ function acquireDispatcherLaunchLock(path, getProcessIdentity) {
 export function ensureWakeDispatcher(root, {
   spawnProcess = spawn,
   getProcessIdentity = processIdentity,
-  dispatcherScript = fileURLToPath(new URL('../bin/opsle-wake-delivery.js', import.meta.url)),
+  dispatcherScript = DEFAULT_DISPATCHER_SCRIPT,
+  implementationSha256 = WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
 } = {}) {
   const wake = directories(root);
   const supervisor = readJson(paths(root).supervisor);
   let existing = readOptional(wake.dispatcher);
-  if (dispatcherIsCurrent(existing, supervisor, getProcessIdentity)) {
+  if (dispatcherIsCurrent(
+    existing,
+    supervisor,
+    getProcessIdentity,
+    undefined,
+    implementationSha256,
+  )) {
     return { started: false, reason: 'current-dispatcher-already-live', dispatcher: existing };
   }
   const lock = acquireDispatcherLaunchLock(wake.dispatcherLock, getProcessIdentity);
@@ -2108,13 +2659,20 @@ export function ensureWakeDispatcher(root, {
   }
   try {
     existing = readOptional(wake.dispatcher);
-    if (dispatcherIsCurrent(existing, supervisor, getProcessIdentity)) {
+    if (dispatcherIsCurrent(
+      existing,
+      supervisor,
+      getProcessIdentity,
+      undefined,
+      implementationSha256,
+    )) {
       return { started: false, reason: 'current-dispatcher-already-live', dispatcher: existing };
     }
     const record = {
       schema: DISPATCHER_SCHEMA,
       dispatcher_id: id('wake-dispatcher'),
       dispatcher_generation: (Number(existing?.dispatcher_generation) || 0) + 1,
+      implementation_sha256: implementationSha256,
       supervisor_id: supervisor.supervisor_id,
       supervisor_generation: supervisor.generation,
       queue_generation: supervisor.generation,
@@ -2308,6 +2866,7 @@ export async function runWakeDispatcher(root, {
   const supervisor = readJson(paths(root).supervisor);
   if (record.schema !== DISPATCHER_SCHEMA
       || record.status !== 'LAUNCHED'
+      || record.implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
       || record.dispatcher_id !== dispatcherId
       || record.dispatcher_generation !== dispatcherGeneration
       || record.launch_nonce !== launchNonce

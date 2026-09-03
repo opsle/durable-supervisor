@@ -13,8 +13,13 @@ import {
   sha256,
   writeJson,
 } from './io.js';
-import { paths, SATISFIED_REQUIREMENT_STATES } from './state.js';
-import { codexSessionBindingStatus } from './wakeup.js';
+import {
+  paths,
+  policyWithDefaults,
+  SATISFIED_REQUIREMENT_STATES,
+  effectiveRequirementMatrix,
+} from './state.js';
+import { refreshCodexSessionBinding } from './wakeup.js';
 
 export const RESUME_PACKET_SCHEMA = 'opsle.durable-supervisor.resume-packet/v1';
 export const RECONSTRUCTION_TELEMETRY_SCHEMA = 'opsle.durable-supervisor.reconstruction-telemetry/v1';
@@ -23,6 +28,7 @@ export const PACKET_CHARACTER_CEILING = 4_000;
 export const PACKET_TOKEN_BUDGET = 1_000;
 export const TOKEN_ESTIMATE_METHOD = 'estimated_tokens=ceil(UTF-8_bytes/4); no exact tokenizer available';
 export const EVIDENCE_OUTPUT_BYTE_CEILING = 16_384;
+export const RESUME_FRESHNESS_SCHEMA = 'opsle.durable-supervisor.resume-freshness/v1';
 
 const ACTIVE_CHILD_STATES = new Set(['QUEUED', 'LAUNCHING', 'RUNNING']);
 const TERMINAL_CHILD_STATES = new Set(['COMPLETED', 'FAILED', 'STALLED', 'CANCELLED']);
@@ -73,8 +79,32 @@ function issueCollector() {
 function snapshotValue(value) {
   if (Array.isArray(value)) return value.map(snapshotValue);
   if (value === null || typeof value !== 'object') return value;
+  const irrelevant = new Set([
+    'heartbeat_at',
+    'updated_at',
+    'changed_at',
+    'created_at',
+    'effective_at',
+    'inspected_at',
+    'recovered_at',
+    'bound_at',
+    'queued_at',
+    'claimed_at',
+    'delivered_at',
+    'consumed_at',
+    'prepared_at',
+    'registered_at',
+    'deadline_at',
+    'launch_time',
+    'terminal_at',
+    'last_durable_event',
+    'telemetry',
+    'evidence',
+    'raw_evidence',
+    'raw_evidence_references',
+  ]);
   return Object.fromEntries(Object.entries(value)
-    .filter(([key]) => key !== 'heartbeat_at')
+    .filter(([key]) => !irrelevant.has(key))
     .map(([key, item]) => [key, snapshotValue(item)]));
 }
 
@@ -129,7 +159,13 @@ function sourceReader(root, issues) {
       }
     }
   }
-  return { read, track, verifyUnchanged, considered };
+  function authorityFingerprint() {
+    const manifest = [...considered.values()]
+      .map(({ path, snapshot_sha256: authoritySha256 }) => ({ path, authority_sha256: authoritySha256 }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    return sha256(canonicalJson(manifest));
+  }
+  return { read, track, verifyUnchanged, authorityFingerprint, considered };
 }
 
 function evidenceCollector(root, reader) {
@@ -181,7 +217,7 @@ function compactSessionStatus(status) {
     classification: status?.classification ?? 'unknown',
     valid: status?.valid === true,
     supported: status?.supported === true,
-    binding_id: binding?.binding_id ?? null,
+    binding_revision: binding?.binding_revision ?? status?.binding_revision ?? null,
     codex_session_uuid: binding?.codex_session_uuid ?? null,
     supervisor_generation: binding?.supervisor_generation ?? null,
     reasons: [...new Set(status?.reasons ?? [])].sort(),
@@ -199,6 +235,28 @@ function compactHerdr(status) {
   };
 }
 
+function freshnessValue(packet) {
+  const {
+    budget: _budget,
+    evidence: _evidence,
+    freshness: _freshness,
+    ...decisionRelevant
+  } = packet;
+  return decisionRelevant;
+}
+
+function applyFreshness(packet, authorityFingerprint, ephemeralAuthority = null) {
+  packet.freshness = {
+    schema: RESUME_FRESHNESS_SCHEMA,
+    authority_sha256: sha256(canonicalJson({
+      packet: freshnessValue(packet),
+      sources: authorityFingerprint,
+      ephemeral: ephemeralAuthority,
+    })),
+  };
+  return packet;
+}
+
 function summarizeWake(root, reader, supervisor, state, injectedStatus = null) {
   if (injectedStatus) return injectedStatus;
   const base = join(paths(root).opsle, 'wake');
@@ -214,22 +272,55 @@ function summarizeWake(root, reader, supervisor, state, injectedStatus = null) {
       'opsle.durable-supervisor.native-wake-request/v2',
     ].includes(request.schema);
     if (request.target?.supervisor_id !== supervisor?.supervisor_id
-        || request.target?.supervisor_generation !== supervisor?.generation
-        || state?.processed_event_ids?.includes(request.event_id)) continue;
+        || request.target?.supervisor_generation !== supervisor?.generation) continue;
+    const deliveryPath = join(base, 'deliveries', `${request.event_id}.json`);
+    const delivery = reader.read(deliveryPath, { required: false });
+    if (delivery && ['DELIVERED', 'CONSUMED'].includes(delivery.status)) {
+      const consumptionPath = join(base, 'consumptions', `${request.event_id}.json`);
+      const consumption = reader.read(consumptionPath, { required: false });
+      const consumed = delivery.status === 'CONSUMED'
+        || (consumption?.schema === 'opsle.durable-supervisor.wake-consumption/v1'
+          && consumption.event_id === request.event_id
+          && consumption.delivery_id === delivery.delivery_id
+          && consumption.supervisor_id === delivery.supervisor_id
+          && consumption.supervisor_generation === delivery.supervisor_generation);
+      if (consumed) continue;
+      const historicalTask = request.task_id
+        ? reader.read(join(paths(root).tasks, `${request.task_id}.json`), { required: false })
+        : null;
+      const historicalAttempt = request.attempt_id
+        ? reader.read(join(paths(root).attempts, `${request.attempt_id}.json`), { required: false })
+        : null;
+      if (TERMINAL_TASK_STATES.has(historicalTask?.state)
+          || historicalAttempt?.supervisor_evaluation) continue;
+      items.push({
+        event_id: request.event_id,
+        task_id: request.task_id ?? null,
+        attempt_id: request.attempt_id ?? null,
+        queued_at: request.queued_at ?? null,
+        terminal_type: request.terminal_type ?? null,
+        classification: 'awaiting-consumption',
+        reason: 'delivered-terminal-wake-unconsumed',
+        request_path: requestPath,
+        decision_path: null,
+      });
+      continue;
+    }
+    if (state?.processed_event_ids?.includes(request.event_id)) continue;
     if (request.task_id && request.attempt_id) {
       const task = reader.read(join(paths(root).tasks, `${request.task_id}.json`), { required: false });
       const attempt = reader.read(join(paths(root).attempts, `${request.attempt_id}.json`), { required: false });
       if (TERMINAL_TASK_STATES.has(task?.state) || attempt?.supervisor_evaluation) continue;
     }
-    const deliveryPath = join(base, 'deliveries', `${request.event_id}.json`);
-    const delivery = reader.read(deliveryPath, { required: false });
-    if (delivery && ['DELIVERED', 'CONSUMED'].includes(delivery.status)) continue;
     const decisionPath = join(base, 'activation-decisions', `${request.event_id}.json`);
     const decision = reader.read(decisionPath, { required: false });
     if (decision?.status === 'DELIVERED') continue;
     const uncertain = !validSchema || decision?.status === 'UNCERTAIN';
     items.push({
       event_id: request.event_id,
+      task_id: request.task_id ?? null,
+      attempt_id: request.attempt_id ?? null,
+      queued_at: request.queued_at ?? null,
       terminal_type: request.terminal_type ?? null,
       classification: uncertain ? 'uncertain' : 'queued',
       reason: !validSchema
@@ -239,11 +330,25 @@ function summarizeWake(root, reader, supervisor, state, injectedStatus = null) {
       decision_path: decision ? decisionPath : null,
     });
   }
+  const ranked = items.sort((left, right) => {
+    const leftCurrent = left.task_id === state?.active_task_id
+      && left.attempt_id === state?.active_attempt_id;
+    const rightCurrent = right.task_id === state?.active_task_id
+      && right.attempt_id === state?.active_attempt_id;
+    if (leftCurrent !== rightCurrent) return leftCurrent ? -1 : 1;
+    const priority = { 'awaiting-consumption': 0, uncertain: 1, queued: 2 };
+    const classification = (priority[left.classification] ?? 3)
+      - (priority[right.classification] ?? 3);
+    if (classification !== 0) return classification;
+    return String(right.queued_at ?? '').localeCompare(String(left.queued_at ?? ''));
+  });
   return {
     attention_count: items.length,
     queued: items.filter((item) => item.classification === 'queued').length,
     uncertain: items.filter((item) => item.classification === 'uncertain').length,
-    items,
+    selected_count: Math.min(1, ranked.length),
+    omitted_count: Math.max(0, ranked.length - 1),
+    items: ranked.slice(0, 1),
   };
 }
 
@@ -463,6 +568,7 @@ function deriveNextAction({
   exactSessionStatus,
   objectiveComplete,
   unsatisfiedCount,
+  requirementDriven = true,
   classification,
 }) {
   const taskId = active.activeWork?.task_id;
@@ -471,6 +577,7 @@ function deriveNextAction({
     && exactSessionStatus.valid === true
     && exactSessionStatus.supported === true;
   const hasWakeAttention = (wake.attention_count ?? wake.items?.length ?? 0) > 0;
+  const awaitingConsumption = wake.items?.find((item) => item.classification === 'awaiting-consumption');
   const hasUnresolved = Boolean(state?.latest_unresolved_issue);
 
   if (pausedWithoutWork) {
@@ -481,6 +588,9 @@ function deriveNextAction({
   }
   const awaitingEvaluation = active.attempt && TERMINAL_CHILD_STATES.has(active.attempt.child_state)
     && active.activeWork?.task_state === 'AWAITING_SUPERVISOR';
+  if (awaitingConsumption) {
+    return `Consume delivered terminal wake ${awaitingConsumption.event_id} before evaluating ${taskId}.`;
+  }
   const runnerOnly = ACTIVE_CHILD_STATES.has(active.attempt?.child_state)
     && active.attempt?.wait_registration?.detached_dormancy?.monitoring_owner === 'RUNNER_ONLY';
   if (runnerOnly && !sessionCurrent) {
@@ -506,7 +616,9 @@ function deriveNextAction({
   }
   if (objectiveComplete) return null;
   if (unsatisfiedCount > 0) return 'Select the next unsatisfied requirement slice.';
-  return 'Evaluate objective completion from the authoritative requirement state.';
+  return requirementDriven
+    ? 'Evaluate objective completion from the authoritative requirement state.'
+    : 'Evaluate objective completion from authoritative objective and task evidence.';
 }
 
 function measurePacket(packet) {
@@ -542,9 +654,19 @@ export function generateResumePacket(root, {
   const supervisor = reader.read(p.supervisor);
   const state = reader.read(p.state);
   const objective = reader.read(p.objective);
-  const policy = reader.read(p.policy);
-  const requirements = reader.read(p.requirements);
-  for (const path of [p.supervisor, p.state, p.objective, p.policy, p.requirements]) evidence.authoritative(path);
+  const rawPolicy = reader.read(p.policy);
+  const policy = rawPolicy ? policyWithDefaults(rawPolicy) : null;
+  const bootstrap = reader.read(p.bootstrap, { required: false });
+  const rawRequirements = reader.read(p.requirements, { required: false });
+  const requirements = effectiveRequirementMatrix(root, {
+    bootstrap,
+    matrix: rawRequirements,
+    state,
+  });
+  const requirementDriven = Boolean(requirements);
+  for (const path of [p.supervisor, p.state, p.objective, p.policy]) evidence.authoritative(path);
+  if (bootstrap) evidence.authoritative(p.bootstrap);
+  if (requirements) evidence.authoritative(p.requirements);
 
   if (supervisor && (supervisor.repository !== root || supervisor.authority_status !== 'AUTHORITATIVE'
       || !Number.isSafeInteger(supervisor.generation) || supervisor.generation <= 0)) {
@@ -556,10 +678,11 @@ export function generateResumePacket(root, {
     issues.add('current-objective-revision-missing', 'contradictory');
     evidence.escalation(p.objective, 'current_objective', 'current-objective-revision-missing');
   }
+  const requirementsPresent = Array.isArray(requirements?.requirements);
   const unsatisfied = requirements?.requirements?.filter(
     (item) => !SATISFIED_REQUIREMENT_STATES.has(item.state),
-  ) ?? null;
-  if (!Array.isArray(requirements?.requirements)) {
+  ) ?? [];
+  if (requirementDriven && !requirementsPresent) {
     issues.add('requirements-state-missing', 'incomplete');
     evidence.escalation(p.requirements, 'requirement_states', 'requirements-state-missing');
   }
@@ -588,20 +711,20 @@ export function generateResumePacket(root, {
     : (latestSupervisorDecision ?? active.decision);
 
   const bindingPath = join(p.opsle, 'wake', 'codex-session-binding.json');
-  reader.track(bindingPath);
-  evidence.authoritative(bindingPath);
   let exactSessionStatus = sessionStatus;
   if (!exactSessionStatus) {
     try {
-      exactSessionStatus = codexSessionBindingStatus(root, { dependencies: bindingDependencies });
+      exactSessionStatus = refreshCodexSessionBinding(root, { dependencies: bindingDependencies });
     } catch (error) {
       exactSessionStatus = { classification: 'unknown', valid: false, supported: false, reasons: ['session-status-check-failed'] };
       issues.add('session-status-check-failed', 'incomplete');
     }
   }
+  reader.track(bindingPath);
+  evidence.authoritative(bindingPath);
   if (exactSessionStatus.classification === 'unbound') {
     issues.add('codex-session-binding-unbound', 'requires_escalation');
-  } else if (exactSessionStatus.classification === 'stale') {
+  } else if (['stale', 'attention'].includes(exactSessionStatus.classification)) {
     issues.add('codex-session-binding-stale', 'requires_escalation');
     evidence.escalation(bindingPath, 'session_binding', 'codex-session-binding-stale');
   } else if (!['unbound', 'bound-authoritative-herdr'].includes(exactSessionStatus.classification)) {
@@ -640,14 +763,16 @@ export function generateResumePacket(root, {
     evidence.escalation(p.state, 'resume_fields', 'unresolved-supervisor-state');
   }
   const classification = issues.classification();
-  const objectiveComplete = state?.phase === 'COMPLETE' && unsatisfied?.length === 0;
+  const objectiveComplete = state?.phase === 'COMPLETE'
+    && (!requirementDriven || unsatisfied.length === 0);
   const nextAction = deriveNextAction({
     state,
     active,
     wake,
     exactSessionStatus,
     objectiveComplete,
-    unsatisfiedCount: unsatisfied?.length ?? 0,
+    unsatisfiedCount: requirementDriven ? unsatisfied.length : 0,
+    requirementDriven,
     classification,
   });
   const packet = {
@@ -672,19 +797,20 @@ export function generateResumePacket(root, {
       text: objectiveText,
       objective_compacted: false,
       complete: objectiveComplete,
-      unsatisfied_requirements: unsatisfied?.length ?? null,
+      unsatisfied_requirements: requirementDriven ? unsatisfied.length : null,
     },
     policy: policy ? {
       version: policy.version ?? null,
       providers: Object.fromEntries(Object.entries(policy.providers ?? {}).sort().map(([name, value]) => [name, {
         enabled: value.enabled === true,
-        model: value.model ?? null,
-        reasoning_effort: value.reasoning_effort ?? null,
+        ...(value.model == null ? {} : { model: value.model }),
+        ...(value.reasoning_effort == null ? {} : { reasoning_effort: value.reasoning_effort }),
       }])),
       review: policy.review ?? null,
       gearbox_required: policy.gearbox?.required ?? null,
       model_polling_permitted: policy.model_polling?.permitted ?? null,
       affected_verification: policy.affected_verification?.authority ?? null,
+      context_firewall_enabled: policy.context_firewall?.enabled ?? true,
     } : null,
     pause: state?.pause ?? null,
     active_work: active.activeWork,
@@ -692,7 +818,9 @@ export function generateResumePacket(root, {
       attention_count: wake.attention_count ?? wake.items?.length ?? 0,
       queued: wake.queued ?? 0,
       uncertain: wake.uncertain ?? 0,
-      items: (wake.items ?? []).slice(0, 4).map((item) => ({
+      selected_count: wake.selected_count ?? Math.min(1, wake.items?.length ?? 0),
+      omitted_count: wake.omitted_count ?? Math.max(0, (wake.items?.length ?? 0) - 1),
+      items: (wake.items ?? []).slice(0, 1).map((item) => ({
         event_id: item.event_id,
         terminal_type: item.terminal_type ?? null,
         classification: item.classification,
@@ -715,6 +843,9 @@ export function generateResumePacket(root, {
       estimated_tokens: 0,
     },
   };
+  applyFreshness(packet, reader.authorityFingerprint(), {
+    session_binding_id: exactSessionStatus?.binding?.binding_id ?? null,
+  });
   let serialized = measurePacket(packet);
   let packetBytes = Buffer.byteLength(serialized);
   let packetCharacters = [...serialized].length;
@@ -729,7 +860,7 @@ export function generateResumePacket(root, {
     packet.classification = compactedClassification;
     packet.complete_for_resume = false;
     packet.requires_escalation = true;
-    packet.objective.text = boundedText(objectiveSource, 160);
+    packet.objective.text = boundedText(objectiveSource, 120);
     packet.objective.objective_compacted = true;
     packet.objective.source_sha256 = objectiveText == null ? null : sha256(objectiveText);
     packet.objective.source_reference = {
@@ -744,8 +875,12 @@ export function generateResumePacket(root, {
       wake,
       exactSessionStatus,
       objectiveComplete,
-      unsatisfiedCount: unsatisfied?.length ?? 0,
+      unsatisfiedCount: requirementDriven ? unsatisfied.length : 0,
+      requirementDriven,
       classification: compactedClassification,
+    });
+    applyFreshness(packet, reader.authorityFingerprint(), {
+      session_binding_id: exactSessionStatus?.binding?.binding_id ?? null,
     });
     serialized = measurePacket(packet);
     packetBytes = Buffer.byteLength(serialized);
@@ -833,9 +968,29 @@ function selectedEvidence(value, selector) {
   throw new Error(`unsupported bounded evidence selector: ${selector}`);
 }
 
-export function readResumePacket(root) {
+export function readResumePacket(root, {
+  verifyFreshness = true,
+  bindingDependencies = {},
+  sessionStatus = null,
+  wakeStatus = null,
+} = {}) {
   const packet = JSON.parse(readFileSync(paths(root).resumePacket, 'utf8'));
   if (packet?.schema !== RESUME_PACKET_SCHEMA) throw new Error('unsupported resume packet schema');
+  if (verifyFreshness && packet.complete_for_resume) {
+    if (packet.freshness?.schema !== RESUME_FRESHNESS_SCHEMA
+        || typeof packet.freshness?.authority_sha256 !== 'string') {
+      throw new Error('complete resume packet lacks a freshness fence; regenerate it');
+    }
+    const current = generateResumePacket(root, {
+      persist: false,
+      bindingDependencies,
+      sessionStatus,
+      wakeStatus,
+    }).packet;
+    if (current.freshness.authority_sha256 !== packet.freshness.authority_sha256) {
+      throw new Error('complete resume packet is stale; regenerate it');
+    }
+  }
   return packet;
 }
 

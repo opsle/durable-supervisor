@@ -2,10 +2,12 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
   closeSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   openSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -20,6 +22,7 @@ import {
   RESUME_PACKET_SCHEMA,
   generateResumePacket,
   readResumeEvidence,
+  readResumePacket,
 } from '../src/reconstruction.js';
 import { paths } from '../src/state.js';
 
@@ -398,6 +401,83 @@ test('receipt-free current-generation queued wake requires its exact request evi
   }]);
 });
 
+test('wake reconstruction selects one current event and reports omitted attention within budget', () => {
+  const root = fixture();
+  for (let index = 0; index < 5; index += 1) {
+    const eventId = `event-bounded-${index}`;
+    writeJson(join(root, '.opsle', 'wake', 'requests', `${eventId}.json`), {
+      schema: 'opsle.durable-supervisor.host-wake-request/v1',
+      event_id: eventId,
+      terminal_type: 'intervention-required',
+      queued_at: `2026-09-03T00:00:0${index}.000Z`,
+      target: {
+        supervisor_id: 'supervisor-reconstruction-fixture',
+        supervisor_generation: 3,
+      },
+    });
+  }
+  const { packet, serialized } = generate(root);
+  assert.equal(packet.wake_attention.attention_count, 5);
+  assert.equal(packet.wake_attention.selected_count, 1);
+  assert.equal(packet.wake_attention.omitted_count, 4);
+  assert.equal(packet.wake_attention.items[0].event_id, 'event-bounded-4');
+  assert.ok(Buffer.byteLength(serialized) <= PACKET_BYTE_CEILING);
+  assert.equal(packet.evidence.escalation.length, 1);
+});
+
+test('historically evaluated delivery without consumption is inert without rewriting evidence', () => {
+  const root = fixture();
+  addActiveWork(root);
+  const statePath = join(root, '.opsle', 'state.json');
+  const taskPath = join(root, '.opsle', 'tasks', 'task-active.json');
+  const attemptPath = join(root, '.opsle', 'children', 'task-active-attempt-001.json');
+  const state = readJson(statePath);
+  state.active_task_id = null;
+  state.active_attempt_id = null;
+  state.latest_accepted_task_id = 'task-active';
+  writeJson(statePath, state);
+  const task = readJson(taskPath);
+  task.state = 'ACCEPTED';
+  writeJson(taskPath, task);
+  const attempt = readJson(attemptPath);
+  attempt.supervisor_evaluation = {
+    decision_id: 'decision-historical',
+    decision: 'ACCEPT',
+    rationale: 'historical pre-consumption enforcement',
+    evaluated_at: '2026-09-02T00:00:00.000Z',
+  };
+  writeJson(attemptPath, attempt);
+  const eventId = 'event-historical-delivered';
+  writeJson(join(root, '.opsle', 'wake', 'requests', `${eventId}.json`), {
+    schema: 'opsle.durable-supervisor.native-wake-request/v2',
+    event_id: eventId,
+    task_id: 'task-active',
+    attempt_id: 'task-active-attempt-001',
+    terminal_type: 'child-completed',
+    target: {
+      supervisor_id: 'supervisor-reconstruction-fixture',
+      supervisor_generation: 3,
+    },
+  });
+  const deliveryPath = join(root, '.opsle', 'wake', 'deliveries', `${eventId}.json`);
+  writeJson(deliveryPath, {
+    schema: 'opsle.durable-supervisor.host-wake-delivery/v1',
+    delivery_id: 'delivery-historical',
+    event_id: eventId,
+    supervisor_id: 'supervisor-reconstruction-fixture',
+    supervisor_generation: 3,
+    status: 'DELIVERED',
+    consumed_at: null,
+  });
+  const before = readFileSync(deliveryPath);
+  const packet = generate(root).packet;
+  assert.equal(packet.wake_attention.attention_count, 0);
+  assert.deepEqual(readFileSync(deliveryPath), before);
+  assert.equal(existsSync(join(
+    root, '.opsle', 'wake', 'consumptions', `${eventId}.json`,
+  )), false);
+});
+
 test('claim and fence contradictions are explicit and never cleaned by inference', () => {
   const root = fixture();
   addActiveWork(root, { indexedClaim: { fence_generation: 99 } });
@@ -556,6 +636,93 @@ test('oversize objective compaction is explicit, deterministic, and escalation-l
   assert.ok(first.packet.budget.estimated_tokens <= PACKET_TOKEN_BUDGET);
   assert.doesNotMatch(first.serialized, /x{1000}/);
   assert.notEqual(first.telemetry.generated_at, second.telemetry.generated_at);
+});
+
+test('complete resume packets fence every decision-relevant authority change', () => {
+  const cases = [
+    ['objective', (root) => {
+      const objective = readJson(join(root, '.opsle', 'objective.json'));
+      objective.history[0].objective = 'Changed objective authority.';
+      writeJson(join(root, '.opsle', 'objective.json'), objective);
+      return {};
+    }],
+    ['task', (root) => {
+      const task = readJson(join(root, '.opsle', 'tasks', 'task-active.json'));
+      task.scope = ['changed-authority'];
+      writeJson(join(root, '.opsle', 'tasks', 'task-active.json'), task);
+      return {};
+    }],
+    ['decision', (root) => {
+      const path = join(root, '.opsle', 'children', 'task-active-attempt-001.json');
+      const attempt = readJson(path);
+      attempt.policy_snapshot.gearbox_decision.decision_id = 'gearbox-replaced';
+      writeJson(path, attempt);
+      return {};
+    }],
+    ['pause', (root) => {
+      const state = readJson(join(root, '.opsle', 'state.json'));
+      state.pause = { active: true, after_current: true, reason: 'new pause', changed_at: 'later' };
+      writeJson(join(root, '.opsle', 'state.json'), state);
+      return {};
+    }],
+    ['unresolved', (root) => {
+      const state = readJson(join(root, '.opsle', 'state.json'));
+      state.latest_unresolved_issue = 'new unresolved authority';
+      writeJson(join(root, '.opsle', 'state.json'), state);
+      return {};
+    }],
+    ['wake', (root) => {
+      writeJson(join(root, '.opsle', 'wake', 'requests', 'event-new.json'), {
+        schema: 'opsle.durable-supervisor.host-wake-request/v1',
+        event_id: 'event-new',
+        terminal_type: 'intervention-required',
+        target: { supervisor_id: 'supervisor-reconstruction-fixture', supervisor_generation: 3 },
+      });
+      return {};
+    }],
+    ['session binding', () => ({ sessionStatus: {
+      ...currentSession(),
+      binding: { ...currentSession().binding, binding_id: 'binding-replaced' },
+    } })],
+    ['supervisor generation', (root) => {
+      const supervisor = readJson(join(root, '.opsle', 'supervisor.json'));
+      supervisor.generation = 4;
+      writeJson(join(root, '.opsle', 'supervisor.json'), supervisor);
+      return { sessionStatus: currentSession(4) };
+    }],
+  ];
+
+  for (const [label, mutate] of cases) {
+    const root = fixture();
+    try {
+      addActiveWork(root);
+      generateResumePacket(root, { sessionStatus: currentSession() });
+      assert.equal(readResumePacket(root, { sessionStatus: currentSession() }).complete_for_resume, true);
+      const options = mutate(root);
+      assert.throws(
+        () => readResumePacket(root, { sessionStatus: currentSession(), ...options }),
+        /resume packet is stale/,
+        label,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('resume freshness ignores telemetry-only timestamp changes', () => {
+  const root = fixture();
+  try {
+    addActiveWork(root);
+    generateResumePacket(root, { sessionStatus: currentSession() });
+    const path = join(root, '.opsle', 'children', 'task-active-attempt-001.json');
+    const attempt = readJson(path);
+    attempt.telemetry = { updated_at: '2099-01-01T00:00:00.000Z' };
+    writeJson(path, attempt);
+    assert.equal(readResumePacket(root, { sessionStatus: currentSession() }).complete_for_resume, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('fresh process consumes packet only and generation never ingests broad history', () => {

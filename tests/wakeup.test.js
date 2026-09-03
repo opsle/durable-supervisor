@@ -55,14 +55,19 @@ import {
   CODEX_RESUME_HELPER_TIMEOUT_MS,
   plainCodexResumeTransport,
   processIdentity,
+  refreshCodexSessionBinding,
   registerBoundRolloutOpportunity,
   registerWait,
   releaseActivationLease,
   runWakeDispatcher,
   updateCommittedWakeCleanup,
+  wakeDeliveryConsumptionStatus,
+  WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+  wakeQueueStatus,
 } from '../src/wakeup.js';
 import { sessionCommand } from '../src/cli.js';
 import { resumeHelperResult } from '../bin/opsle-codex-resume.js';
+import { generateResumePacket, readResumePacket } from '../src/reconstruction.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 
@@ -121,6 +126,7 @@ function stageDispatcher(root, {
     schema: 'opsle.durable-supervisor.host-wake-dispatcher/v1',
     dispatcher_id: dispatcherId,
     dispatcher_generation: dispatcherGeneration,
+    implementation_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
     queue_generation: supervisor.generation,
@@ -189,7 +195,7 @@ function terminalEvent(root, suffix = 'one') {
   });
 }
 
-function bindingFixture(root, { duplicate = false, bind = true } = {}) {
+function bindingFixture(root, { duplicate = false, bind = true, legacyTmuxSession = null } = {}) {
   const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
   const sessionsRoot = join(root, 'codex-sessions');
   mkdirSync(sessionsRoot, { recursive: true });
@@ -220,11 +226,51 @@ function bindingFixture(root, { duplicate = false, bind = true } = {}) {
     pane_id: 'pane-1',
     terminal_id: 'terminal-1',
   };
+  const snapshot = () => ({
+    type: 'session_snapshot',
+    snapshot: {
+      version: '1.2.3',
+      protocol: 20,
+      workspaces: [{
+        workspace_id: host.workspace_id,
+        worktree: { checkout_path: root, repo_root: root },
+      }],
+      panes: [{
+        workspace_id: host.workspace_id,
+        tab_id: 'tab-1',
+        pane_id: host.pane_id,
+        terminal_id: host.terminal_id,
+        cwd: root,
+        foreground_cwd: root,
+        agent: 'codex',
+        agent_session: { source: 'integration', agent: 'codex', kind: 'id', value: sessionId },
+        revision: 1,
+      }],
+      agents: [],
+      tabs: [],
+      layouts: [],
+    },
+  });
   const dependencies = {
     processIdentity: (pid) => structuredClone(processes.get(pid) ?? null),
     codexVersion: () => 'codex-cli 0.152.0',
     uid: () => 1000,
     legacyTmuxAuthority: () => false,
+    environment: () => ({
+      CODEX_SESSION_ID: sessionId,
+      CODEX_THREAD_ID: sessionId,
+      CODEX_HOME: root,
+    }),
+    sessionsRoot: () => sessionsRoot,
+    herdrSnapshot: snapshot,
+    herdrPaneProcessInfo: () => ({
+      type: 'pane_process_info',
+      process_info: {
+        pane_id: host.pane_id,
+        tty: '/dev/pts/7',
+        foreground_processes: [{ pid: 700, name: 'codex', cwd: root }],
+      },
+    }),
   };
   if (!duplicate && bind) {
     bindCodexSession(root, {
@@ -236,6 +282,7 @@ function bindingFixture(root, { duplicate = false, bind = true } = {}) {
       workspaceCwd: host.workspace_cwd,
       paneId: host.pane_id,
       terminalId: host.terminal_id,
+      legacyTmuxSession,
     }, { dependencies });
   }
   return { sessionId, sessionsRoot, rolloutPath, processes, host, dependencies };
@@ -1573,6 +1620,17 @@ test('duplicate dispatcher start is idempotent and exact process death advances 
     assert.equal(restarted.started, true);
     assert.equal(restarted.dispatcher.dispatcher_generation, first.dispatcher.dispatcher_generation + 1);
     assert.equal(nextPid, 8202);
+
+    restarted.dispatcher.implementation_sha256 = '0'.repeat(64);
+    writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), restarted.dispatcher);
+    const upgraded = ensureWakeDispatcher(root, { spawnProcess, getProcessIdentity });
+    assert.equal(upgraded.started, true);
+    assert.equal(upgraded.dispatcher.dispatcher_generation, restarted.dispatcher.dispatcher_generation + 1);
+    assert.equal(
+      upgraded.dispatcher.implementation_sha256,
+      WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+    );
+    assert.equal(nextPid, 8203);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1603,18 +1661,18 @@ test('authoritative Herdr Codex binding validates exact identity and rejects gen
     assert.equal(status.binding.host.authority, 'authoritative');
     assert.equal(status.binding.host.process.uid, 1000);
     assert.equal(status.binding.native_wake.transport, 'plain-codex-resume');
+    assert.equal(status.binding.authority_fence.legacy_tmux_session, null);
+    assert.equal(status.binding.authority_fence.legacy_tmux_fallback_configured, false);
     assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
 
     const supervisor = readJson(paths(root).supervisor);
     supervisor.generation += 1;
     writeJson(paths(root).supervisor, supervisor);
-    const stale = sessionCommand(root, 'status', [], { dependencies: bound.dependencies });
-    assert.equal(stale.valid, false);
-    assert.ok(stale.reasons.includes('supervisor-generation-stale'));
-    assert.throws(
-      () => sessionCommand(root, 'adopt', [], { dependencies: bound.dependencies }),
-      /must be replaced|generation drift/,
-    );
+    const refreshed = sessionCommand(root, 'status', [], { dependencies: bound.dependencies });
+    assert.equal(refreshed.valid, true);
+    assert.equal(refreshed.binding.supervisor_generation, supervisor.generation);
+    assert.equal(refreshed.binding.binding_revision, status.binding.binding_revision + 1);
+    assert.equal(sessionCommand(root, 'adopt', [], { dependencies: bound.dependencies }).adopted, false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1688,8 +1746,8 @@ test('session binding fails deterministically for duplicate and mismatched ident
       binding: old,
       dependencies: first.dependencies,
     });
-    assert.equal(stale.valid, false);
-    assert.ok(stale.reasons.includes('session-binding-superseded'));
+    assert.equal(stale.valid, true);
+    assert.equal(stale.binding.binding_id, old.binding_id);
   } finally {
     rmSync(supersededRoot, { recursive: true, force: true });
   }
@@ -1699,7 +1757,11 @@ test('session binding fails deterministically for duplicate and mismatched ident
     const bound = bindingFixture(identityRoot);
     const binding = readJson(join(identityRoot, '.opsle', 'wake', 'codex-session-binding.json'));
     const changedSession = codexSessionBindingStatus(identityRoot, {
-      binding: { ...binding, codex_session_uuid: '01a05952-e1fa-71e2-adea-df7e3f7d99cf' },
+      binding: {
+        ...binding,
+        codex_session_uuid: '01a05952-e1fa-71e2-adea-df7e3f7d99cf',
+        codex_thread_uuid: '01a05952-e1fa-71e2-adea-df7e3f7d99cf',
+      },
       dependencies: bound.dependencies,
     });
     assert.equal(changedSession.valid, false);
@@ -1750,7 +1812,7 @@ test('session binding fails deterministically for duplicate and mismatched ident
 test('authoritative Herdr binding rejects stale tmux authority before any transport call', async () => {
   const root = fixture();
   try {
-    const bound = bindingFixture(root);
+    const bound = bindingFixture(root, { legacyTmuxSession: 'opsle-wake-fixture' });
     const event = terminalEvent(root, 'unsupported-writer');
     enqueueTerminalWake(root, event);
     let resumeCalls = 0;
@@ -1793,6 +1855,316 @@ test('authoritative Herdr binding rejects stale tmux authority before any transp
     });
     assert.equal(dispatched.results[0].classification, 'queued');
     assert.equal(resumeCalls, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ephemeral binding refresh replaces frontend and rollout identities without changing supervisor identity', () => {
+  const root = fixture();
+  try {
+    const bound = bindingFixture(root);
+    const bindingPath = join(root, '.opsle', 'wake', 'codex-session-binding.json');
+    const first = readJson(bindingPath);
+    const firstSha = sha256(readFileSync(bindingPath));
+    const supervisorBefore = readJson(paths(root).supervisor);
+    const nextSession = '01a05952-e1fa-71e2-adea-df7e3f7d99cf';
+    const nextRollout = join(bound.sessionsRoot, 'rollout-next.jsonl');
+    writeFileSync(nextRollout, `${JSON.stringify({
+      type: 'session_meta', payload: { id: nextSession, cwd: root },
+    })}\n`);
+    bound.processes.set(701, {
+      ...bound.processes.get(700),
+      pid: 701,
+      start_time_ticks: '7010',
+      tty: '/dev/pts/8',
+      command_line_sha256: 'b'.repeat(64),
+    });
+    const snapshot = structuredClone(bound.dependencies.herdrSnapshot());
+    const pane = snapshot.snapshot.panes[0];
+    pane.pane_id = 'pane-2';
+    pane.terminal_id = 'terminal-2';
+    pane.agent_session.value = nextSession;
+    const dependencies = {
+      ...bound.dependencies,
+      environment: () => ({
+        CODEX_SESSION_ID: nextSession,
+        CODEX_THREAD_ID: nextSession,
+        CODEX_HOME: root,
+      }),
+      herdrSnapshot: () => structuredClone(snapshot),
+      herdrPaneProcessInfo: () => ({
+        type: 'pane_process_info',
+        process_info: {
+          pane_id: 'pane-2',
+          tty: '/dev/pts/8',
+          foreground_processes: [{ pid: 701, name: 'codex', cwd: root }],
+        },
+      }),
+    };
+    const refreshed = refreshCodexSessionBinding(root, { dependencies });
+    assert.equal(refreshed.valid, true);
+    assert.equal(refreshed.refreshed, true);
+    assert.equal(refreshed.binding.binding_revision, first.binding_revision + 1);
+    assert.equal(refreshed.binding.codex_session_uuid, nextSession);
+    assert.equal(refreshed.binding.rollout.realpath, realpathSync(nextRollout));
+    assert.equal(refreshed.binding.host.pane_id, 'pane-2');
+    assert.equal(refreshed.binding.host.process.pid, 701);
+    assert.deepEqual(readJson(paths(root).supervisor), supervisorBefore);
+    assert.equal(existsSync(join(
+      root, '.opsle', 'wake', 'session-binding-history', `${firstSha}.json`,
+    )), true);
+    const repeated = refreshCodexSessionBinding(root, { dependencies });
+    assert.equal(repeated.refreshed, false);
+    assert.equal(repeated.binding.binding_id, refreshed.binding.binding_id);
+
+    unlinkSync(nextRollout);
+    const rotatedRollout = join(bound.sessionsRoot, 'rollout-next-rotated.jsonl');
+    writeFileSync(rotatedRollout, `${JSON.stringify({
+      type: 'session_meta', payload: { id: nextSession, cwd: root },
+    })}\n`);
+    const rotated = refreshCodexSessionBinding(root, { dependencies });
+    assert.equal(rotated.valid, true);
+    assert.equal(rotated.binding.binding_revision, refreshed.binding.binding_revision + 1);
+    assert.equal(rotated.binding.rollout.realpath, realpathSync(rotatedRollout));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('current Herdr snapshot refreshes from the attached frontend environment without embedded session metadata', () => {
+  const root = fixture();
+  try {
+    const bound = bindingFixture(root);
+    const snapshot = structuredClone(bound.dependencies.herdrSnapshot());
+    delete snapshot.snapshot.workspaces[0].worktree;
+    delete snapshot.snapshot.panes[0].agent_session;
+    snapshot.snapshot.agents = [structuredClone(snapshot.snapshot.panes[0])];
+    bound.processes.set(699, {
+      ...bound.processes.get(700),
+      pid: 699,
+      start_time_ticks: '6990',
+      executable: '/usr/bin/node',
+      command_line_sha256: '9'.repeat(64),
+    });
+    const dependencies = {
+      ...bound.dependencies,
+      herdrSnapshot: () => structuredClone(snapshot),
+      herdrPaneProcessInfo: () => ({
+        type: 'pane_process_info',
+        process_info: {
+          pane_id: bound.host.pane_id,
+          foreground_process_group_id: 699,
+          foreground_processes: [
+            { pid: 699, name: 'MainThread', cmdline: 'node /opt/codex agents', cwd: root },
+            { pid: 700, name: 'codex', cmdline: '/opt/codex agents', cwd: root },
+          ],
+        },
+      }),
+    };
+    const refreshed = refreshCodexSessionBinding(root, { dependencies });
+    assert.equal(refreshed.valid, true);
+    assert.equal(refreshed.binding.codex_session_uuid, bound.sessionId);
+    assert.equal(refreshed.binding.host.process.pid, 699);
+
+    const dispatcherRefresh = refreshCodexSessionBinding(root, {
+      dependencies: {
+        ...dependencies,
+        environment: () => ({
+          CODEX_SESSION_ID: '01a05952-e1fa-71e2-adea-df7e3f7d9999',
+          CODEX_THREAD_ID: '01a05952-e1fa-71e2-adea-df7e3f7d9999',
+          CODEX_HOME: root,
+        }),
+      },
+      allowEnvironmentMismatch: true,
+    });
+    assert.equal(dispatcherRefresh.valid, true);
+    assert.equal(dispatcherRefresh.binding.binding_id, refreshed.binding.binding_id);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('refresh invalidates current use on ambiguity, detached environment, races, and dual tmux authority', () => {
+  const cases = [
+    ['ambiguous Herdr candidates', (bound) => {
+      const snapshot = structuredClone(bound.dependencies.herdrSnapshot());
+      snapshot.snapshot.panes.push({
+        ...structuredClone(snapshot.snapshot.panes[0]),
+        pane_id: 'pane-duplicate',
+        terminal_id: 'terminal-duplicate',
+      });
+      return { herdrSnapshot: () => structuredClone(snapshot) };
+    }],
+    ['detached child environment', (bound) => ({
+      environment: () => ({
+        CODEX_SESSION_ID: '01a05952-e1fa-71e2-adea-df7e3f7d9999',
+        CODEX_THREAD_ID: '01a05952-e1fa-71e2-adea-df7e3f7d9999',
+        CODEX_HOME: bound.sessionsRoot,
+      }),
+    })],
+    ['frontend discovery race', (bound) => {
+      let calls = 0;
+      return { herdrSnapshot: () => {
+        const snapshot = structuredClone(bound.dependencies.herdrSnapshot());
+        calls += 1;
+        if (calls === 2) snapshot.snapshot.panes[0].terminal_id = 'terminal-raced';
+        return snapshot;
+      } };
+    }],
+    ['dual tmux authority', () => ({ legacyTmuxAuthority: () => true })],
+  ];
+  for (const [label, mutate] of cases) {
+    const root = fixture();
+    try {
+      const bound = bindingFixture(root);
+      const first = readJson(join(root, '.opsle', 'wake', 'codex-session-binding.json'));
+      const dependencies = { ...bound.dependencies, ...mutate(bound) };
+      const invalid = refreshCodexSessionBinding(root, { dependencies });
+      assert.equal(invalid.valid, false, label);
+      assert.equal(invalid.classification, 'attention', label);
+      assert.equal(invalid.binding.state, 'INVALID', label);
+      assert.equal(invalid.binding.binding_revision, first.binding_revision + 1, label);
+      assert.equal(invalid.binding.codex_session_uuid, undefined, label);
+      assert.equal(invalid.binding.rollout, undefined, label);
+      assert.equal(invalid.binding.host, undefined, label);
+      const repeated = refreshCodexSessionBinding(root, { dependencies });
+      if (label === 'frontend discovery race') {
+        assert.equal(repeated.valid, true, label);
+        assert.equal(repeated.binding.binding_revision, invalid.binding.binding_revision + 1, label);
+      } else {
+        assert.equal(repeated.binding.binding_id, invalid.binding.binding_id, label);
+        assert.equal(repeated.binding.binding_revision, invalid.binding.binding_revision, label);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('legacy v2 binding migrates once to the current ephemeral schema', () => {
+  const root = fixture();
+  try {
+    const bound = bindingFixture(root);
+    const path = join(root, '.opsle', 'wake', 'codex-session-binding.json');
+    const legacy = readJson(path);
+    legacy.schema = 'opsle.durable-supervisor.codex-session-binding/v2';
+    delete legacy.state;
+    delete legacy.binding_revision;
+    delete legacy.codex_thread_uuid;
+    writeJson(path, legacy);
+    const legacySha = sha256(readFileSync(path));
+    const migrated = refreshCodexSessionBinding(root, { dependencies: bound.dependencies });
+    assert.equal(migrated.binding.schema, 'opsle.durable-supervisor.codex-session-binding/v3');
+    assert.equal(migrated.binding.binding_revision, 1);
+    assert.equal(migrated.binding.codex_thread_uuid, bound.sessionId);
+    assert.equal(existsSync(join(
+      root, '.opsle', 'wake', 'session-binding-history', `${legacySha}.json`,
+    )), true);
+    assert.equal(refreshCodexSessionBinding(root, {
+      dependencies: bound.dependencies,
+    }).refreshed, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('binding revision is shared by status and resume freshness invalidates on frontend replacement', () => {
+  const root = fixture();
+  try {
+    const bound = bindingFixture(root);
+    const initial = sessionCommand(root, 'status', [], { dependencies: bound.dependencies });
+    const wake = wakeQueueStatus(root, { bindingDependencies: bound.dependencies });
+    assert.equal(wake.session_binding.binding_revision, initial.binding_revision);
+    generateResumePacket(root, { bindingDependencies: bound.dependencies });
+
+    const nextSession = '01a05952-e1fa-71e2-adea-df7e3f7d99cf';
+    writeFileSync(join(bound.sessionsRoot, 'rollout-resume-next.jsonl'), `${JSON.stringify({
+      type: 'session_meta', payload: { id: nextSession, cwd: root },
+    })}\n`);
+    const snapshot = structuredClone(bound.dependencies.herdrSnapshot());
+    snapshot.snapshot.panes[0].agent_session.value = nextSession;
+    const dependencies = {
+      ...bound.dependencies,
+      environment: () => ({
+        CODEX_SESSION_ID: nextSession,
+        CODEX_THREAD_ID: nextSession,
+        CODEX_HOME: root,
+      }),
+      herdrSnapshot: () => structuredClone(snapshot),
+    };
+    assert.throws(
+      () => readResumePacket(root, { bindingDependencies: dependencies }),
+      /resume packet is stale/,
+    );
+    const regenerated = generateResumePacket(root, { bindingDependencies: dependencies }).packet;
+    assert.equal(regenerated.session_binding.binding_revision, initial.binding_revision + 1);
+    assert.equal(regenerated.session_binding.codex_session_uuid, nextSession);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('dispatcher refreshes immediately before delivery and never resumes a superseded frontend', () => {
+  const root = fixture();
+  try {
+    const bound = bindingFixture(root);
+    const nextSession = '01a05952-e1fa-71e2-adea-df7e3f7d99cf';
+    writeFileSync(join(bound.sessionsRoot, 'rollout-dispatcher-next.jsonl'), `${JSON.stringify({
+      type: 'session_meta', payload: { id: nextSession, cwd: root },
+    })}\n`);
+    bound.processes.set(701, {
+      ...bound.processes.get(700), pid: 701, start_time_ticks: '7010', command_line_sha256: 'c'.repeat(64),
+    });
+    let snapshotCalls = 0;
+    const nextSnapshot = () => {
+      const value = structuredClone(bound.dependencies.herdrSnapshot());
+      value.snapshot.panes[0].agent_session.value = nextSession;
+      return value;
+    };
+    const dependencies = {
+      ...bound.dependencies,
+      environment: () => {
+        const session = snapshotCalls >= 2 ? nextSession : bound.sessionId;
+        return { CODEX_SESSION_ID: session, CODEX_THREAD_ID: session, CODEX_HOME: root };
+      },
+      herdrSnapshot: () => {
+        snapshotCalls += 1;
+        return snapshotCalls <= 2
+          ? bound.dependencies.herdrSnapshot()
+          : nextSnapshot();
+      },
+      herdrPaneProcessInfo: () => ({
+        type: 'pane_process_info',
+        process_info: {
+          pane_id: bound.host.pane_id,
+          tty: '/dev/pts/7',
+          foreground_processes: [{
+            pid: snapshotCalls <= 2 ? 700 : 701,
+            name: 'codex',
+            cwd: root,
+          }],
+        },
+      }),
+    };
+    const event = terminalEvent(root, 'dispatcher-refresh');
+    enqueueTerminalWake(root, event);
+    const dispatcher = stageCurrentDispatcher(root);
+    let resumes = 0;
+    const result = deliverWake(root, event.event_id, {
+      dispatcher,
+      bindingDependencies: dependencies,
+      nativeTransport: {
+        kind: 'plain-codex-resume',
+        resume: () => { resumes += 1; },
+      },
+    });
+    assert.equal(result.delivered, false);
+    assert.equal(result.reason, 'session-binding-revision-changed');
+    assert.equal(resumes, 0);
+    assert.equal(readJson(join(
+      root, '.opsle', 'wake', 'codex-session-binding.json',
+    )).codex_session_uuid, nextSession);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1849,14 +2221,38 @@ test('unchanged delivery fences preserve canonical plain Codex resume exactly on
       && entry.source_event_id === event.event_id
     )).length, 1);
     const generation = readJson(paths(root).supervisor).generation;
+    const receiptPath = join(root, '.opsle', 'wake', 'deliveries', `${event.event_id}.json`);
+    const receiptBeforeConsumption = readFileSync(receiptPath);
     assert.throws(() => consumeWakeDelivery(root, event.event_id, {
       deliveryId: delivered.receipt.delivery_id,
       generation: generation + 1,
     }), /stale supervisor generation/);
+    const consumed = consumeWakeDelivery(root, event.event_id, {
+      deliveryId: delivered.receipt.delivery_id,
+      generation,
+    });
+    assert.equal(consumed.duplicate, false);
+    assert.deepEqual(readFileSync(receiptPath), receiptBeforeConsumption);
+    assert.equal(wakeDeliveryConsumptionStatus(root, event.event_id).consumed, true);
     assert.equal(consumeWakeDelivery(root, event.event_id, {
       deliveryId: delivered.receipt.delivery_id,
       generation,
-    }).duplicate, false);
+    }).duplicate, true);
+    assert.throws(() => consumeWakeDelivery(root, event.event_id, {
+      deliveryId: 'delivery-wrong',
+      generation,
+    }), /identity mismatch/);
+
+    const secondEvent = terminalEvent(root, 'implicit-delivery-id');
+    enqueueTerminalWake(root, secondEvent);
+    const secondDelivered = deliverWake(root, secondEvent.event_id, {
+      nativeTransport,
+      bindingDependencies: bound.dependencies,
+      dispatcher,
+    });
+    assert.equal(consumeWakeDelivery(root, secondEvent.event_id, {
+      generation,
+    }).consumption.delivery_id, secondDelivered.receipt.delivery_id);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

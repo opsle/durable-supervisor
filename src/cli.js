@@ -1,6 +1,13 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { basename, join, relative } from 'node:path';
+import {
+  basename,
+  dirname,
+  join,
+  relative,
+  resolve,
+} from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   appendEvent,
@@ -16,9 +23,11 @@ import {
   NEXT_UNSATISFIED_REQUIREMENT_ACTION,
   REVIEW_MODES,
   derivePendingNextAction,
+  effectiveRequirementMatrix,
   emit,
   initialize,
   paths,
+  policyWithDefaults,
   repositoryRoot,
   setRequirements,
   updateState,
@@ -59,10 +68,12 @@ import {
   adoptQueuedWakes,
   applyWakeEvent,
   bindCodexSession,
-  codexSessionBindingStatus,
   consumeWakeDelivery,
   drainWakeQueue,
   ensureWakeDispatcher,
+  refreshCodexSessionBinding,
+  unconsumedDeliveredWakes,
+  wakeDeliveryConsumptionStatus,
   wakeQueueStatus,
 } from './wakeup.js';
 
@@ -70,7 +81,8 @@ function usage() {
   return `usage: opsle COMMAND
 
 commands:
-  init
+  --version
+  init [--objective TEXT] [--json]
   status [--verbose|--json] [--watch [--iterations N] [--interval-ms MS]]
   validate
   recover
@@ -87,6 +99,7 @@ commands:
   policy status [--verbose|--json]
   policy enable PROVIDER
   policy disable PROVIDER
+  policy context-firewall enable|disable
   policy review MODE [--reviewer PROVIDER]
   models status [--verbose|--json]
   models enable|disable [PROVIDER]
@@ -123,6 +136,37 @@ function print(value) {
   process.stdout.write(`${typeof value === 'string' ? value : JSON.stringify(value, null, 2)}\n`);
 }
 
+const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+export function versionInfo({ run = spawnSync } = {}) {
+  const manifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
+  const source = run('git', ['-C', packageRoot, 'rev-parse', '--verify', 'HEAD'], { encoding: 'utf8' });
+  const sourceRevision = source.status === 0 ? source.stdout.trim() : null;
+  const sourceStatus = sourceRevision
+    ? run('git', [
+      '-C', packageRoot, 'status', '--porcelain', '--untracked-files=all',
+      '--', '.', ':(exclude).opsle', ':(exclude)graphify-out',
+    ], { encoding: 'utf8' })
+    : null;
+  const sourceDirty = sourceStatus?.status === 0 ? sourceStatus.stdout.trim().length > 0 : null;
+  const buildRevision = process.env.OPSLE_BUILD_REVISION?.trim() || null;
+  return {
+    name: manifest.name,
+    version: manifest.version,
+    source_revision: sourceRevision,
+    source_dirty: sourceDirty,
+    build_revision: buildRevision,
+  };
+}
+
+function renderVersion(value) {
+  const provenance = [
+    value.source_revision ? `source ${value.source_revision}${value.source_dirty ? ' (dirty worktree)' : ''}` : null,
+    value.build_revision ? `build ${value.build_revision}` : null,
+  ].filter(Boolean).join('; ');
+  return `opsle ${value.version}${provenance ? `\n${provenance}` : ''}`;
+}
+
 function outputMode(args) {
   const json = args.includes('--json');
   const verbose = args.includes('--verbose');
@@ -142,7 +186,7 @@ function integerOption(args, flag, fallback, { minimum = 1, maximum = Number.MAX
 }
 
 export function sessionCommand(root, subcommand, args, { dependencies = {} } = {}) {
-  if (subcommand === 'status') return codexSessionBindingStatus(root, { dependencies });
+  if (subcommand === 'status') return refreshCodexSessionBinding(root, { dependencies });
   if (subcommand === 'adopt') return adoptCodexSessionBinding(root, { dependencies });
   if (subcommand !== 'bind') throw new Error('session requires bind, status, or adopt');
   const required = [
@@ -197,7 +241,8 @@ function measuredElapsedMs(attempt) {
 
 function updatePolicy(root, mutate, actor = 'operator-cli') {
   const p = paths(root);
-  const policy = readJson(p.policy);
+  const policy = policyWithDefaults(readJson(p.policy));
+  delete policy.context_firewall.defaulted_for_compatibility;
   const before = JSON.parse(JSON.stringify(policy));
   mutate(policy);
   policy.version += 1;
@@ -215,7 +260,17 @@ function updatePolicy(root, mutate, actor = 'operator-cli') {
 }
 
 function requirementsSummary(root, json) {
-  const matrix = readJson(paths(root).requirements);
+  const p = paths(root);
+  const bootstrap = existsSync(p.bootstrap) ? readJson(p.bootstrap) : null;
+  const rawMatrix = existsSync(p.requirements) ? readJson(p.requirements) : null;
+  const matrix = effectiveRequirementMatrix(root, {
+    bootstrap,
+    matrix: rawMatrix,
+    state: readJson(p.state),
+  });
+  if (!matrix) {
+    return json ? { mode: 'objective_driven', requirements: null } : 'Requirements: none (objective-driven repository)';
+  }
   if (json) return matrix;
   const counts = Object.fromEntries(matrix.allowed_states.map((state) => [state, 0]));
   for (const requirement of matrix.requirements) counts[requirement.state] += 1;
@@ -234,9 +289,13 @@ function setObjective(root, text, actor = 'operator-cli') {
   if (!objectiveText) throw new Error('objective set requires nonempty --text TEXT');
   const p = paths(root);
   const objective = readJson(p.objective);
-  const previous = objective.history.find((item) => item.revision === objective.current_revision);
-  if (!previous) throw new Error(`current objective revision is missing: ${objective.current_revision}`);
-  if (previous.objective === objectiveText) throw new Error('objective is unchanged');
+  const previous = objective.current_revision === 0
+    ? null
+    : objective.history.find((item) => item.revision === objective.current_revision);
+  if (objective.current_revision !== 0 && !previous) {
+    throw new Error(`current objective revision is missing: ${objective.current_revision}`);
+  }
+  if (previous?.objective === objectiveText) throw new Error('objective is unchanged');
 
   const state = readJson(p.state);
   const attempt = attemptForState(root, state);
@@ -271,7 +330,7 @@ function setObjective(root, text, actor = 'operator-cli') {
   const revision = {
     revision: objective.current_revision + 1,
     objective: objectiveText,
-    specification_sha256: fileSha256(p.specification),
+    ...(existsSync(p.specification) ? { specification_sha256: fileSha256(p.specification) } : {}),
     changed_by: actor,
     effective_at: now(),
   };
@@ -279,19 +338,61 @@ function setObjective(root, text, actor = 'operator-cli') {
   objective.current_revision = revision.revision;
   writeJson(p.objective, objective);
   if (!state.active_task_id) {
+    const bootstrap = existsSync(p.bootstrap) ? readJson(p.bootstrap) : null;
+    const rawMatrix = existsSync(p.requirements) ? readJson(p.requirements) : null;
+    const requirementDriven = Boolean(effectiveRequirementMatrix(root, {
+      bootstrap,
+      matrix: rawMatrix,
+      state,
+    }));
     updateState(root, {
-      phase: state.phase === 'COMPLETE' ? 'SELF_HOSTED' : state.phase,
+      phase: state.phase === 'COMPLETE'
+        ? (requirementDriven ? 'SELF_HOSTED' : 'ACTIVE')
+        : (state.phase === 'INITIALIZED' ? 'ACTIVE' : state.phase),
       pending_next_action: `Establish bounded work for objective revision ${revision.revision}.`,
     });
   }
   const event = emit(root, 'OBJECTIVE_CHANGED', {
     actor,
     objective_id: objective.objective_id,
-    prior_revision: previous.revision,
+    prior_revision: previous?.revision ?? null,
     objective_revision: revision.revision,
     reconciliation,
   });
   return { objective, reconciliation, event_id: event.event_id };
+}
+
+function lifecycleWakeAttention(root, supervisor, state) {
+  const base = join(paths(root).opsle, 'wake');
+  const requests = join(base, 'requests');
+  if (!existsSync(requests)) return { actionable_count: 0, authoritative_count: 0 };
+  const records = readdirSync(requests).filter((name) => name.endsWith('.json')).sort().map((name) => {
+    const request = readJson(join(requests, name));
+    const receiptPath = join(base, 'deliveries', `${request.event_id}.json`);
+    const receipt = existsSync(receiptPath) ? readJson(receiptPath) : null;
+    const consumption = receipt ? wakeDeliveryConsumptionStatus(root, request.event_id) : null;
+    const decisionPath = join(base, 'activation-decisions', `${request.event_id}.json`);
+    const decision = existsSync(decisionPath) ? readJson(decisionPath) : null;
+    const taskPath = request.task_id ? join(paths(root).tasks, `${request.task_id}.json`) : null;
+    const attemptPath = request.attempt_id ? join(paths(root).attempts, `${request.attempt_id}.json`) : null;
+    const task = taskPath && existsSync(taskPath) ? readJson(taskPath) : null;
+    const attempt = attemptPath && existsSync(attemptPath) ? readJson(attemptPath) : null;
+    const authoritative = request.target?.supervisor_id === supervisor.supervisor_id
+      && request.target?.supervisor_generation === supervisor.generation;
+    const awaitingConsumption = consumption?.delivered === true && consumption.consumed !== true;
+    const historicallyEvaluated = ['ACCEPTED', 'REJECTED'].includes(task?.state)
+      || Boolean(attempt?.supervisor_evaluation);
+    const resolved = consumption?.consumed === true
+      || historicallyEvaluated
+      || (!awaitingConsumption && state.processed_event_ids?.includes(request.event_id));
+    return {
+      ...request,
+      authoritative,
+      classification: resolved ? 'duplicate' : (awaitingConsumption ? 'awaiting-consumption' : 'queued'),
+      reason: resolved ? 'resolved' : (awaitingConsumption ? 'delivered-terminal-wake-unconsumed' : 'current-generation-request'),
+    };
+  });
+  return selectWakeRecords(records);
 }
 
 function status(root, { json = false, verbose = false, referenceTime = Date.now() } = {}) {
@@ -299,8 +400,10 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
   const supervisor = readJson(p.supervisor);
   const state = readJson(p.state);
   const objective = readJson(p.objective);
-  const policy = readJson(p.policy);
-  const matrix = readJson(p.requirements);
+  const policy = policyWithDefaults(readJson(p.policy));
+  const rawMatrix = existsSync(p.requirements) ? readJson(p.requirements) : null;
+  const bootstrap = existsSync(p.bootstrap) ? readJson(p.bootstrap) : null;
+  const matrix = effectiveRequirementMatrix(root, { bootstrap, matrix: rawMatrix, state });
   const task = state.active_task_id && existsSync(join(p.tasks, `${state.active_task_id}.json`))
     ? readJson(join(p.tasks, `${state.active_task_id}.json`)) : null;
   const attempt = state.active_attempt_id && existsSync(join(p.attempts, `${state.active_attempt_id}.json`))
@@ -311,24 +414,23 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
     ? join(p.opsle, 'workers', `${attempt.attempt_id}.json`)
     : null;
   const runner = runnerPath && existsSync(runnerPath) ? readJson(runnerPath) : null;
-  const sessionBinding = codexSessionBindingStatus(root);
+  const sessionBinding = refreshCodexSessionBinding(root);
+  const selectedWake = lifecycleWakeAttention(root, supervisor, state);
   const operatorState = deriveDisplayState({
     supervisor,
     state,
+    objective,
+    requirements: matrix,
     task,
     attempt,
     claim,
     runner,
+    wakeAttention: selectedWake,
+    sessionBinding,
     processIsAlive: processAlive,
   });
-  if (sessionBinding.classification === 'stale') {
-    operatorState.attention = true;
-    operatorState.reasons.unshift(
-      `authoritative Herdr binding is UNKNOWN: ${(sessionBinding.reasons ?? []).join(', ') || 'stale'}`,
-    );
-  }
   const counts = {};
-  for (const requirement of matrix.requirements) counts[requirement.state] = (counts[requirement.state] ?? 0) + 1;
+  for (const requirement of matrix?.requirements ?? []) counts[requirement.state] = (counts[requirement.state] ?? 0) + 1;
   const events = existsSync(p.eventsLog)
     ? readFileSync(p.eventsLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)) : [];
   const completionEvents = events.filter((item) => item.type === 'CHILD_COMPLETION');
@@ -371,7 +473,7 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
       tmux_session: supervisor.session_id,
       tmux_alive: supervisor.session_id ? tmuxAlive(supervisor.session_id) : false,
     },
-    objective: objective.history.find((item) => item.revision === objective.current_revision),
+    objective: objective.history.find((item) => item.revision === objective.current_revision) ?? null,
     session_binding: sessionBinding,
     operator_state: operatorState,
     active_work: task ? {
@@ -409,12 +511,14 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
       reviewer: policy.review.reviewer,
       affected_verification: policy.affected_verification.authority,
       model_polling_permitted: policy.model_polling.permitted,
+      context_firewall_enabled: policy.context_firewall.enabled,
+      context_firewall_defaulted: policy.context_firewall.defaulted_for_compatibility === true,
     },
     progress: {
       requirements: counts,
       latest_accepted_task: state.latest_accepted_task_id,
       latest_unresolved_issue: state.latest_unresolved_issue,
-      pending_next_action: state.pending_next_action,
+      pending_next_action: derivePendingNextAction(state, matrix),
     },
     telemetry,
   };
@@ -698,7 +802,10 @@ export function recover(root, {
       }
     }
   }
-  const pendingNextAction = derivePendingNextAction(state, readJson(p.requirements));
+  const pendingNextAction = derivePendingNextAction(
+    state,
+    existsSync(p.requirements) ? readJson(p.requirements) : null,
+  );
   if (pendingNextAction !== state.pending_next_action) {
     state.pending_next_action = pendingNextAction;
     stateChanged = true;
@@ -727,6 +834,10 @@ function evaluateTask(root, taskId, accept, rationale) {
   if (!attemptId) throw new Error('task has no attempt');
   const attemptPath = join(p.attempts, `${attemptId}.json`);
   const attempt = readJson(attemptPath);
+  const unconsumed = unconsumedDeliveredWakes(root, taskId, attemptId);
+  if (unconsumed.length > 0) {
+    throw new Error(`delivered terminal wake must be consumed before evaluation: ${unconsumed.join(', ')}`);
+  }
   if (attempt.supervisor_evaluation) return { idempotent: true, task, attempt };
   if (accept && attempt.acceptance?.state !== 'SATISFIED') {
     throw new Error('supervisor cannot accept a task rejected by the Acceptance gate without a durable correction');
@@ -783,7 +894,10 @@ function evaluateTask(root, taskId, accept, rationale) {
     latest_accepted_task_id: accept ? taskId : currentState.latest_accepted_task_id,
     latest_unresolved_issue: accept ? null : `Supervisor rejected ${taskId}: ${rationale}`,
     pending_next_action: accept
-      ? derivePendingNextAction(nextState, readJson(p.requirements))
+      ? derivePendingNextAction(
+        nextState,
+        existsSync(p.requirements) ? readJson(p.requirements) : null,
+      )
       : nextState.pending_next_action,
   });
   if (applyPauseAfterCurrent) {
@@ -802,12 +916,22 @@ export function consumeEvent(root, eventId, { deliveryId = null, generation = nu
   const p = paths(root);
   const state = readJson(p.state);
   state.processed_event_ids ??= [];
-  if (state.processed_event_ids.includes(eventId)) return { event_id: eventId, duplicate: true, action: 'ignored' };
+  if (state.processed_event_ids.includes(eventId)) {
+    const wake = deliveryId == null
+      ? wakeDeliveryConsumptionStatus(root, eventId)
+      : consumeWakeDelivery(root, eventId, { deliveryId, generation });
+    return { event_id: eventId, duplicate: true, action: 'ignored', wake_delivery: wake };
+  }
   const event = readJson(join(p.events, `${eventId}.json`));
   const wake = consumeWakeDelivery(root, eventId, { deliveryId, generation });
   state.processed_event_ids.push(eventId);
   writeJson(p.state, state);
-  emit(root, 'EVENT_CONSUMED', { source_event_id: eventId, source_event_type: event.type });
+  emit(root, 'EVENT_CONSUMED', {
+    source_event_id: eventId,
+    source_event_type: event.type,
+    delivery_id: wake?.receipt?.delivery_id ?? null,
+    consumption_id: wake?.consumption?.consumption_id ?? null,
+  });
   return { event_id: eventId, duplicate: false, action: 'recorded', wake_delivery: wake };
 }
 
@@ -886,10 +1010,17 @@ export async function main(args) {
     print(usage());
     return;
   }
+  if (args[0] === '--version' || args[0] === '-V' || args[0] === 'version') {
+    print(renderVersion(versionInfo()));
+    return;
+  }
   const root = repositoryRoot();
   const [command, subcommand, ...rest] = args;
   if (command === 'init') {
-    print(initialize(root));
+    const result = initialize(root, { objectiveText: valueAfter(args, '--objective') });
+    print(args.includes('--json')
+      ? result
+      : `Initialized Durable Supervisor for ${root} (${result.bootstrap.profile}); next: ${result.state.pending_next_action}`);
     return;
   }
   if (!existsSync(paths(root).supervisor)) throw new Error('run opsle init first');
@@ -1004,7 +1135,7 @@ export async function main(args) {
   if (command === 'policy') {
     if (subcommand === 'status') {
       const mode = outputMode(rest);
-      const policy = readJson(paths(root).policy);
+      const policy = policyWithDefaults(readJson(paths(root).policy));
       print(mode.json ? policy : renderPolicy(policy, mode));
     }
     else if (['enable', 'disable'].includes(subcommand)) {
@@ -1013,6 +1144,15 @@ export async function main(args) {
       const policy = readJson(paths(root).policy);
       if (!policy.providers[provider]) throw new Error(`unknown provider: ${provider}`);
       print(updatePolicy(root, (next) => { next.providers[provider].enabled = subcommand === 'enable'; }));
+    } else if (subcommand === 'context-firewall') {
+      recordHumanActivation(root, 'policy-context-firewall');
+      const mode = rest[0];
+      if (!['enable', 'disable'].includes(mode)) {
+        throw new Error('policy context-firewall requires enable or disable');
+      }
+      print(updatePolicy(root, (next) => {
+        next.context_firewall = { enabled: mode === 'enable' };
+      }));
     } else if (subcommand === 'review') {
       recordHumanActivation(root, 'policy-review');
       const mode = rest[0];
@@ -1163,7 +1303,7 @@ export async function main(args) {
     else if (subcommand === 'is-alive') {
       const mode = outputMode(rest);
       const supervisor = readJson(paths(root).supervisor);
-      const herdr = codexSessionBindingStatus(root);
+      const herdr = refreshCodexSessionBinding(root);
       const tmux = { session: name, alive: tmuxAlive(name) };
       const liveness = deriveSupervisorLiveness({
         authorityStatus: supervisor.authority_status,

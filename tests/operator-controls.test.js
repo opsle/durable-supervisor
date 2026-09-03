@@ -20,7 +20,7 @@ import {
   createTask,
   routeTask,
 } from '../src/pipeline.js';
-import { canonicalJson, readJson } from '../src/io.js';
+import { canonicalJson, readJson, writeJson } from '../src/io.js';
 import {
   emit,
   initialize,
@@ -329,6 +329,62 @@ test('accepted task cannot recreate an automatic next action after terminal comp
   }
 });
 
+test('task evaluation fails closed until its delivered terminal wake is explicitly consumed', async () => {
+  const root = fixture();
+  try {
+    const p = paths(root);
+    const task = createTask(root, handoff('task-consume-before-evaluate', { requirement_ids: [] }));
+    const decision = routeTask(root, task);
+    const { attempt, claim } = createAttempt(root, task, decision);
+    const completed = await runAttempt(root, task, attempt, claim);
+    const eventId = completed.completion_event.event_id;
+    const supervisor = readJson(p.supervisor);
+    const deliveryId = 'delivery-consume-before-evaluate';
+    writeJson(join(p.opsle, 'wake', 'requests', `${eventId}.json`), {
+      schema: 'opsle.durable-supervisor.native-wake-request/v2',
+      event_id: eventId,
+      terminal_type: completed.completion_event.terminal_type,
+      task_id: task.task_id,
+      attempt_id: attempt.attempt_id,
+      target: {
+        supervisor_id: supervisor.supervisor_id,
+        supervisor_generation: supervisor.generation,
+      },
+      queue_version: 1,
+    });
+    writeJson(join(p.opsle, 'wake', 'deliveries', `${eventId}.json`), {
+      schema: 'opsle.durable-supervisor.host-wake-delivery/v1',
+      delivery_id: deliveryId,
+      event_id: eventId,
+      supervisor_id: supervisor.supervisor_id,
+      supervisor_generation: supervisor.generation,
+      status: 'DELIVERED',
+      delivered_at: '2026-09-03T00:00:00.000Z',
+    });
+
+    const blocked = await runCli(root, [
+      'task', 'evaluate', task.task_id,
+      '--accept', '--rationale', 'must not bypass consumption',
+    ]);
+    assert.equal(blocked.code, 1);
+    assert.match(blocked.stderr, /delivered terminal wake must be consumed/);
+
+    const consumed = await runCli(root, [
+      'events', 'consume', eventId,
+      '--generation', String(supervisor.generation),
+    ]);
+    assert.equal(consumed.code, 0, consumed.stderr);
+    const evaluated = await runCli(root, [
+      'task', 'evaluate', task.task_id,
+      '--accept', '--rationale', 'delivery consumption is now durable',
+    ]);
+    assert.equal(evaluated.code, 0, evaluated.stderr);
+    assert.equal(readJson(join(p.tasks, `${task.task_id}.json`)).state, 'ACCEPTED');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('pause after current evaluates and terminalizes the task before PAUSED blocks the next launch', async () => {
   const root = fixture();
   try {
@@ -561,7 +617,8 @@ test('operator status commands separate concise, verbose, and JSON output', asyn
     const concise = await runCli(root, ['status']);
     assert.equal(concise.code, 0, concise.stderr);
     assert.ok(concise.stdout.trim().split('\n').length <= 10, concise.stdout);
-    assert.match(concise.stdout, /^Supervisor: READY/m);
+    assert.match(concise.stdout, /^Supervisor: ATTENTION/m);
+    assert.match(concise.stdout, /Herdr (snapshot unavailable|discovery requires)/);
     assert.doesNotMatch(concise.stdout, /Repository:|Tmux fallback:/);
     assert.doesNotMatch(concise.stdout, /^\s*\{/);
 
@@ -575,7 +632,7 @@ test('operator status commands separate concise, verbose, and JSON output', asyn
     assert.equal(structured.code, 0, structured.stderr);
     const statusValue = JSON.parse(structured.stdout);
     assert.equal(statusValue.supervisor.repository, root);
-    assert.equal(statusValue.operator_state.supervisor, 'READY');
+    assert.equal(statusValue.operator_state.supervisor, 'ATTENTION');
     assert.equal(statusValue.session_binding.classification, 'unbound');
 
     const policy = readJson(paths(root).policy);

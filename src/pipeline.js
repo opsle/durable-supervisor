@@ -13,6 +13,7 @@ import {
   emit,
   gitMetadata,
   paths,
+  policyWithDefaults,
   policyHash,
   resolveExecutable,
   updateState,
@@ -121,6 +122,10 @@ export function createTask(root, input) {
   validateHandoff(input);
   const p = paths(root);
   const objective = readJson(p.objective);
+  if (objective.current_revision === 0) throw new Error('set the repository objective before creating work');
+  if (!existsSync(p.requirements) && input.requirement_ids.length > 0) {
+    throw new Error('objective-driven repository task cannot claim requirement IDs without a matrix');
+  }
   const supervisor = readJson(p.supervisor);
   const taskId = input.task_id ?? id('task');
   const path = join(p.tasks, `${taskId}.json`);
@@ -174,7 +179,7 @@ function filterCapabilities(discovery, policy) {
 export function routeTask(root, task) {
   validateTaskCommands(task);
   const p = paths(root);
-  const policy = readJson(p.policy);
+  const policy = policyWithDefaults(readJson(p.policy));
   const discovery = discoverCapabilities(root);
   const permitted = filterCapabilities(discovery, policy);
   const considered = [];
@@ -383,7 +388,7 @@ export function createAttempt(root, task, gearbox, claimFactory = acquireClaim) 
     throw new Error(`rejected task cannot be relaunched: ${task.task_id}`);
   }
   const p = paths(root);
-  const policy = readJson(p.policy);
+  const policy = policyWithDefaults(readJson(p.policy));
   const selectedRoute = gearbox.selected_route_config;
   if (gearbox.schema !== 'opsle.durable-supervisor.gearbox-decision/v3'
       || selectedRoute?.schema !== 'opsle.durable-supervisor.exact-child-route/v2'
@@ -435,6 +440,7 @@ export function createAttempt(root, task, gearbox, claimFactory = acquireClaim) 
     review_mode: policy.review.mode,
     reviewer: policy.review.reviewer,
     independent_review: 'none',
+    context_firewall_enabled: policy.context_firewall.enabled,
     authorization_envelope: task.authorization,
     policy_version: policy.version,
     policy_sha256: policyHash(root),

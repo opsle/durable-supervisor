@@ -93,6 +93,7 @@ function snapshotFiles(root) {
       if (rel.startsWith('.opsle/')) {
         const protectedAuthority = new Set([
           '.opsle/specification.md',
+          '.opsle/bootstrap.json',
           '.opsle/requirements.json',
           '.opsle/objective.json',
           '.opsle/policy.json',
@@ -466,6 +467,10 @@ function contextPacket({ task, attempt, result, verification, changed, unexpecte
     : 'requires_escalation';
   const base = {
     schema: CONTEXT_PACKET_SCHEMA,
+    context_firewall: {
+      enabled_at_launch: attempt.policy_snapshot.context_firewall_enabled !== false,
+      output_contract: 'bounded-decision-evidence',
+    },
     task_id: task.task_id,
     attempt_id: attempt.attempt_id,
     completeness,

@@ -32,10 +32,16 @@ queue independently of Runner and supervisor turns. It registers filesystem
 observation before every receipt-free queue check, so an event cannot be lost
 between the empty decision and watcher registration.
 
-Automatic delivery fails closed unless `codex-session-binding/v2` proves the
-exact repository, supervisor generation, Codex UUID, rollout `session_meta` and
-inode, installed CLI, UID, authoritative Herdr process/workspace/pane/terminal,
-and absence of the old authoritative tmux session. The canonical transport is
+Automatic delivery fails closed unless the ephemeral
+`codex-session-binding/v3` current pointer proves the exact repository,
+supervisor generation, Codex session/thread UUID, rollout `session_meta` and
+inode, installed CLI, UID, authoritative Herdr frontend
+process/workspace/pane/terminal, and absence of concurrent tmux authority.
+Status, liveness, reconstruction, and dispatch refresh that pointer from two
+consistent read-only Herdr snapshots, exact pane-process facts, and the unique
+Codex rollout. Replacement is atomic and prior pointers remain immutable. An
+unprovable refresh installs an `INVALID` pointer with no usable session,
+rollout, or host values. The canonical transport is
 plain `codex resume SESSION_ID MESSAGE` in a temporary process group. A
 repository-local PTY launcher keeps that frontend alive only until the bound
 rollout contains one exact accepted message and its matching turn-began record.
@@ -50,7 +56,9 @@ it remains queued and may be reclaimed only after the already-registered watcher
 observes an append to that exact bound rollout. Any outcome uncertain after
 spawn is durably `UNCERTAIN` and is never automatically replayed. The transmitted
 message contains only event ID, generation, and an instruction to read durable
-state. Historical wake request bytes are immutable. Stale-generation and
+state. A delivered terminal wake has separate immutable, delivery- and
+generation-fenced consumption evidence, and task evaluation is blocked until
+it is consumed. Historical wake request and delivery bytes are immutable. Stale-generation and
 already-evaluated requests are classified obsolete rather than adopted.
 
 Herdr is the authoritative host, but the Herdr adapter remains read-only: it
@@ -151,9 +159,16 @@ npm test
 ```
 
 The package is currently private and has no supported cross-repository
-installer. `opsle init` is for a prepared repository that already contains the
-V0.1 specification and requirements matrix; it fails closed if an authoritative
-supervisor already exists.
+installer. When the CLI is available, `opsle init` initializes an ordinary Git
+repository without changing tracked project content or copying this repository.
+It records a neutral, versioned objective-driven bootstrap and does not invent a
+requirement matrix or objective. Use `opsle init --objective TEXT` to record an
+initial objective explicitly. Pre-seeded specification/matrix repositories keep
+requirement-driven semantics, including the V0.1 self-host profile. Initialization
+fails closed if an authoritative supervisor already exists.
+
+`opsle --version` works outside initialized repositories. Its first line is the
+short package version; source and build revision lines are included when known.
 
 ## Operate and recover
 
@@ -164,6 +179,10 @@ emits the canonical bounded model-facing reconstruction. A genuine new
 activation uses `resume-packet generate --recover`, reconciling first without
 exposing broad recovery output. The path does not replay chat history, ingest
 append-only logs or raw evidence, or silently retry uncertain work.
+Complete packets carry a semantic freshness fence over decision-relevant
+objective, task, decision, pause, unresolved/wake, policy, generation, and
+session authority. Consumption rejects a stale complete packet while ignoring
+telemetry-only timestamps.
 
 ## Self-hosting evidence
 
@@ -198,13 +217,16 @@ recorded policy; Claude and independent review remained disabled.
 
 The dispatcher is repository-local and single-host. Its durable record fences
 dispatcher ID/generation, supervisor ID/generation, exact PID/start/executable,
-and each request queue version. Recovery supersedes stale ownership, starts one
+the loaded dispatcher implementation hash, and each request queue version. A
+new Runner supersedes an alive dispatcher whose implementation no longer
+matches the repository source. Recovery supersedes stale ownership, starts one
 current dispatcher, and leaves prior-generation requests immutable and obsolete.
 
-The repository-local transport is deterministically covered for binding,
+The repository-local transport is deterministically covered for binding refresh,
 rollout confirmation, cleanup, busy, uncertainty, fencing, idempotency, and
-pause-after-current ordering. A live binding must still be created explicitly;
-the intentionally stale v1 record is not adopted or rewritten automatically.
+pause-after-current ordering. Legacy v2 bindings migrate deterministically on
+the first exact refresh; frontend replacement does not create a supervisor
+identity or advance its generation.
 
 ## License
 
