@@ -485,9 +485,3 @@ export function renderWakeStatus(value, { verbose = false, referenceTime = Date.
   }
   return lines.join('\n');
 }
-
-export function detachedLaunchNotice(result) {
-  const ids = [result.task_id, result.attempt_id];
-  const pause = result.pause_after_current?.armed ? '; pause after evaluation is armed' : '';
-  return `Child ${abbreviateIdentifier(result.task_id, ids)} started as ${abbreviateIdentifier(result.attempt_id, ids)}; Runner owns monitoring and the supervisor is dormant${pause}. END_TURN_IMMEDIATELY`;
-}

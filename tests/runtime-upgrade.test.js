@@ -26,16 +26,78 @@ import {
   assertRuntimeStartAllowed,
   inventoryManagedRuntime,
   readCurrentRuntime,
+  runtimeHostPaths,
   upgradeHostRuntime,
 } from '../src/runtime-upgrade.js';
+import { defaultOpsledHome } from '../src/opsled.js';
 import { processStartIdentity } from '../src/runtime-release.js';
 import { initialize } from '../src/state.js';
 
 const sourceRoot = resolve(dirname(new URL(import.meta.url).pathname), '..');
-const priorRuntime = process.env.OPSLE_PRIOR_RUNTIME
-  ?? '/home/deploy/.npm-global/lib/node_modules/@opsle/durable-supervisor';
-const priorWakeupSha256 = process.env.OPSLE_PRIOR_WAKEUP_SHA256
-  ?? 'e4c6cdc6da82904c363b934b9be1e764555377b909fae7ccad5a2ccf410e511a';
+
+// The prior-runtime takeover proof needs a real managed runtime that still
+// carries the historical wake dispatcher helper. Resolve it from canonical
+// host state so no caller has to know a machine-specific install path, and
+// derive its implementation identity from the artifact actually selected
+// rather than from a hardcoded digest that goes stale on every release.
+const REQUIRED_PRIOR_HELPER_FILES = [
+  join('bin', 'opsle.js'),
+  join('bin', 'opsle-wake-delivery.js'),
+  join('src', 'wakeup.js'),
+];
+
+function resolvePriorRuntime() {
+  const override = process.env.OPSLE_PRIOR_RUNTIME;
+  if (override) return { root: override, source: 'OPSLE_PRIOR_RUNTIME' };
+  // Read the canonical managed runtime pointer directly. readCurrentRuntime()
+  // validates the pointer against the *current* runtime's expectations, which a
+  // prior release is not required to satisfy, so it cannot resolve a checkpoint.
+  const pointerPath = runtimeHostPaths(defaultOpsledHome()).current;
+  if (existsSync(pointerPath)) {
+    try {
+      const pointer = readJson(pointerPath);
+      if (typeof pointer?.release_root === 'string') {
+        return { root: pointer.release_root, source: 'managed-host-runtime-pointer' };
+      }
+    } catch {
+      // Unreadable pointer: treated as no managed prior runtime.
+    }
+  }
+  return { root: null, source: null };
+}
+
+function priorRuntimeProof() {
+  const { root, source } = resolvePriorRuntime();
+  if (!root) {
+    return { available: false, reason: 'no OPSLE_PRIOR_RUNTIME and no managed current runtime on this host' };
+  }
+  if (!existsSync(root)) {
+    return { available: false, reason: `prior runtime ${source} path does not exist: ${root}` };
+  }
+  const missing = REQUIRED_PRIOR_HELPER_FILES.filter((name) => !existsSync(join(root, name)));
+  if (missing.length > 0) {
+    return {
+      available: false,
+      reason: `prior runtime ${root} lacks the historical managed helper: ${missing.join(', ')}`,
+    };
+  }
+  const wakeupPath = join(root, 'src', 'wakeup.js');
+  const wakeupSha256 = fileSha256(wakeupPath);
+  const expected = process.env.OPSLE_PRIOR_WAKEUP_SHA256;
+  if (expected && expected !== wakeupSha256) {
+    return {
+      available: false,
+      reason: `prior runtime wakeup digest ${wakeupSha256} does not match OPSLE_PRIOR_WAKEUP_SHA256 ${expected}`,
+    };
+  }
+  return { available: true, root, source, wakeupPath, wakeupSha256 };
+}
+
+// Release verification sets OPSLE_REQUIRE_PRIOR_RUNTIME_PROOF so that an
+// unavailable artifact, or a proof that never ran, fails instead of skipping.
+const requirePriorRuntimeProof = process.env.OPSLE_REQUIRE_PRIOR_RUNTIME_PROOF === '1';
+const priorRuntime = priorRuntimeProof();
+let priorRuntimeProofRan = false;
 
 async function waitFor(check, message, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
@@ -156,19 +218,23 @@ test('host runtime upgrade installs by digest, migrates managed repositories, an
 });
 
 test('takeover retires an already-running managed prior helper before release B becomes current', {
-  skip: !existsSync(join(priorRuntime, 'bin', 'opsle-wake-delivery.js')),
+  skip: (!priorRuntime.available && !requirePriorRuntimeProof)
+    ? `prior-runtime takeover proof unavailable: ${priorRuntime.reason}`
+    : false,
   timeout: 30000,
 }, async () => {
+  assert.equal(priorRuntime.available, true, priorRuntime.reason);
   const hostRoot = mkdtempSync(join(tmpdir(), 'opsle-runtime-prior-helper-'));
   const root = repository('prior-helper');
-  const installedWakeup = join(priorRuntime, 'src', 'wakeup.js');
+  const installedWakeup = priorRuntime.wakeupPath;
+  const priorWakeupSha256 = priorRuntime.wakeupSha256;
   let priorIdentity = null;
   let targetStarted = null;
   let sawQuiescedLaunchGate = false;
   try {
     assert.equal(fileSha256(installedWakeup), priorWakeupSha256);
     const launched = spawnSync(process.execPath, [
-      join(priorRuntime, 'bin', 'opsle.js'), 'wake', 'start',
+      join(priorRuntime.root, 'bin', 'opsle.js'), 'wake', 'start',
     ], { cwd: root, encoding: 'utf8' });
     assert.equal(launched.status, 0, launched.stderr);
     const dispatcherPath = join(root, '.opsle', 'wake', 'dispatcher.json');
@@ -215,6 +281,7 @@ test('takeover retires an already-running managed prior helper before release B 
         : null;
     }, 'release B did not own normal repository operation');
     assert.equal(fileSha256(installedWakeup), priorWakeupSha256);
+    priorRuntimeProofRan = true;
   } finally {
     await stopInstalledOpsled(targetStarted, hostRoot);
     if (priorIdentity && processStartIdentity(priorIdentity.pid)?.start_time_ticks
@@ -402,4 +469,15 @@ test('corrupt-neighbor upgrade quarantines B while A and C remain serviceable', 
     roots.forEach((root) => rmSync(root, { recursive: true, force: true }));
     rmSync(hostRoot, { recursive: true, force: true });
   }
+});
+
+// Release verification must never report PASS while silently omitting the real
+// prior-runtime takeover proof.
+test('REQUIRED mode proves the real prior-runtime takeover actually ran', {
+  skip: requirePriorRuntimeProof
+    ? false
+    : 'set OPSLE_REQUIRE_PRIOR_RUNTIME_PROOF=1 to require the real prior-runtime proof',
+}, () => {
+  assert.equal(priorRuntime.available, true, priorRuntime.reason ?? 'prior runtime unavailable');
+  assert.equal(priorRuntimeProofRan, true, 'the prior-runtime takeover proof did not run');
 });

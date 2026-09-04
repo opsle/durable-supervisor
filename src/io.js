@@ -157,10 +157,3 @@ export function appendEvent(path, event) {
     closeSync(descriptor);
   }
 }
-
-export function assertRegular(path) {
-  const stats = statSync(path);
-  if (!stats.isFile() || stats.isSymbolicLink()) {
-    throw new Error(`expected regular non-symlink file: ${path}`);
-  }
-}

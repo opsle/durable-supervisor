@@ -13,24 +13,69 @@ remain readable. None can become current execution or wake authority.
 
 ## Measured simplification
 
-Counts use exact `origin/main` (`4dc2faa5590deba1456c31b6a7e42e9207f98a12`)
-and this branch working tree after the change.
+All values are recomputed from exact revisions: base `origin/main`
+(`4dc2faa5590deba1456c31b6a7e42e9207f98a12`) and this branch's final tree. No
+figure below is carried over from an earlier report.
 
-| Measure | Before | After |
+| Measure | Base | Final |
 | --- | ---: | ---: |
-| `src/*.js` LOC | 13,669 | 12,227 |
-| `tests/*.js` LOC | 10,577 | 9,799 |
+| `src/**/*.js` LOC | 13,669 | 12,192 |
+| `bin/**/*.js` LOC | 469 | 439 |
+| `tests/**/*.js` LOC | 10,577 | 9,954 |
 | Long-lived Opsle process types | 2 | 1 |
 | Current child execution authority paths | 2 | 1 |
 | Current wake authority paths | 3 | 1 |
-| Current lock/lease/fence mechanisms | 13 | 11 |
-| Durable authority record types in current execution | 12 | 11 |
-| Legacy-only branches deleted | 13 | 0 remaining |
+| Retained lock/lease/fence mechanisms | 13 | 11 |
+| Durable authority record types constructed by current code | 57 | 53 |
+
+Diff against the base, restricted to `src`, `bin`, and `tests`: 332 additions
+and 2,462 deletions. `src/host-terminal.js` is the only deleted source file.
 
 The removed long-lived type is the per-repository dispatcher. The removed child
 path is direct foreground execution. The removed wake paths are repository
 dispatcher delivery and direct CLI draining. Current authority no longer uses a
 dispatcher fence or a tmux-authority fence.
+
+The four record types no longer constructed are the wake dispatcher, the wake
+dispatcher implementation, the host adapter, and the legacy host binding.
+Existing records of all four remain readable; none can regain current authority.
+
+### Confirmed dead branches removed
+
+Nine zero-writer or zero-reference constructs were deleted after re-checking
+reachability at HEAD: `repositoryWakeSummary`, `detachedLaunchNotice`,
+`assertRegular`, the now-unused `removeIfPresent` helper, the
+`.opsle/wake/busy.json` path entry, the busy read and unlink in wake
+consumption, the busy read and `busy` field in `wakeQueueStatus` output, and the
+two `BUSY` activation-decision branches. `.opsle/wake/busy.json` has no writer
+in any current or historical shipped path, so no evidence is lost.
+`TRANSPORT_NOT_STARTED` is still written and its branches are retained.
+
+### Residual legacy surface
+
+The four historical schema identifiers are retained as `HISTORICAL_SCHEMAS` in
+`src/wakeup.js`. They are not dead: the durable schema fingerprint stamped into
+every managed repository's `.opsle/compatibility.json` covers this identifier
+set, and `validateHeader` has no migration from durable schema v2, so removing
+any identifier would fail every existing managed repository closed as `CORRUPT`.
+`HISTORICAL_SCHEMAS.wakeDispatcher` is referenced by managed runtime takeover to
+recognize and retire an actual old dispatcher. The other three are read-only
+compatibility surface with no current authority.
+
+## Known defect carried forward: non-atomic task evaluation
+
+This defect exists on the PR 2 base and is **not** a PR 3 regression. It is
+recorded here rather than fixed, because fixing it means adding a lease or fence
+and PR 3 is a simplification change.
+
+`opsle task evaluate` performs a non-atomic check-then-write.
+
+Reproduction: run four concurrent evaluator processes against the same task
+attempt. All four pass the existence check, four durable supervisor decisions
+are committed, and requirements application runs more than once.
+
+Required future invariant: one task attempt yields at most one committed
+supervisor evaluation.
 
 ## Remaining mechanisms: concurrent-writer test
 
@@ -53,8 +98,8 @@ repository dispatcher, tmux host, or foreground supervisor execution owner.
 
 ## Complexity review
 
-Another 20 percent of current control-plane code cannot be deleted without
-removing at least one named invariant above. The largest remaining components
-are the plain-resume confirmation/uncertainty boundary, crash-safe release
-takeover, Runner evidence lifecycle, and current-session validation. Each has a
+No further deletion was found that does not remove at least one named
+invariant above. The largest remaining components are the plain-resume
+confirmation/uncertainty boundary, crash-safe release takeover, Runner evidence
+lifecycle, and current-session validation. Each has a
 reachable concurrent writer or failure and an adversarial test.

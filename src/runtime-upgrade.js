@@ -19,6 +19,7 @@ import { sameProcessIdentity } from './host-lock.js';
 import { acquireUpgradeLock, readRegistry, registryPaths } from './opsled-registry.js';
 import { validateOpsledRunnerRecord } from './opsled-runner.js';
 import { validateWakeTransportRecord } from './opsled-wake.js';
+import { HISTORICAL_SCHEMAS } from './wakeup.js';
 import {
   loadRuntimeRelease,
   processStartIdentity,
@@ -175,7 +176,7 @@ export function inventoryManagedRuntime(hostRoot, {
     if (existsSync(dispatcherPath)) {
       try {
         const dispatcher = readJson(dispatcherPath);
-        if (dispatcher?.schema !== 'opsle.durable-supervisor.host-wake-dispatcher/v1') {
+        if (dispatcher?.schema !== HISTORICAL_SCHEMAS.wakeDispatcher) {
           throw new Error('invalid managed wake dispatcher schema');
         }
         if (dispatcher.process == null) {

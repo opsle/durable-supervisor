@@ -6,7 +6,6 @@ import {
   readdirSync,
   realpathSync,
   statSync,
-  unlinkSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
@@ -40,12 +39,18 @@ const WAIT_SCHEMA = 'opsle.durable-supervisor.wait-registration/v1';
 const WAKE_REQUEST_SCHEMA = 'opsle.durable-supervisor.host-wake-request/v1';
 const NATIVE_WAKE_REQUEST_SCHEMA = 'opsle.durable-supervisor.native-wake-request/v2';
 const DELIVERY_SCHEMA = 'opsle.durable-supervisor.host-wake-delivery/v1';
-// Historical tmux host-adapter evidence remains schema-readable, but no
-// current execution path constructs or invokes an adapter.
-export const LEGACY_HOST_ADAPTER_SCHEMA = 'opsle.durable-supervisor.host-adapter/v1';
-export const LEGACY_HOST_BINDING_SCHEMA = 'opsle.durable-supervisor.host-binding/v1';
-export const LEGACY_WAKE_DISPATCHER_SCHEMA = 'opsle.durable-supervisor.host-wake-dispatcher/v1';
-export const LEGACY_WAKE_DISPATCHER_IMPLEMENTATION_SCHEMA = 'opsle.durable-supervisor.wake-dispatcher-implementation/v1';
+// Historical durable evidence remains schema-readable. These identifiers carry
+// no current authority: nothing constructs a host adapter, a legacy host
+// binding, or a repository wake dispatcher. They stay declared because the
+// durable schema fingerprint stamped into every managed repository covers this
+// identifier set, and because managed runtime takeover must still recognize an
+// actual old dispatcher record in order to retire it.
+export const HISTORICAL_SCHEMAS = Object.freeze({
+  hostAdapter: 'opsle.durable-supervisor.host-adapter/v1',
+  hostBinding: 'opsle.durable-supervisor.host-binding/v1',
+  wakeDispatcher: 'opsle.durable-supervisor.host-wake-dispatcher/v1',
+  wakeDispatcherImplementation: 'opsle.durable-supervisor.wake-dispatcher-implementation/v1',
+});
 const WAKEUP_SOURCE_PATH = fileURLToPath(import.meta.url);
 export const WAKE_WORKER_IMPLEMENTATION_SHA256 = sha256(canonicalJson({
   schema: 'opsle.wake-worker-implementation/v1',
@@ -149,7 +154,6 @@ function wakePaths(root) {
     base,
     requests: join(base, 'requests'),
     deliveries: join(base, 'deliveries'),
-    busy: join(base, 'busy.json'),
     sessionBinding: join(base, 'codex-session-binding.json'),
     sessionBindingHistory: join(base, 'session-binding-history'),
     consumptions: join(base, 'consumptions'),
@@ -173,10 +177,6 @@ function directories(root) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
   }
   return value;
-}
-
-function removeIfPresent(path) {
-  try { unlinkSync(path); } catch (error) { if (error.code !== 'ENOENT') throw error; }
 }
 
 function requestPath(root, eventId) {
@@ -1090,7 +1090,7 @@ export function claimActivationDecision(root, eventId, lease, {
   const path = activationDecisionPath(root, eventId);
   if (atomicCreateJson(path, decision)) return { claimed: true, duplicate: false, decision };
   const current = readJson(path);
-  if (['BUSY', 'TRANSPORT_NOT_STARTED'].includes(current.status)
+  if (current.status === 'TRANSPORT_NOT_STARTED'
       && decisionFenceCurrent(root, lease)) {
     const expected = sha256(canonicalJson(current));
     decision.prior_attempts = [
@@ -1166,7 +1166,7 @@ export function classifyQueuedWake(root, request, supervisor = readJson(paths(ro
   }
   if (existsSync(activationDecisionPath(root, request.event_id))) {
     const decision = readJson(activationDecisionPath(root, request.event_id));
-    if (['BUSY', 'TRANSPORT_NOT_STARTED'].includes(decision.status)) {
+    if (decision.status === 'TRANSPORT_NOT_STARTED') {
       return {
         classification: 'queued',
         reason: 'awaiting-supported-native-transport',
@@ -2487,7 +2487,6 @@ export function consumeWakeDelivery(root, eventId, { deliveryId = null, generati
       || decision.message_sha256 !== receipt.message_sha256) {
     throw new Error('wake delivery receipt fence mismatch');
   }
-  const wake = directories(root);
   const consumption = {
     schema: WAKE_CONSUMPTION_SCHEMA,
     consumption_id: `wake-consumption-${sha256(canonicalJson({
@@ -2528,8 +2527,6 @@ export function consumeWakeDelivery(root, eventId, { deliveryId = null, generati
       || durable.delivery_receipt_fence_sha256 !== consumption.delivery_receipt_fence_sha256) {
     throw new Error('wake consumption evidence fence mismatch');
   }
-  const busy = readOptional(wake.busy);
-  if (busy?.delivery_id === receipt.delivery_id) removeIfPresent(wake.busy);
   return { duplicate: !created, receipt, consumption: durable };
 }
 
@@ -2582,7 +2579,6 @@ export function wakeQueueStatus(root, {
 } = {}) {
   const wake = directories(root);
   const supervisor = readJson(paths(root).supervisor);
-  const busy = readOptional(wake.busy);
   const bindingStatus = refreshCodexSessionBinding(root, { dependencies: bindingDependencies });
   const requests = readdirSync(wake.requests).filter((name) => name.endsWith('.json')).sort().map((name) => {
     const request = readJson(join(wake.requests, name));
@@ -2640,7 +2636,6 @@ export function wakeQueueStatus(root, {
   return {
     supervisor_generation: supervisor.generation,
     session_binding: bindingStatus,
-    busy,
     requests,
   };
 }
