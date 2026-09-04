@@ -16,7 +16,6 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
-import { activationSummary } from '../src/activation-telemetry.js';
 import { createAttempt, createTask, routeTask } from '../src/pipeline.js';
 import { readJson, writeJson } from '../src/io.js';
 import { initialize, paths } from '../src/state.js';
@@ -27,6 +26,14 @@ import {
   runDetachedWorker,
 } from '../src/runner.js';
 import { registerWait } from '../src/wakeup.js';
+import { createReleaseFence, processStartIdentity } from '../src/runtime-release.js';
+import {
+  HOST_OWNERSHIP_SCHEMA,
+  OPSLED_REPOSITORY_SCHEMA,
+  registryPaths,
+  repositoryOperationalId,
+} from '../src/opsled-registry.js';
+import { processRunnerRequests } from '../src/opsled-runner.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 const cliPath = join(sourceRoot, 'bin', 'opsle.js');
@@ -41,7 +48,25 @@ function fixture() {
   mkdirSync(join(root, '.opsle'));
   cpSync(join(sourceRoot, '.opsle', 'specification.md'), join(root, '.opsle', 'specification.md'));
   cpSync(join(sourceRoot, '.opsle', 'requirements.json'), join(root, '.opsle', 'requirements.json'));
-  initialize(root, { actor: 'detached-test' });
+  initialize(root, { actor: 'detached-test', objectiveText: 'Exercise detached Runner behavior.' });
+  const hostRoot = join(root, '.fixture-opsled-host');
+  writeJson(join(root, '.opsle', 'host-ownership.json'), {
+    schema: HOST_OWNERSHIP_SCHEMA,
+    repository_id: repositoryOperationalId(root),
+    repository_realpath: root,
+    opsled_root: hostRoot,
+    registry_path: registryPaths(hostRoot).registry,
+    herdr: {
+      kind: 'herdr',
+      workspace_id: 'fixture-workspace',
+      pane_id: 'fixture-pane',
+      terminal_id: 'fixture-terminal',
+      sessions_root_realpath: join(root, '.fixture-codex', 'sessions'),
+    },
+    session_binding_path: join(root, '.opsle', 'wake', 'codex-session-binding.json'),
+    registered_at: '2026-09-04T00:00:00.000Z',
+    updated_at: '2026-09-04T00:00:00.000Z',
+  });
   return root;
 }
 
@@ -255,6 +280,7 @@ test('detached worker failure durably separates Runner failure and intervention 
     writeJson(join(paths(root).attempts, `${attempt.attempt_id}.json`), attempt);
     const supervisor = readJson(paths(root).supervisor);
     const launchNonce = 'runner-launch-fixture';
+    const workerIdentity = processStartIdentity();
     mkdirSync(join(root, '.opsle', 'workers'), { recursive: true });
     writeJson(join(root, '.opsle', 'workers', `${attempt.attempt_id}.json`), {
       schema: 'opsle.durable-supervisor.detached-runner/v1',
@@ -267,6 +293,13 @@ test('detached worker failure durably separates Runner failure and intervention 
       launch_nonce: launchNonce,
       launcher_pid: process.pid,
       worker_pid: process.pid,
+      expected_release: {
+        runtime_release_id: createReleaseFence('runner-worker', workerIdentity).runtime_release_id,
+        packaged_artifact_sha256: createReleaseFence('runner-worker', workerIdentity).packaged_artifact_sha256,
+        runtime_epoch: createReleaseFence('runner-worker', workerIdentity).runtime_epoch,
+        helper_role: 'runner-worker',
+      },
+      release_fence: createReleaseFence('runner-worker', workerIdentity),
       status: 'LAUNCHED',
       launched_at: registeredAt,
       owned_at: null,
@@ -346,7 +379,7 @@ test('recovery preserves only a live exact detached Runner owner across generati
   }
 });
 
-test('detached ownership ends the launcher turn and only a queued terminal event permits reactivation', async () => {
+test('task run publishes a durable Runner request without launching a child', async () => {
   const root = fixture();
   try {
     const task = createTask(root, handoff('task-detached-default', 2400));
@@ -356,81 +389,14 @@ test('detached ownership ends the launcher turn and only a queued terminal event
     assert.equal(launched.code, 0, launched.stderr);
     assert.ok(launched.stdout.trim(), JSON.stringify(launched));
     const launch = JSON.parse(launched.stdout);
-    assert.equal(launch.launch_mode, 'detached');
-    assert.equal(launch.action, 'END_TURN_IMMEDIATELY');
-    assert.equal(launch.monitoring_owner, 'RUNNER_ONLY');
-    assert.ok(['LAUNCHING', 'RUNNING'].includes(launch.child_state));
+    assert.equal(launch.launch_mode, 'opsled-request');
+    assert.equal(launch.action, 'REQUEST_SUBMITTED');
+    assert.equal(launch.monitoring_owner, 'OPSLED');
+    assert.equal(launch.child_state, 'QUEUED');
     assert.ok(elapsed < 1200, `detached launch took ${elapsed}ms`);
-    assert.equal(readJson(paths(root).state).supervisor_state, 'DORMANT');
-    assert.deepEqual(launch.dormancy_contract.prohibited_automatic_supervisor_checks, [
-      'child', 'status', 'heartbeat', 'watch', 'wait',
-    ]);
-    assert.deepEqual(launch.dormancy_contract.eligible_automatic_reactivation, {
-      event_types: [
-        'child-completed',
-        'child-failed',
-        'child-timeout',
-        'child-stall',
-        'intervention-required',
-      ],
-      queue: 'durable-wake-queue',
-      transport: 'plain-codex-resume',
-    });
-
-    const recordPath = join(root, '.opsle', 'workers', `${launch.attempt_id}.json`);
-    const owned = readJson(recordPath);
-    assert.ok(['OWNED', 'TERMINAL'].includes(owned.status));
-    assert.equal(owned.worker_pid, launch.worker_pid);
-    assert.equal(owned.dormancy_contract.monitoring_owner, 'RUNNER_ONLY');
-    await waitFor(() => {
-      try { process.kill(owned.launcher_pid, 0); return false; } catch { return true; }
-    }, 'initiating CLI launcher remained alive');
-
-    const attemptPath = join(paths(root).attempts, `${launch.attempt_id}.json`);
-    const initialHeartbeat = readJson(attemptPath).heartbeat_at;
-    await waitFor(() => {
-      const value = readJson(attemptPath);
-      return value.child_state === 'RUNNING' && value.heartbeat_at !== initialHeartbeat;
-    }, 'Runner did not publish nonterminal heartbeat progress');
-    const running = readJson(attemptPath);
-    assert.equal(running.wait_registration.detached_dormancy.supervisor_action, 'END_TURN_IMMEDIATELY');
-    assert.equal(readJson(paths(root).state).supervisor_state, 'DORMANT');
-    assert.equal(events(root).filter((event) => (
-      event.type === 'SUPERVISOR_ACTIVATION'
-      && event.attempt_id === launch.attempt_id
-    )).length, 0);
-    assert.equal(existsSync(join(root, '.opsle', 'wake', 'requests')), false);
-
-    const completed = await waitFor(() => {
-      const value = readJson(attemptPath);
-      return value.child_state === 'COMPLETED' ? value : null;
-    }, 'detached worker did not publish terminal attempt state');
-    assert.equal(completed.acceptance.state, 'SATISFIED');
-    assert.equal(completed.telemetry.activation_counts.wait_induced_automatic, 0);
-    assert.equal(readFileSync(join(root, `${task.task_id}.txt`), 'utf8'), 'done\n');
-    await waitFor(() => readJson(recordPath).status === 'TERMINAL', 'worker terminal record was not persisted');
-    await waitFor(() => {
-      try { process.kill(launch.worker_pid, 0); return false; } catch { return true; }
-    }, 'detached Runner process did not exit after terminal record');
-    assert.equal(readJson(paths(root).state).supervisor_state, 'DORMANT');
-    assert.equal(readJson(join(paths(root).claims, `${completed.claim_id}.json`)).status, 'COMPLETED');
-
-    const completion = events(root).find((event) => (
-      event.type === 'CHILD_COMPLETION' && event.attempt_id === launch.attempt_id
-    ));
-    assert.ok(completion);
-    assert.match(completion.wait_mechanism, /detached Runner worker/);
-    assert.equal(events(root).filter((event) => (
-      event.type === 'SUPERVISOR_ACTIVATION'
-      && event.classification === 'terminal-event'
-      && event.attempt_id === launch.attempt_id
-    )).length, 0);
-    assert.equal(activationSummary(events(root)).wait_induced_automatic, 0);
-    assert.ok(existsSync(join(root, '.opsle', 'wake', 'requests', `${completion.event_id}.json`)));
-    assert.equal(events(root).filter((event) => (
-      event.type === 'HOST_WAKE_QUEUED'
-      && event.source_event_id === completion.event_id
-    )).length, 1);
+    assert.equal(readJson(paths(root).state).supervisor_state, 'ACTIVE');
+    assert.equal(existsSync(join(paths(root).runnerRequests, `${launch.request_id}.json`)), true);
+    assert.equal(existsSync(join(root, '.opsle', 'workers')), false);
   } finally {
     await cleanupDetachedFixture(root);
   }
@@ -456,22 +422,67 @@ test('foreground waiting is available only through the explicit compatibility fl
   }
 });
 
-test('default detached launch emits one useful notice and immediately leaves supervision dormant', async () => {
+test('opsled launches and supervises a deterministic Runner from the explicit request', async () => {
   const root = fixture();
   try {
-    const task = createTask(root, handoff('task-human-launch-notice', 500));
-    const launched = runCli(root, ['task', 'run', task.task_id]);
-    assert.equal(launched.code, 0, launched.stderr);
-    assert.equal(launched.stdout.trim().split('\n').length, 1);
-    assert.match(launched.stdout, /^Child .* started as .*; Runner owns monitoring and the supervisor is dormant\./);
-    assert.match(launched.stdout, /END_TURN_IMMEDIATELY$/m);
-    assert.equal(readJson(paths(root).state).supervisor_state, 'DORMANT');
+    const task = createTask(root, handoff('task-opsled-intent-live', 100));
+    const queued = runCli(root, ['task', 'run', task.task_id, '--json']);
+    assert.equal(queued.code, 0, queued.stderr);
+    const request = JSON.parse(queued.stdout);
+    const pointer = readJson(paths(root).hostOwnership);
+    const mapping = {
+      schema: OPSLED_REPOSITORY_SCHEMA,
+      repository_id: pointer.repository_id,
+      repository_realpath: root,
+      host_state_path: join(pointer.opsled_root, 'repositories', pointer.repository_id),
+      ownership_pointer_path: paths(root).hostOwnership,
+      herdr: pointer.herdr,
+      enabled: true,
+      added_at: pointer.registered_at,
+      updated_at: pointer.updated_at,
+    };
+    const identity = processStartIdentity();
+    const options = {
+      releaseFence: createReleaseFence('opsled-worker', identity),
+      processIdentity: identity,
+      serviceIdentity: {
+        service_id: 'opsled-fixture-service',
+        generation: 1,
+        launch_nonce: 'existing-service-fence',
+        process: identity,
+        host_root: pointer.opsled_root,
+      },
+    };
+    const [launched] = await processRunnerRequests(mapping, options);
+    assert.equal(launched.request_id, request.request_id);
+    assert.equal(launched.status, 'RUNNING');
+    const attemptPath = join(paths(root).attempts, `${request.attempt_id}.json`);
+    await waitFor(() => readJson(attemptPath).child_state === 'COMPLETED', 'opsled Runner did not complete');
+    await waitFor(() => readJson(join(root, '.opsle', 'workers', `${request.attempt_id}.json`)).status === 'TERMINAL', 'opsled Runner did not publish terminal ownership');
+    const [terminal] = await processRunnerRequests(mapping, options);
+    assert.equal(terminal.status, 'TERMINAL');
+    assert.equal(readFileSync(join(root, `${task.task_id}.txt`), 'utf8'), 'done\n');
   } finally {
     await cleanupDetachedFixture(root);
   }
 });
 
-test('task run atomically arms pause-after-current before detached ownership returns', async () => {
+test('default task run reports the durable opsled request without claiming a child launch', async () => {
+  const root = fixture();
+  try {
+    const task = createTask(root, handoff('task-human-launch-notice', 500));
+    const launched = runCli(root, ['task', 'run', task.task_id]);
+    assert.equal(launched.code, 0, launched.stderr);
+    assert.equal(launched.stdout.trim().split('\n').length, 2);
+    assert.match(launched.stdout, /^Runner request .* queued for task-human-launch-notice\./);
+    assert.match(launched.stdout, /^Opsled owns launch and supervision\.$/m);
+    assert.equal(readJson(paths(root).state).supervisor_state, 'ACTIVE');
+  } finally {
+    await cleanupDetachedFixture(root);
+  }
+});
+
+test('task run atomically arms pause-after-current before publishing the Runner request', async () => {
   for (const evaluation of ['accept', 'reject']) {
     const root = fixture();
     try {
@@ -483,76 +494,29 @@ test('task run atomically arms pause-after-current before detached ownership ret
       ]);
       assert.equal(launched.code, 0, launched.stderr);
       const launch = JSON.parse(launched.stdout);
-      assert.equal(launch.action, 'END_TURN_IMMEDIATELY');
-      assert.equal(launch.monitoring_owner, 'RUNNER_ONLY');
-      assert.deepEqual(launch.pause_after_current, {
-        armed: true,
-        reason,
-        event_id: launch.pause_after_current.event_id,
-      });
-      assert.match(launch.pause_after_current.event_id, /^event-/);
+      assert.equal(launch.action, 'REQUEST_SUBMITTED');
+      assert.equal(launch.monitoring_owner, 'OPSLED');
+      assert.equal(launch.pause_after_current, true);
 
       const armed = readJson(paths(root).state);
-      assert.equal(armed.supervisor_state, 'DORMANT');
+      assert.equal(armed.supervisor_state, 'ACTIVE');
       assert.equal(armed.pause.active, true);
       assert.equal(armed.pause.after_current, true);
       assert.equal(armed.pause.reason, reason);
       const armedEvent = events(root).find((event) => (
-        event.event_id === launch.pause_after_current.event_id
+        event.type === 'PAUSE_AFTER_CURRENT_REQUESTED'
+        && event.attempt_id === launch.attempt_id
       ));
-      assert.equal(armedEvent.type, 'SUPERVISOR_PAUSED');
-      assert.equal(armedEvent.source, 'task-run');
-
-      const attemptPath = join(paths(root).attempts, `${launch.attempt_id}.json`);
-      await waitFor(() => readJson(attemptPath).child_state === 'COMPLETED', 'atomic child did not finish');
-      await waitFor(() => !processAlive(launch.worker_pid), 'atomic detached Runner did not exit');
-      const awaiting = readJson(paths(root).state);
-      assert.equal(awaiting.supervisor_state, 'DORMANT');
-      assert.equal(awaiting.pause.active, true);
-      assert.equal(awaiting.pause.after_current, true);
-      assert.equal(readJson(join(paths(root).tasks, `${task.task_id}.json`)).state, 'AWAITING_SUPERVISOR');
-      assert.equal(events(root).some((event) => event.type === 'PAUSE_AFTER_CURRENT_APPLIED'), false);
-
-      const evaluated = runCli(root, [
-        'task', 'evaluate', task.task_id,
-        `--${evaluation}`, '--rationale', `${evaluation} atomic pause ordering`,
-      ]);
-      assert.equal(evaluated.code, 0, evaluated.stderr);
-      const result = JSON.parse(evaluated.stdout);
-      const recordedEvents = events(root);
-      const decisionIndex = recordedEvents.findIndex((event) => (
-        event.type === 'SUPERVISOR_DECISION'
-        && event.decision_id === result.decision.decision_id
-      ));
-      const appliedIndex = recordedEvents.findIndex((event) => (
-        event.type === 'PAUSE_AFTER_CURRENT_APPLIED'
-        && event.decision_id === result.decision.decision_id
-      ));
-      assert.ok(decisionIndex >= 0);
-      assert.ok(appliedIndex > decisionIndex);
-      const decisions = readFileSync(paths(root).decisionsLog, 'utf8')
-        .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-      assert.ok(decisions.some((decision) => decision.decision_id === result.decision.decision_id));
-
-      const terminal = readJson(paths(root).state);
-      assert.equal(terminal.supervisor_state, 'PAUSED');
-      assert.equal(terminal.pause.active, true);
-      assert.equal(terminal.pause.after_current, false);
-      assert.equal(
-        readJson(join(paths(root).tasks, `${task.task_id}.json`)).state,
-        evaluation === 'accept' ? 'ACCEPTED' : 'REJECTED',
-      );
-      const next = createTask(root, handoff(`task-after-atomic-${evaluation}`, 50));
-      const blocked = runCli(root, ['task', 'run', next.task_id]);
-      assert.equal(blocked.code, 1);
-      assert.match(blocked.stderr, /automatic progression is paused/);
+      assert.ok(armedEvent);
+      assert.equal(existsSync(join(paths(root).runnerRequests, `${launch.request_id}.json`)), true);
+      assert.equal(existsSync(join(root, '.opsle', 'workers')), false);
     } finally {
       await cleanupDetachedFixture(root);
     }
   }
 });
 
-test('compatibility pause command remains available for an existing detached launch', async () => {
+test('pause before opsled launch leaves the queued request durable and blocks new work', async () => {
   const root = fixture();
   try {
     const task = createTask(root, handoff('task-detached-pause', 650));
@@ -560,34 +524,15 @@ test('compatibility pause command remains available for an existing detached lau
     assert.equal(launched.code, 0, launched.stderr);
     assert.ok(launched.stdout.trim(), JSON.stringify(launched));
     const launch = JSON.parse(launched.stdout);
-    const attemptPath = join(paths(root).attempts, `${launch.attempt_id}.json`);
-    await waitFor(() => readJson(attemptPath).child_state === 'RUNNING', 'child never entered RUNNING');
-
     const paused = runCli(root, ['pause', '--after-current', '--reason', 'detached fixture boundary']);
     assert.equal(paused.code, 0, paused.stderr);
-    const recovered = runCli(root, ['recover']);
-    assert.equal(recovered.code, 0, recovered.stderr);
-    assert.equal(JSON.parse(recovered.stdout).reconciliation.classification, 'known_running');
-
-    await waitFor(() => readJson(attemptPath).child_state === 'COMPLETED', 'child did not finish after recovery');
-    await waitFor(() => {
-      try { process.kill(launch.worker_pid, 0); return false; } catch { return true; }
-    }, 'detached Runner process did not exit after pause completion');
     const state = readJson(paths(root).state);
-    assert.equal(state.supervisor_state, 'DORMANT');
+    assert.equal(state.supervisor_state, 'PAUSED');
     assert.equal(state.pause.active, true);
-    assert.equal(state.pause.after_current, true);
-    assert.equal(readJson(join(paths(root).tasks, `${task.task_id}.json`)).state, 'AWAITING_SUPERVISOR');
-    const evaluated = runCli(root, [
-      'task', 'evaluate', task.task_id,
-      '--reject', '--rationale', 'recovery changed protected generation evidence during execution',
-    ]);
-    assert.equal(evaluated.code, 0, evaluated.stderr);
-    const terminal = readJson(paths(root).state);
-    assert.equal(terminal.supervisor_state, 'PAUSED');
-    assert.equal(terminal.pause.active, true);
-    assert.equal(terminal.pause.after_current, false);
-    assert.equal(readJson(join(paths(root).tasks, `${task.task_id}.json`)).state, 'REJECTED');
+    assert.equal(state.pause.after_current, false);
+    assert.equal(readJson(join(paths(root).attempts, `${launch.attempt_id}.json`)).child_state, 'QUEUED');
+    assert.equal(existsSync(join(paths(root).runnerRequests, `${launch.request_id}.json`)), true);
+    assert.equal(existsSync(join(root, '.opsle', 'workers')), false);
     const next = createTask(root, handoff('task-detached-must-not-run', 50));
     const blocked = runCli(root, ['task', 'run', next.task_id]);
     assert.equal(blocked.code, 1);

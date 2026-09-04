@@ -75,16 +75,60 @@ test('display state never reports a stale running child as active', () => {
   const stale = deriveDisplayState({
     supervisor, state, task, attempt, claim, runner, processIsAlive: () => false,
   });
-  assert.equal(stale.supervisor, 'UNKNOWN');
+  assert.equal(stale.supervisor, 'ATTENTION');
   assert.equal(stale.child.label, 'UNKNOWN');
   assert.match(stale.reasons[0], /lacks current exact Runner/);
 
   const current = deriveDisplayState({
     supervisor, state, task, attempt, claim, runner, processIsAlive: (pid) => pid === 42,
   });
-  assert.equal(current.supervisor, 'DORMANT');
+  assert.equal(current.supervisor, 'ACTIVE');
   assert.equal(current.child.label, 'RUNNING');
   assert.equal(current.attention, false);
+});
+
+test('lifecycle labels derive INITIALIZED, ACTIVE, IDLE, PAUSED, COMPLETE, and ATTENTION', () => {
+  const supervisor = { authority_status: 'AUTHORITATIVE' };
+  const emptyObjective = { current_revision: 0, history: [] };
+  const objective = { current_revision: 1, history: [{ revision: 1, objective: 'Ship it.' }] };
+  const base = {
+    supervisor_state: 'ACTIVE',
+    phase: 'ACTIVE',
+    active_task_id: null,
+    active_attempt_id: null,
+    latest_unresolved_issue: null,
+    pause: { active: false, after_current: false },
+  };
+  const derive = (state, options = {}) => deriveDisplayState({
+    supervisor,
+    state,
+    objective: options.objective ?? objective,
+    task: options.task ?? null,
+    attempt: options.attempt ?? null,
+  }).supervisor;
+
+  assert.equal(derive({ ...base, phase: 'INITIALIZED' }, { objective: emptyObjective }), 'INITIALIZED');
+  assert.equal(derive(base), 'IDLE');
+  assert.equal(derive({ ...base, active_task_id: 'task-1', active_attempt_id: 'attempt-1' }, {
+    task: { task_id: 'task-1', state: 'QUEUED' },
+    attempt: { attempt_id: 'attempt-1', task_id: 'task-1', child_state: 'QUEUED' },
+  }), 'ACTIVE');
+  assert.equal(derive({
+    ...base,
+    supervisor_state: 'PAUSED',
+    pause: { active: true, after_current: false },
+  }), 'PAUSED');
+  assert.equal(derive({ ...base, phase: 'COMPLETE' }), 'COMPLETE');
+  assert.equal(derive({ ...base, latest_unresolved_issue: 'needs reconciliation' }), 'ATTENTION');
+  assert.equal(derive(base, { objective }), 'IDLE');
+  assert.equal(deriveDisplayState({
+    supervisor,
+    state: base,
+    objective,
+    task: null,
+    attempt: null,
+    wakeAttention: { actionable_count: 1 },
+  }).supervisor, 'ATTENTION');
 });
 
 test('authoritative Herdr liveness does not depend on tmux', () => {

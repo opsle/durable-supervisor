@@ -3,6 +3,7 @@ const ACTIONABLE_WAKE_CLASSIFICATIONS = new Set([
   'queued',
   'native-ready',
   'unsupported-topology',
+  'awaiting-consumption',
 ]);
 
 function words(value) {
@@ -97,13 +98,25 @@ function exactRunnerOwnership({ attempt, claim, runner, supervisor, processIsAli
 export function deriveDisplayState({
   supervisor,
   state,
+  objective = undefined,
+  requirements = null,
   task,
   attempt,
   claim = null,
   runner = null,
+  wakeAttention = null,
+  sessionBinding = null,
   processIsAlive = () => false,
 }) {
   const reasons = [];
+  const hasObjective = Number.isSafeInteger(objective?.current_revision)
+    && objective.current_revision > 0
+    && objective.history?.some((item) => item.revision === objective.current_revision);
+  const neutralInitialized = objective !== undefined
+    && state?.phase === 'INITIALIZED'
+    && !hasObjective
+    && !state?.active_task_id
+    && !state?.active_attempt_id;
   if (supervisor?.authority_status !== 'AUTHORITATIVE') {
     reasons.push(`supervisor authority is ${supervisor?.authority_status ?? 'UNKNOWN'}`);
   }
@@ -111,6 +124,36 @@ export function deriveDisplayState({
     reasons.push(typeof state.latest_unresolved_issue === 'string'
       ? state.latest_unresolved_issue
       : (state.latest_unresolved_issue.reason ?? JSON.stringify(state.latest_unresolved_issue)));
+  }
+  if (wakeAttention?.actionable_count > 0) {
+    reasons.push(`${wakeAttention.actionable_count} current wake request(s) require attention`);
+  }
+  if (sessionBinding && sessionBinding.valid !== true && !neutralInitialized) {
+    reasons.push(`authoritative Herdr binding is not current: ${(sessionBinding.reasons ?? []).join(', ') || sessionBinding.classification}`);
+  }
+  if (neutralInitialized) reasons.push('objective required');
+  if ((state?.active_task_id == null) !== (state?.active_attempt_id == null)) {
+    reasons.push('active task and attempt authority are contradictory');
+  }
+  if (state?.supervisor_state === 'PAUSED' && state?.pause?.active !== true) {
+    reasons.push('paused state lacks active pause authority');
+  }
+  if (state?.pause?.after_current === true && !state?.active_attempt_id) {
+    reasons.push('pause-after-current lacks active work');
+  }
+  if (objective !== undefined && state?.phase === 'INITIALIZED' && hasObjective) {
+    reasons.push('initialized phase contradicts a current objective');
+  }
+  if (objective !== undefined && state?.phase !== 'INITIALIZED' && !hasObjective) {
+    reasons.push('active lifecycle lacks a current objective');
+  }
+  const openRequirements = requirements?.requirements?.filter((item) => ![
+    'VERIFIED',
+    'DEFERRED_WITH_JUSTIFICATION',
+    'NOT_APPLICABLE_WITH_JUSTIFICATION',
+  ].includes(item.state)).length ?? 0;
+  if (state?.phase === 'COMPLETE' && openRequirements > 0) {
+    reasons.push('complete phase retains open requirements');
   }
 
   let child = { label: 'NONE', reason: null, attention: false };
@@ -162,20 +205,20 @@ export function deriveDisplayState({
   if (child.reason) reasons.push(child.reason);
 
   let supervisorLabel;
-  if (supervisor?.authority_status !== 'AUTHORITATIVE' || child.label === 'UNKNOWN' || child.label === 'UNCERTAIN') {
-    supervisorLabel = 'UNKNOWN';
-  } else if (state?.pause?.active) {
+  if (neutralInitialized && supervisor?.authority_status === 'AUTHORITATIVE') {
+    supervisorLabel = 'INITIALIZED';
+  } else if (reasons.length > 0 || child.attention) {
+    supervisorLabel = 'ATTENTION';
+  } else if (state?.pause?.active && !(state.pause.after_current && task)) {
     supervisorLabel = 'PAUSED';
-  } else if (child.label === 'NEEDS REVIEW') {
-    supervisorLabel = 'NEEDS REVIEW';
-  } else if (state?.phase === 'COMPLETE' && !task) {
+  } else if (state?.phase === 'COMPLETE' && !task && hasObjective) {
     supervisorLabel = 'COMPLETE';
-  } else if (state?.supervisor_state === 'DORMANT') {
-    supervisorLabel = 'DORMANT';
+  } else if (!hasObjective && !task) {
+    supervisorLabel = 'INITIALIZED';
   } else if (task) {
     supervisorLabel = 'ACTIVE';
   } else {
-    supervisorLabel = 'READY';
+    supervisorLabel = 'IDLE';
   }
 
   return {
@@ -193,7 +236,7 @@ export function deriveSupervisorLiveness({ authorityStatus, herdr, tmuxAlive = f
   if (herdr?.valid === true && herdr.classification === 'bound-authoritative-herdr') {
     return { classification: 'alive', authority: 'herdr', reason: null };
   }
-  if (tmuxAlive) {
+  if (tmuxAlive && !herdr?.reasons?.some((reason) => reason.includes('concurrent live tmux'))) {
     return { classification: 'alive', authority: 'tmux-fallback', reason: null };
   }
   return {
@@ -205,6 +248,7 @@ export function deriveSupervisorLiveness({ authorityStatus, herdr, tmuxAlive = f
 
 function wakeTimestamp(record) {
   const candidates = [
+    record?.consumption?.consumed_at,
     record?.receipt?.consumed_at,
     record?.receipt?.delivered_at,
     record?.receipt?.claimed_at,
@@ -247,7 +291,7 @@ export function renderPolicy(policy, { verbose = false } = {}) {
   const polling = policy.model_polling?.permitted === false
     ? 'prohibited'
     : (policy.model_polling?.permitted === true ? 'permitted' : 'UNKNOWN');
-  const lines = [`Policy: ${providerText}; review ${words(review)}; model polling ${polling}`];
+  const lines = [`Policy: ${providerText}; review ${words(review)}; Context Firewall mandatory; model polling ${polling}`];
   if (verbose) {
     lines.push(`Version: ${policy.version ?? 'unknown'}`);
     for (const [name, config] of providers) {
@@ -255,6 +299,7 @@ export function renderPolicy(policy, { verbose = false } = {}) {
     }
     lines.push(`Reviewer: ${policy.review?.reviewer ?? 'none'}`);
     lines.push(`Affected verification: ${words(policy.affected_verification?.authority)}`);
+    lines.push('Context Firewall: mandatory');
     lines.push(`Changed: ${policy.changed_at ?? 'unknown'} by ${policy.changed_by ?? 'unknown'}`);
   }
   return lines.join('\n');
@@ -308,18 +353,31 @@ export function renderSupervisorStatus(value, {
     active?.attempt_id,
     active?.claim_id,
   ].filter(Boolean);
-  const lines = [];
-  if (value.operator_state.attention) {
-    const label = ['UNKNOWN', 'UNCERTAIN'].includes(value.operator_state.child.label)
-      ? value.operator_state.child.label
-      : 'ACTION NEEDED';
-    lines.push(`ATTENTION: ${label} — ${compactText(value.operator_state.reasons.join('; ') || 'operator action is required')}`);
-  }
-  lines.push(`Supervisor: ${value.operator_state.supervisor} — objective r${value.objective?.revision ?? 'unknown'}`);
+  const lifecycle = value.objective
+    ? `${title(value.supervisor.phase)} — objective r${value.objective.revision}`
+    : `${title(value.supervisor.phase)} — no objective set`;
+  const pause = value.supervisor.pause?.active
+    ? `${value.supervisor.pause.after_current ? 'after current work' : 'active'}${value.supervisor.pause.reason ? ` — ${compactText(value.supervisor.pause.reason)}` : ''}`
+    : 'clear';
   const sessionLabel = value.session_binding.valid === true
-    ? 'CURRENT (authoritative Herdr)'
-    : `${value.session_binding.classification === 'stale' ? 'UNKNOWN' : value.session_binding.classification.toUpperCase()}${value.session_binding.reasons?.length ? ` — ${value.session_binding.reasons.map(words).join(', ')}` : ''}`;
-  lines.push(`Herdr: ${sessionLabel}`);
+    ? `current — workspace ${value.session_binding.binding.host.workspace_id}, pane ${value.session_binding.binding.host.pane_id}`
+    : `${value.session_binding.classification === 'stale' ? 'unknown' : words(value.session_binding.classification)}${value.session_binding.reasons?.length ? ` — ${value.session_binding.reasons.map(words).join(', ')}` : ''}`;
+  const wakeCurrent = value.wake?.current ?? null;
+  const wake = wakeCurrent
+    ? `${title(wakeCurrent.classification)} — ${words(wakeCurrent.terminal_type)} for ${abbreviateIdentifier(wakeCurrent.task_id, identifiers)}`
+    : 'clear';
+  let next = value.progress.pending_next_action ?? 'none';
+  if (active && ['COMPLETED', 'FAILED', 'CANCELLED'].includes(active.child_state)) {
+    next = `Evaluate ${abbreviateIdentifier(active.task_id, identifiers)}.`;
+  } else if (active) {
+    next = 'Await the current Runner result.';
+  } else if (value.supervisor.pause?.active) {
+    next = 'Await operator direction.';
+  }
+  const lines = [
+    `Lifecycle: ${lifecycle}`,
+    `Pause: ${pause}`,
+  ];
   if (!active) {
     lines.push('Work: none');
   } else {
@@ -328,27 +386,13 @@ export function renderSupervisorStatus(value, {
     const timing = ['LAUNCHING', 'RUNNING'].includes(value.operator_state.child.label)
       ? ` for ${formatDuration(active.elapsed_ms)}`
       : (active.completion ? ` ${formatRelativeTime(active.completion, referenceTime)}` : '');
-    lines.push(`Work: ${value.operator_state.child.label} — ${active.description} [${taskId}]${timing}`);
-    lines.push(`Attempt: ${attemptId}; heartbeat ${formatRelativeTime(active.last_heartbeat, referenceTime)}`);
+    lines.push(`Work: ${title(value.operator_state.child.label)} — ${active.description} [${taskId}]${timing}; attempt ${attemptId}`);
   }
+  lines.push(`Wake: ${wake}`);
+  lines.push(`Herdr: ${sessionLabel}`);
+  lines.push(`Next: ${compactText(next)}`);
+
   const requirementEntries = Object.entries(value.progress.requirements);
-  const terminalRequirementStates = new Set([
-    'VERIFIED',
-    'DEFERRED_WITH_JUSTIFICATION',
-    'NOT_APPLICABLE_WITH_JUSTIFICATION',
-  ]);
-  const done = requirementEntries
-    .filter(([name]) => terminalRequirementStates.has(name))
-    .reduce((sum, [, count]) => sum + count, 0);
-  const open = requirementEntries
-    .filter(([name]) => !terminalRequirementStates.has(name))
-    .reduce((sum, [, count]) => sum + count, 0);
-  lines.push(`Progress: ${done} resolved; ${open} open`);
-  lines.push(`Next: ${compactText(value.progress.pending_next_action ?? 'none')}`);
-  const providers = Object.entries(value.policy.providers)
-    .map(([name, enabled]) => `${title(name)} ${enabledLabel(enabled)}`)
-    .join('; ');
-  lines.push(`Policy: ${providers}; review ${words(value.policy.review_mode)}`);
 
   if (verbose) {
     lines.push('');
@@ -359,6 +403,7 @@ export function renderSupervisorStatus(value, {
     lines.push(`Durable state: ${value.supervisor.state}`);
     lines.push(`Phase: ${value.supervisor.phase}`);
     lines.push(`Pause: ${JSON.stringify(value.supervisor.pause)}`);
+    lines.push(`Attention: ${value.operator_state.attention ? value.operator_state.reasons.join('; ') : 'none'}`);
     lines.push(`Herdr classification: ${value.session_binding.classification}`);
     lines.push(`Herdr session ID: ${value.session_binding.binding?.codex_session_uuid ?? 'none'}`);
     lines.push(`Herdr reasons: ${(value.session_binding.reasons ?? []).join(', ') || 'none'}`);
@@ -447,6 +492,9 @@ export function renderWakeStatus(value, { verbose = false, referenceTime = Date.
     lines.push(`Session reasons: ${(value.session_binding?.reasons ?? []).join(', ') || 'none'}`);
     lines.push(`Dispatcher ID: ${value.dispatcher?.dispatcher_id ?? 'none'}`);
     lines.push(`Dispatcher status: ${value.dispatcher?.status ?? 'not-started'}`);
+    lines.push(`Dispatcher implementation current: ${value.dispatcher?.implementation_fence?.current === true ? 'yes' : 'no'}`);
+    lines.push(`Dispatcher implementation expected: ${value.dispatcher?.implementation_fence?.expected_sha256 ?? 'unknown'}`);
+    lines.push(`Dispatcher implementation observed: ${value.dispatcher?.implementation_fence?.observed_sha256 ?? 'unknown'}`);
   }
   return lines.join('\n');
 }

@@ -6,8 +6,10 @@ are not.
 
 ## Initialize once
 
-`init` requires a prepared repository containing `.opsle/specification.md` and
-`.opsle/requirements.json`. Do not run it in an already initialized repository:
+`init` works in an ordinary Git repository. It creates repository-local `.opsle`
+authority without copying Durable Supervisor source, changing tracked project
+content, assuming sibling repositories, fabricating requirements, or injecting
+the V0.1 self-host objective. Do not run it in an already initialized repository:
 it fails closed when an authoritative supervisor exists.
 
 ```bash
@@ -15,6 +17,18 @@ it fails closed when an authoritative supervisor exists.
 ./bin/opsle.js validate
 ./bin/opsle.js status
 ```
+
+The neutral bootstrap starts as `INITIALIZED` until an objective is supplied:
+
+```bash
+./bin/opsle.js init --objective "Ship the repository objective."
+```
+
+Repositories that already contain both `.opsle/specification.md` and
+`.opsle/requirements.json` retain requirement-driven semantics. Supplying only
+one fails closed because the authority would be ambiguous. `--json` selects the
+machine-readable initialization result. `opsle --version` is repository-
+independent and prints source/build provenance when available.
 
 This repository is already initialized.
 
@@ -27,9 +41,10 @@ One snapshot:
 ```
 
 The default is an attention-first human summary intended to fit one terminal
-screen. It derives supervisor and child labels from current durable authority;
-`UNKNOWN` and `UNCERTAIN` are never collapsed into idle or active. Times are
-relative and identifiers are safely abbreviated.
+screen. It derives `INITIALIZED`, `ACTIVE`, `IDLE`, `PAUSED`, `COMPLETE`, and
+`ATTENTION` from current objective, work, pause, unresolved, wake, and authority
+facts. Contradictory or uncertain child authority is `ATTENTION`, never idle or
+active. Times are relative and identifiers are safely abbreviated.
 
 Expanded human diagnostics, including exact identifiers and timestamps:
 
@@ -183,7 +198,9 @@ a process loss without a supervisor recovery, use:
 
 Normal recovery starts the current dispatcher automatically. Dispatcher
 ownership is fenced by exact PID/start/executable, dispatcher generation,
-supervisor identity/generation, and request queue version. Duplicate starts are
+the loaded dispatcher implementation hash, supervisor identity/generation, and
+request queue version. A newly launched Runner atomically supersedes an alive
+dispatcher that loaded obsolete source. Duplicate starts are
 idempotent. A stale owner cannot select transport after recovery supersedes it.
 
 Each queued request has no expiry. The dispatcher registers filesystem
@@ -213,7 +230,7 @@ and latest event IDs.
 ./bin/opsle.js wake drain
 ```
 
-For a valid authoritative Herdr v2 binding, normal dispatch spawns plain
+For a valid authoritative Herdr v3 binding, normal dispatch spawns plain
 `codex resume SESSION_ID MESSAGE` under a repository-local PTY launcher. It
 confirms one exact accepted-message record and its matching turn-began record in
 the bound rollout and hashes their complete raw JSONL line bytes. Before spawn,
@@ -251,12 +268,27 @@ the immediately prior invocation without `--evidence` and always emits one
 complete JSON result, allowing an already-running dispatcher to finish across a
 source cutover. It never calls tmux input or Herdr input.
 
-### Bind and inspect the exact Codex session
+### Refresh and inspect the exact Codex session
 
-Binding is separate from the durable supervisor identity. Obtain the exact
-current Herdr Codex process and workspace facts from read-only inspection, then
-run this reviewed command with those literal values. Do not run it from a child
-task:
+The current frontend binding is ephemeral and separate from the durable
+supervisor identity. `status`, `session status`, `wake status`, supervisor
+liveness, resume-packet generation/freshness checks, and delivery discover it
+automatically. Discovery requires matching `CODEX_SESSION_ID` and
+`CODEX_THREAD_ID` when present, two consistent `herdr api snapshot` reads,
+exact `herdr pane process-info` facts, one repository workspace, one attached
+Codex pane/frontend process, and one matching rollout. A fenced dispatcher may
+ignore an obsolete inherited Codex environment and select the one exact live
+Herdr frontend.
+
+Replacement atomically advances only `binding_revision`; it does not change
+the supervisor ID or generation. Prior pointers are retained under
+`.opsle/wake/session-binding-history/`. Ambiguous, raced, detached,
+repository-mismatched, incomplete, or dual-tmux discovery installs an
+`INVALID` pointer with no usable session, rollout, or host facts and exposes
+attention in every operator view. Repeating the same refresh is idempotent.
+
+The explicit bind command remains a compatibility diagnostic. Do not use it
+from a child task or to override failed live discovery:
 
 ```bash
 ./bin/opsle.js session bind \
@@ -276,7 +308,10 @@ copy/paste. The command sends no input and does not resume Codex. It records and
 validates repository realpath, supervisor identity/generation, Codex UUID,
 rollout `session_meta` hashes and file device/inode, installed CLI version,
 UID, exact process start/executable/TTY/command hash, Herdr workspace/pane/
-terminal identity, unique rollout candidate, and absence of old tmux authority.
+terminal identity and a unique rollout candidate. No tmux fallback is required
+or fabricated. If `--legacy-tmux-session NAME` is explicitly supplied, binding
+and every status/delivery check fail closed while that exact tmux authority is
+live.
 
 Inspect without model use:
 
@@ -285,11 +320,23 @@ Inspect without model use:
 ./bin/opsle.js wake status
 ```
 
-Generation or session drift requires a fresh authoritative Herdr binding; v2
-bindings are never adopted across a generation change. Missing/replaced rollout,
-duplicate candidate, metadata mismatch, dead/reused process,
-CLI/UID/repository/host mismatch, supersession, or live old tmux authority fails
-closed. Valid status is `bound-authoritative-herdr`.
+Existing v2 records load safely and migrate once when exact live facts are
+proven. Missing/replaced rollout, duplicate frontend or rollout candidates,
+metadata mismatch, dead/reused process, CLI/UID/repository/host mismatch,
+detached child context, discovery races, supersession, or live tmux authority
+fails closed. Valid status is `bound-authoritative-herdr`.
+
+After terminal delivery, consume the exact fenced receipt before evaluation:
+
+```bash
+./bin/opsle.js events consume EVENT_ID \
+  --delivery DELIVERY_ID \
+  --generation SUPERVISOR_GENERATION
+```
+
+Consumption is idempotent and immutable under `.opsle/wake/consumptions/`; it
+does not rewrite the delivery receipt. A task with a delivered but unconsumed
+terminal wake cannot be evaluated.
 
 Before a send, the 180-second activation lease safely exceeds the bounded
 135-second plain-resume helper lifecycle. Its CAS fences generation,
@@ -411,6 +458,9 @@ Provider changes are prospective:
 ./bin/opsle.js policy disable claude
 ```
 
+Context Firewall reduction is mandatory Runner behavior. It has no enable or
+disable policy command and every completed Runner path emits its bounded packet.
+
 Set risk-based review only after its reviewer is enabled:
 
 ```bash
@@ -494,11 +544,17 @@ activation, reconcile once and emit only the resulting packet:
 The packet is canonical `resume-packet/v1` JSON and answers current repository,
 supervisor/generation, authority and Herdr binding, objective, phase, policy,
 pause, active task/attempt/claim/fence, wake attention, latest relevant decision,
-unresolved state, and next action. Its hard ceilings are 4,000 UTF-8 bytes,
-4,000 characters, and 1,000 clearly labeled estimated tokens using
-`ceil(UTF-8 bytes / 4)`. Generation time and reconstruction telemetry are
+unresolved state, and next action. Its hard ceilings are 4,000 UTF-8 bytes and
+4,000 Unicode code points. Those exact measurements are recorded; no token count
+is claimed without a tokenizer. Generation time and reconstruction telemetry are
 written separately to `.opsle/evidence/reconstruction/telemetry.json` and never
 enter the packet.
+
+Every complete packet includes a semantic freshness fence. Packet consumption
+re-derives that fence and replaces a stale cached packet with the fresh packet
+already computed in that same pass for changed objective, task, decision,
+pause/resume, unresolved/wake, policy, supervisor-generation, or session authority.
+Telemetry-only timestamp changes are excluded from the fence.
 
 For a `complete_for_resume` packet, do not read broader durable files. For
 `incomplete`, `contradictory`, or `requires_escalation`, load only a path named
@@ -511,9 +567,9 @@ in `evidence.escalation`:
 That command verifies the referenced file hash and emits only its selected JSON
 slice, capped at 16 KiB. It rejects unselected paths, changed evidence, symlinks,
 repository escapes, unsupported selectors, and oversized selected output.
-`resume-packet show` rereads only the already generated packet. Append-only
-events and decisions, raw evidence, the specification, and objective history
-remain durable but are not normal model inputs.
+`resume-packet show` verifies the freshness fence before emitting a complete
+packet. Append-only events and decisions, raw evidence, the specification, and
+objective history remain durable but are not normal model inputs or output.
 
 `status` and `validate` remain useful operator diagnostics and release checks.
 Do not paste their output into the normal activation context. Direct `recover`

@@ -1,6 +1,13 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { basename, join, relative } from 'node:path';
+import {
+  basename,
+  dirname,
+  join,
+  relative,
+  resolve,
+} from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   appendEvent,
@@ -16,6 +23,7 @@ import {
   NEXT_UNSATISFIED_REQUIREMENT_ACTION,
   REVIEW_MODES,
   derivePendingNextAction,
+  effectiveRequirementMatrix,
   emit,
   initialize,
   paths,
@@ -32,6 +40,7 @@ import {
   routeTask,
 } from './pipeline.js';
 import { launchDetachedAttempt, runAttempt } from './runner.js';
+import { createRunnerRequest } from './opsled-runner.js';
 import {
   loadSelectedSupervisorSkillInstructions,
   readSupervisorRoutingDecision,
@@ -41,7 +50,6 @@ import { activationSummary } from './activation-telemetry.js';
 import {
   deriveDisplayState,
   deriveSupervisorLiveness,
-  detachedLaunchNotice,
   renderModels,
   renderPolicy,
   renderSession,
@@ -59,18 +67,28 @@ import {
   adoptQueuedWakes,
   applyWakeEvent,
   bindCodexSession,
-  codexSessionBindingStatus,
   consumeWakeDelivery,
   drainWakeQueue,
   ensureWakeDispatcher,
+  refreshCodexSessionBinding,
+  unconsumedDeliveredWakes,
+  wakeDeliveryConsumptionStatus,
   wakeQueueStatus,
+  reconcileWakeTransportNotStarted,
+  consumeReconciledTransportNotStarted,
+  codexSessionBindingStatus,
 } from './wakeup.js';
+import {
+  loadRuntimeRelease,
+} from './runtime-release.js';
+import { ensureDurableCompatibility } from './durable-schema.js';
 
 function usage() {
   return `usage: opsle COMMAND
 
 commands:
-  init
+  --version
+  init [--objective TEXT] [--json]
   status [--verbose|--json] [--watch [--iterations N] [--interval-ms MS]]
   validate
   recover
@@ -100,6 +118,7 @@ commands:
   wake start
   wake status [--verbose|--json]
   wake drain
+  wake reconcile-transport-not-started EVENT_ID
   session bind --session UUID --rollout PATH --sessions-root PATH
     --host-pid PID --workspace-id ID --workspace-cwd PATH
     --pane-id ID --terminal-id ID [--legacy-tmux-session NAME]
@@ -123,6 +142,41 @@ function print(value) {
   process.stdout.write(`${typeof value === 'string' ? value : JSON.stringify(value, null, 2)}\n`);
 }
 
+const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+export function versionInfo({ run = spawnSync } = {}) {
+  const packageManifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
+  const release = loadRuntimeRelease();
+  const source = run('git', ['-C', packageRoot, 'rev-parse', '--verify', 'HEAD'], { encoding: 'utf8' });
+  const sourceRevision = source.status === 0 ? source.stdout.trim() : null;
+  const sourceStatus = sourceRevision
+    ? run('git', [
+      '-C', packageRoot, 'status', '--porcelain', '--untracked-files=all',
+      '--', '.', ':(exclude).opsle', ':(exclude)graphify-out',
+    ], { encoding: 'utf8' })
+    : null;
+  const sourceDirty = sourceStatus?.status === 0 ? sourceStatus.stdout.trim().length > 0 : null;
+  const buildRevision = process.env.OPSLE_BUILD_REVISION?.trim() || null;
+  return {
+    name: packageManifest.name,
+    version: release.version,
+    runtime_release_id: release.runtime_release_id,
+    packaged_artifact_sha256: release.packaged_artifact_sha256,
+    runtime_epoch: release.runtime_epoch,
+    source_revision: sourceRevision,
+    source_dirty: sourceDirty,
+    build_revision: buildRevision,
+  };
+}
+
+function renderVersion(value) {
+  const provenance = [
+    value.source_revision ? `source ${value.source_revision}${value.source_dirty ? ' (dirty worktree)' : ''}` : null,
+    value.build_revision ? `build ${value.build_revision}` : null,
+  ].filter(Boolean).join('; ');
+  return `opsle ${value.version}\nrelease ${value.runtime_release_id}\nartifact ${value.packaged_artifact_sha256}${provenance ? `\n${provenance}` : ''}`;
+}
+
 function outputMode(args) {
   const json = args.includes('--json');
   const verbose = args.includes('--verbose');
@@ -142,7 +196,10 @@ function integerOption(args, flag, fallback, { minimum = 1, maximum = Number.MAX
 }
 
 export function sessionCommand(root, subcommand, args, { dependencies = {} } = {}) {
-  if (subcommand === 'status') return codexSessionBindingStatus(root, { dependencies });
+  if (subcommand === 'status') return refreshCodexSessionBinding(root, {
+    dependencies,
+    allowEnvironmentMismatch: true,
+  });
   if (subcommand === 'adopt') return adoptCodexSessionBinding(root, { dependencies });
   if (subcommand !== 'bind') throw new Error('session requires bind, status, or adopt');
   const required = [
@@ -215,7 +272,10 @@ function updatePolicy(root, mutate, actor = 'operator-cli') {
 }
 
 function requirementsSummary(root, json) {
-  const matrix = readJson(paths(root).requirements);
+  const matrix = effectiveRequirementMatrix(root);
+  if (!matrix) {
+    return json ? { mode: 'objective_driven', requirements: null } : 'Requirements: none (objective-driven repository)';
+  }
   if (json) return matrix;
   const counts = Object.fromEntries(matrix.allowed_states.map((state) => [state, 0]));
   for (const requirement of matrix.requirements) counts[requirement.state] += 1;
@@ -234,9 +294,13 @@ function setObjective(root, text, actor = 'operator-cli') {
   if (!objectiveText) throw new Error('objective set requires nonempty --text TEXT');
   const p = paths(root);
   const objective = readJson(p.objective);
-  const previous = objective.history.find((item) => item.revision === objective.current_revision);
-  if (!previous) throw new Error(`current objective revision is missing: ${objective.current_revision}`);
-  if (previous.objective === objectiveText) throw new Error('objective is unchanged');
+  const previous = objective.current_revision === 0
+    ? null
+    : objective.history.find((item) => item.revision === objective.current_revision);
+  if (objective.current_revision !== 0 && !previous) {
+    throw new Error(`current objective revision is missing: ${objective.current_revision}`);
+  }
+  if (previous?.objective === objectiveText) throw new Error('objective is unchanged');
 
   const state = readJson(p.state);
   const attempt = attemptForState(root, state);
@@ -271,7 +335,7 @@ function setObjective(root, text, actor = 'operator-cli') {
   const revision = {
     revision: objective.current_revision + 1,
     objective: objectiveText,
-    specification_sha256: fileSha256(p.specification),
+    ...(existsSync(p.specification) ? { specification_sha256: fileSha256(p.specification) } : {}),
     changed_by: actor,
     effective_at: now(),
   };
@@ -279,19 +343,56 @@ function setObjective(root, text, actor = 'operator-cli') {
   objective.current_revision = revision.revision;
   writeJson(p.objective, objective);
   if (!state.active_task_id) {
+    const requirementDriven = Boolean(effectiveRequirementMatrix(root, { state }));
     updateState(root, {
-      phase: state.phase === 'COMPLETE' ? 'SELF_HOSTED' : state.phase,
+      phase: state.phase === 'COMPLETE'
+        ? (requirementDriven ? 'SELF_HOSTED' : 'ACTIVE')
+        : (state.phase === 'INITIALIZED' ? 'ACTIVE' : state.phase),
       pending_next_action: `Establish bounded work for objective revision ${revision.revision}.`,
     });
   }
   const event = emit(root, 'OBJECTIVE_CHANGED', {
     actor,
     objective_id: objective.objective_id,
-    prior_revision: previous.revision,
+    prior_revision: previous?.revision ?? null,
     objective_revision: revision.revision,
     reconciliation,
   });
   return { objective, reconciliation, event_id: event.event_id };
+}
+
+function lifecycleWakeAttention(root, supervisor, state) {
+  const base = join(paths(root).opsle, 'wake');
+  const requests = join(base, 'requests');
+  if (!existsSync(requests)) return { actionable_count: 0, authoritative_count: 0 };
+  const records = readdirSync(requests).filter((name) => name.endsWith('.json')).sort().map((name) => {
+    const request = readJson(join(requests, name));
+    const receiptPath = join(base, 'deliveries', `${request.event_id}.json`);
+    const receipt = existsSync(receiptPath) ? readJson(receiptPath) : null;
+    const consumption = receipt ? wakeDeliveryConsumptionStatus(root, request.event_id) : null;
+    const decisionPath = join(base, 'activation-decisions', `${request.event_id}.json`);
+    const decision = existsSync(decisionPath) ? readJson(decisionPath) : null;
+    const taskPath = request.task_id ? join(paths(root).tasks, `${request.task_id}.json`) : null;
+    const attemptPath = request.attempt_id ? join(paths(root).attempts, `${request.attempt_id}.json`) : null;
+    const task = taskPath && existsSync(taskPath) ? readJson(taskPath) : null;
+    const attempt = attemptPath && existsSync(attemptPath) ? readJson(attemptPath) : null;
+    const authoritative = request.target?.repository === supervisor.repository
+      && request.target?.supervisor_id === supervisor.supervisor_id
+      && request.target?.supervisor_generation === supervisor.generation;
+    const awaitingConsumption = consumption?.delivered === true && consumption.consumed !== true;
+    const historicallyEvaluated = ['ACCEPTED', 'REJECTED'].includes(task?.state)
+      || Boolean(attempt?.supervisor_evaluation);
+    const resolved = consumption?.consumed === true
+      || historicallyEvaluated
+      || (!awaitingConsumption && state.processed_event_ids?.includes(request.event_id));
+    return {
+      ...request,
+      authoritative,
+      classification: resolved ? 'duplicate' : (awaitingConsumption ? 'awaiting-consumption' : 'queued'),
+      reason: resolved ? 'resolved' : (awaitingConsumption ? 'delivered-terminal-wake-unconsumed' : 'current-generation-request'),
+    };
+  });
+  return selectWakeRecords(records);
 }
 
 function status(root, { json = false, verbose = false, referenceTime = Date.now() } = {}) {
@@ -300,7 +401,7 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
   const state = readJson(p.state);
   const objective = readJson(p.objective);
   const policy = readJson(p.policy);
-  const matrix = readJson(p.requirements);
+  const matrix = effectiveRequirementMatrix(root, { state });
   const task = state.active_task_id && existsSync(join(p.tasks, `${state.active_task_id}.json`))
     ? readJson(join(p.tasks, `${state.active_task_id}.json`)) : null;
   const attempt = state.active_attempt_id && existsSync(join(p.attempts, `${state.active_attempt_id}.json`))
@@ -312,23 +413,22 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
     : null;
   const runner = runnerPath && existsSync(runnerPath) ? readJson(runnerPath) : null;
   const sessionBinding = codexSessionBindingStatus(root);
+  const selectedWake = lifecycleWakeAttention(root, supervisor, state);
   const operatorState = deriveDisplayState({
     supervisor,
     state,
+    objective,
+    requirements: matrix,
     task,
     attempt,
     claim,
     runner,
+    wakeAttention: selectedWake,
+    sessionBinding,
     processIsAlive: processAlive,
   });
-  if (sessionBinding.classification === 'stale') {
-    operatorState.attention = true;
-    operatorState.reasons.unshift(
-      `authoritative Herdr binding is UNKNOWN: ${(sessionBinding.reasons ?? []).join(', ') || 'stale'}`,
-    );
-  }
   const counts = {};
-  for (const requirement of matrix.requirements) counts[requirement.state] = (counts[requirement.state] ?? 0) + 1;
+  for (const requirement of matrix?.requirements ?? []) counts[requirement.state] = (counts[requirement.state] ?? 0) + 1;
   const events = existsSync(p.eventsLog)
     ? readFileSync(p.eventsLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)) : [];
   const completionEvents = events.filter((item) => item.type === 'CHILD_COMPLETION');
@@ -371,8 +471,9 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
       tmux_session: supervisor.session_id,
       tmux_alive: supervisor.session_id ? tmuxAlive(supervisor.session_id) : false,
     },
-    objective: objective.history.find((item) => item.revision === objective.current_revision),
+    objective: objective.history.find((item) => item.revision === objective.current_revision) ?? null,
     session_binding: sessionBinding,
+    wake: selectedWake,
     operator_state: operatorState,
     active_work: task ? {
       task_id: task.task_id,
@@ -414,7 +515,7 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
       requirements: counts,
       latest_accepted_task: state.latest_accepted_task_id,
       latest_unresolved_issue: state.latest_unresolved_issue,
-      pending_next_action: state.pending_next_action,
+      pending_next_action: derivePendingNextAction(state, matrix),
     },
     telemetry,
   };
@@ -449,15 +550,14 @@ function processAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-function exactDetachedRunnerOwner({ attempt, claim, runner, supervisor, isProcessAlive }) {
-  return runner?.schema === 'opsle.durable-supervisor.detached-runner/v1'
-    && runner.status === 'OWNED'
-    && runner.task_id === attempt.task_id
-    && runner.attempt_id === attempt.attempt_id
-    && runner.claim_id === attempt.claim_id
-    && runner.fence_generation === attempt.fence_generation
-    && runner.supervisor_id === supervisor.supervisor_id
-    && runner.supervisor_generation === attempt.policy_snapshot?.supervisor_generation
+function exactAttemptClaimOwner({ state, task, attempt, claim, index, supervisor }) {
+  const indexed = index?.[`task-${state.active_task_id}`];
+  return task?.task_id === state.active_task_id
+    && task.supervisor_id === supervisor.supervisor_id
+    && task.attempts?.filter((value) => value === state.active_attempt_id).length === 1
+    && attempt?.schema === 'opsle.durable-supervisor.child-attempt/v1'
+    && attempt.task_id === state.active_task_id
+    && attempt.attempt_id === state.active_attempt_id
     && claim?.schema === 'opsle.durable-supervisor.claim/v1'
     && claim.status === 'ACTIVE'
     && claim.task_id === attempt.task_id
@@ -465,6 +565,27 @@ function exactDetachedRunnerOwner({ attempt, claim, runner, supervisor, isProces
     && claim.claim_id === attempt.claim_id
     && claim.fence_generation === attempt.fence_generation
     && claim.owner_supervisor_id === supervisor.supervisor_id
+    && claim.owner_generation === attempt.policy_snapshot?.supervisor_generation
+    && indexed?.schema === claim.schema
+    && indexed.task_id === claim.task_id
+    && indexed.attempt_id === claim.attempt_id
+    && indexed.claim_id === claim.claim_id
+    && indexed.fence_generation === claim.fence_generation
+    && indexed.owner_supervisor_id === claim.owner_supervisor_id
+    && indexed.owner_generation === claim.owner_generation
+    && indexed.status === claim.status;
+}
+
+function exactDetachedRunnerOwner({ state, task, attempt, claim, index, runner, supervisor, isProcessAlive }) {
+  return exactAttemptClaimOwner({ state, task, attempt, claim, index, supervisor })
+    && runner?.schema === 'opsle.durable-supervisor.detached-runner/v1'
+    && runner.status === 'OWNED'
+    && runner.task_id === attempt.task_id
+    && runner.attempt_id === attempt.attempt_id
+    && runner.claim_id === attempt.claim_id
+    && runner.fence_generation === attempt.fence_generation
+    && runner.supervisor_id === supervisor.supervisor_id
+    && runner.supervisor_generation === attempt.policy_snapshot?.supervisor_generation
     && claim.owner_generation === runner.supervisor_generation
     && Number.isInteger(runner.worker_pid)
     && isProcessAlive(runner.worker_pid);
@@ -618,12 +739,13 @@ export function reconcileRunnerFailure(root, {
 
 export function recover(root, {
   isProcessAlive = processAlive,
-  startWakeDispatcher = ensureWakeDispatcher,
+  startWakeDispatcher = null,
   dispatcherOptions = {},
 } = {}) {
   const p = paths(root);
   const supervisor = readJson(p.supervisor);
   const state = readJson(p.state);
+  const requirements = effectiveRequirementMatrix(root, { state });
   let stateChanged = false;
   let reconciliation = { classification: 'no_active_work', action: 'none' };
   if (state.active_attempt_id) {
@@ -654,14 +776,24 @@ export function recover(root, {
           ? join(p.claims, `${attempt.claim_id}.json`)
           : null;
         const claim = claimPath && existsSync(claimPath) ? readJson(claimPath) : null;
+        const taskPath = state.active_task_id
+          ? join(p.tasks, `${state.active_task_id}.json`)
+          : null;
+        const task = taskPath && existsSync(taskPath) ? readJson(taskPath) : null;
+        const indexPath = join(p.claims, 'index.json');
+        const index = existsSync(indexPath) ? readJson(indexPath) : null;
         const detachedOwned = exactDetachedRunnerOwner({
+          state,
+          task,
           attempt,
           claim,
+          index,
           runner,
           supervisor,
           isProcessAlive,
         });
         const foregroundOwned = !runner
+          && exactAttemptClaimOwner({ state, task, attempt, claim, index, supervisor })
           && Number.isInteger(attempt.pid)
           && isProcessAlive(attempt.pid);
         if (detachedOwned || foregroundOwned) reconciliation = {
@@ -698,7 +830,10 @@ export function recover(root, {
       }
     }
   }
-  const pendingNextAction = derivePendingNextAction(state, readJson(p.requirements));
+  const pendingNextAction = derivePendingNextAction(
+    state,
+    requirements,
+  );
   if (pendingNextAction !== state.pending_next_action) {
     state.pending_next_action = pendingNextAction;
     stateChanged = true;
@@ -709,7 +844,9 @@ export function recover(root, {
   writeJson(p.supervisor, supervisor);
   emit(root, 'SUPERVISOR_RECOVERED', { reconciliation });
   const adopted_wake_event_ids = adoptQueuedWakes(root);
-  const wake_dispatcher = startWakeDispatcher(root, dispatcherOptions);
+  const wake_dispatcher = typeof startWakeDispatcher === 'function'
+    ? startWakeDispatcher(root, dispatcherOptions)
+    : { started: false, reason: 'opsled-owns-persistent-wake-dispatch' };
   return {
     supervisor,
     state: readJson(p.state),
@@ -719,14 +856,21 @@ export function recover(root, {
   };
 }
 
-function evaluateTask(root, taskId, accept, rationale) {
+export function evaluateTask(root, taskId, accept, rationale) {
   const p = paths(root);
+  // Authority is preflighted before decision, task, attempt, requirement, or
+  // lifecycle evidence can be mutated.
+  effectiveRequirementMatrix(root);
   const taskPath = join(p.tasks, `${taskId}.json`);
   const task = readJson(taskPath);
   const attemptId = task.attempts.at(-1);
   if (!attemptId) throw new Error('task has no attempt');
   const attemptPath = join(p.attempts, `${attemptId}.json`);
   const attempt = readJson(attemptPath);
+  const unconsumed = unconsumedDeliveredWakes(root, taskId, attemptId);
+  if (unconsumed.length > 0) {
+    throw new Error(`delivered terminal wake must be consumed before evaluation: ${unconsumed.join(', ')}`);
+  }
   if (attempt.supervisor_evaluation) return { idempotent: true, task, attempt };
   if (accept && attempt.acceptance?.state !== 'SATISFIED') {
     throw new Error('supervisor cannot accept a task rejected by the Acceptance gate without a durable correction');
@@ -783,7 +927,10 @@ function evaluateTask(root, taskId, accept, rationale) {
     latest_accepted_task_id: accept ? taskId : currentState.latest_accepted_task_id,
     latest_unresolved_issue: accept ? null : `Supervisor rejected ${taskId}: ${rationale}`,
     pending_next_action: accept
-      ? derivePendingNextAction(nextState, readJson(p.requirements))
+      ? derivePendingNextAction(
+        nextState,
+        effectiveRequirementMatrix(root, { state: nextState }),
+      )
       : nextState.pending_next_action,
   });
   if (applyPauseAfterCurrent) {
@@ -802,12 +949,25 @@ export function consumeEvent(root, eventId, { deliveryId = null, generation = nu
   const p = paths(root);
   const state = readJson(p.state);
   state.processed_event_ids ??= [];
-  if (state.processed_event_ids.includes(eventId)) return { event_id: eventId, duplicate: true, action: 'ignored' };
+  if (state.processed_event_ids.includes(eventId)) {
+    const wake = deliveryId == null
+      ? wakeDeliveryConsumptionStatus(root, eventId)
+      : consumeWakeDelivery(root, eventId, { deliveryId, generation });
+    return { event_id: eventId, duplicate: true, action: 'ignored', wake_delivery: wake };
+  }
   const event = readJson(join(p.events, `${eventId}.json`));
-  const wake = consumeWakeDelivery(root, eventId, { deliveryId, generation });
+  const deliveryStatus = wakeDeliveryConsumptionStatus(root, eventId);
+  const wake = deliveryStatus.delivered
+    ? consumeWakeDelivery(root, eventId, { deliveryId, generation })
+    : consumeReconciledTransportNotStarted(root, eventId, { generation });
   state.processed_event_ids.push(eventId);
   writeJson(p.state, state);
-  emit(root, 'EVENT_CONSUMED', { source_event_id: eventId, source_event_type: event.type });
+  emit(root, 'EVENT_CONSUMED', {
+    source_event_id: eventId,
+    source_event_type: event.type,
+    delivery_id: wake?.receipt?.delivery_id ?? null,
+    consumption_id: wake?.consumption?.consumption_id ?? null,
+  });
   return { event_id: eventId, duplicate: false, action: 'recorded', wake_delivery: wake };
 }
 
@@ -882,17 +1042,28 @@ function importActivationProfile(root, profile) {
 }
 
 export async function main(args) {
+  loadRuntimeRelease();
   if (args.length === 0 || args[0] === 'help' || args[0] === '--help') {
     print(usage());
+    return;
+  }
+  if (args[0] === '--version' || args[0] === '-V' || args[0] === 'version') {
+    print(renderVersion(versionInfo()));
     return;
   }
   const root = repositoryRoot();
   const [command, subcommand, ...rest] = args;
   if (command === 'init') {
-    print(initialize(root));
+    const result = initialize(root, { objectiveText: valueAfter(args, '--objective') });
+    print(args.includes('--json')
+      ? result
+      : `Initialized Durable Supervisor for ${root} (requirements ${result.bootstrap.requirements.mode}); next: ${result.state.pending_next_action}`);
     return;
   }
   if (!existsSync(paths(root).supervisor)) throw new Error('run opsle init first');
+  if (!(command === 'resume-packet' && ['show', 'evidence'].includes(subcommand))) {
+    ensureDurableCompatibility(root);
+  }
   if (command === 'status') {
     const mode = outputMode(args);
     if (args.includes('--watch')) await watchStatus(root, args);
@@ -940,15 +1111,16 @@ export async function main(args) {
     if (!taskId) throw new Error('cutover requires --first-task TASK_ID');
     const p = paths(root);
     const state = readJson(p.state);
+    const requirements = effectiveRequirementMatrix(root, { state });
+    if (!requirements) throw new Error('cutover requires effective requirements authority');
     if (state.phase !== 'BOOTSTRAP') throw new Error(`cutover already occurred: ${state.phase}`);
     updateState(root, { phase: 'SELF_HOSTED', pending_next_action: `Run first post-cutover task ${taskId}.` });
     const event = emit(root, 'BOOTSTRAP_CUTOVER', {
       first_post_cutover_task_id: taskId,
       minimum_substrate: ['state', 'identity', 'policy', 'discovery', 'gearbox', 'authorization', 'handoff', 'claims', 'runner', 'events', 'context_firewall', 'acceptance', 'recovery'],
-      remaining_requirements: readJson(p.requirements).requirements.filter((item) => item.state !== 'VERIFIED').map((item) => item.id),
+      remaining_requirements: requirements.requirements.filter((item) => item.state !== 'VERIFIED').map((item) => item.id),
       rationale: 'The minimum end-to-end path is locally implemented and deterministically validated; remaining work can now be delegated safely.',
     });
-    setRequirements(root, ['DS-005', 'DS-090', 'DS-091'], 'IMPLEMENTED', [relative(root, join(p.events, `${event.event_id}.json`))]);
     print(event);
     return;
   }
@@ -1057,13 +1229,33 @@ export async function main(args) {
           completion_event_id: result.completion_event.event_id,
         });
       } else {
-        const launch = await launchDetachedAttempt(root, task, attempt, claim, {
-          pauseAfterCurrent: pauseAfterCurrent ? {
+        if (pauseAfterCurrent) {
+          const reason = valueAfter(rest, '--reason', 'task run requested pause after current');
+          updateState(root, {
+            pause: { active: true, after_current: true, reason, changed_at: now() },
+          });
+          emit(root, 'PAUSE_AFTER_CURRENT_REQUESTED', {
             actor: 'operator-cli',
-            reason: valueAfter(rest, '--reason', 'task run requested pause after current'),
-          } : null,
-        });
-        print(rest.includes('--json') ? launch : detachedLaunchNotice(launch));
+            task_id: task.task_id,
+            attempt_id: attempt.attempt_id,
+            reason,
+          });
+        }
+        const request = createRunnerRequest(root, task, attempt, claim);
+        const queued = {
+          launch_mode: 'opsled-request',
+          action: 'REQUEST_SUBMITTED',
+          task_id: task.task_id,
+          attempt_id: attempt.attempt_id,
+          request_id: request.request_id,
+          child_state: attempt.child_state,
+          monitoring_owner: 'OPSLED',
+          pause_after_current: pauseAfterCurrent,
+        };
+        print(rest.includes('--json') ? queued : [
+          `Runner request ${request.request_id} queued for ${task.task_id}.`,
+          'Opsled owns launch and supervision.',
+        ].join('\n'));
       }
     } else if (subcommand === 'evaluate') {
       const taskId = rest[0];
@@ -1109,6 +1301,9 @@ export async function main(args) {
       print(mode.json ? wake : renderWakeStatus(wake, mode));
     } else if (subcommand === 'drain') {
       print(drainWakeQueue(root));
+    } else if (subcommand === 'reconcile-transport-not-started') {
+      if (!rest[0]) throw new Error('wake reconciliation requires event ID');
+      print(reconcileWakeTransportNotStarted(root, rest[0]));
     } else throw new Error('wake requires start, status, or drain');
     return;
   }

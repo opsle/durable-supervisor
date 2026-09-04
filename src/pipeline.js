@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { basename, join, relative, resolve } from 'node:path';
 import {
   atomicCompareAndSwapJson,
+  canonicalJson,
   id,
   now,
   readJson,
@@ -11,6 +12,7 @@ import {
 } from './io.js';
 import {
   emit,
+  effectiveRequirementMatrix,
   gitMetadata,
   paths,
   policyHash,
@@ -121,6 +123,15 @@ export function createTask(root, input) {
   validateHandoff(input);
   const p = paths(root);
   const objective = readJson(p.objective);
+  if (objective.current_revision === 0) throw new Error('set the repository objective before creating work');
+  const requirements = effectiveRequirementMatrix(root);
+  if (!requirements && input.requirement_ids.length > 0) {
+    throw new Error('objective-driven repository task cannot claim requirement IDs without a matrix');
+  }
+  const effectiveIds = new Set(requirements?.requirements?.map((item) => item.id) ?? []);
+  for (const requirementId of input.requirement_ids) {
+    if (!effectiveIds.has(requirementId)) throw new Error(`unknown effective requirement: ${requirementId}`);
+  }
   const supervisor = readJson(p.supervisor);
   const taskId = input.task_id ?? id('task');
   const path = join(p.tasks, `${taskId}.json`);
@@ -159,50 +170,23 @@ export function createTask(root, input) {
   return task;
 }
 
-function filterCapabilities(discovery, policy) {
-  const commands = structuredClone(discovery.commands);
-  for (const provider of ['codex', 'claude']) {
-    commands[provider].policy_enabled = policy.providers[provider]?.enabled === true;
-    commands[provider].eligible = commands[provider].available && commands[provider].policy_enabled;
-    commands[provider].rejected_reason = commands[provider].eligible
-      ? null
-      : (!commands[provider].available ? 'UNAVAILABLE' : 'DISABLED_BY_OPERATOR_POLICY');
-  }
-  return { ...discovery, commands };
-}
-
 export function routeTask(root, task) {
   validateTaskCommands(task);
   const p = paths(root);
   const policy = readJson(p.policy);
   const discovery = discoverCapabilities(root);
-  const permitted = filterCapabilities(discovery, policy);
-  const considered = [];
+  let selected = null;
   if (task.deterministic_command) {
     const command = task.deterministic_command[0];
-    const capability = permitted.commands[basename(command)] ?? {
-      available: Boolean(executable(command)), policy_enabled: true, eligible: Boolean(executable(command)),
+    const capability = discovery.commands[basename(command)] ?? {
+      available: Boolean(executable(command)),
     };
-    const eligible = capability.eligible ?? capability.available === true;
-    considered.push({ route: 'deterministic', capability: command, eligible, reason: eligible ? null : 'COMMAND_UNAVAILABLE' });
+    if (capability.available) selected = { route: 'deterministic', capability: command };
+  } else if (policy.providers.codex?.enabled === true && discovery.commands.codex.available === true) {
+    selected = { route: 'codex', capability: 'codex' };
   }
-  considered.push({
-    route: 'codex',
-    capability: 'codex',
-    eligible: permitted.commands.codex.eligible,
-    reason: permitted.commands.codex.rejected_reason,
-  });
-  considered.push({
-    route: 'claude',
-    capability: 'claude',
-    eligible: permitted.commands.claude.eligible,
-    reason: permitted.commands.claude.rejected_reason,
-  });
   // route_hint is advisory classification input only. Adequacy, discovery, and
   // policy determine the route; a hint can neither force nor veto selection.
-  const selected = task.deterministic_command
-    ? considered.find((item) => item.route === 'deterministic' && item.eligible)
-    : considered.find((item) => item.route === 'codex' && item.eligible);
   if (!selected) throw new Error('no authorized, available, policy-permitted Gearbox route');
   const selectedRoute = selected.route === 'deterministic' ? {
     schema: 'opsle.durable-supervisor.exact-child-route/v2',
@@ -245,8 +229,6 @@ export function routeTask(root, task) {
     task_id: task.task_id,
     classified_work: task.deterministic_command ? 'bounded_command_or_implementation' : 'bounded_implementation',
     discovery,
-    permitted_capabilities: permitted,
-    considered_routes: considered,
     selected_route: selected.route,
     selected_capability: selected.capability,
     selected_route_config: selectedRoute,
@@ -298,15 +280,38 @@ function claimIndexSnapshot(indexPath) {
 }
 
 function exactIndexedClaim(indexed, claim) {
-  return indexed?.task_id === claim.task_id
+  return indexed?.schema === claim.schema
+    && indexed?.task_id === claim.task_id
+    && indexed?.attempt_id === claim.attempt_id
     && indexed?.claim_id === claim.claim_id
-    && indexed?.fence_generation === claim.fence_generation;
+    && indexed?.fence_generation === claim.fence_generation
+    && indexed?.owner_supervisor_id === claim.owner_supervisor_id
+    && indexed?.owner_generation === claim.owner_generation
+    && indexed?.status === claim.status;
+}
+
+function exactClaimIdentity(left, right) {
+  return left?.schema === 'opsle.durable-supervisor.claim/v1'
+    && right?.schema === left.schema
+    && right.claim_id === left.claim_id
+    && right.task_id === left.task_id
+    && right.attempt_id === left.attempt_id
+    && right.owner_supervisor_id === left.owner_supervisor_id
+    && right.owner_generation === left.owner_generation
+    && right.fence_generation === left.fence_generation;
 }
 
 export function acquireClaim(root, task, attemptId) {
   const p = paths(root);
   const indexPath = join(p.claims, 'index.json');
   const supervisor = readJson(p.supervisor);
+  const taskPath = join(p.tasks, `${task?.task_id}.json`);
+  if (typeof attemptId !== 'string' || !attemptId
+      || !existsSync(taskPath)
+      || canonicalJson(readJson(taskPath)) !== canonicalJson(task)
+      || task.supervisor_id !== supervisor.supervisor_id) {
+    throw new Error('claim acquisition task authority is ambiguous or stale');
+  }
   for (let attempt = 0; attempt < CLAIM_INDEX_CAS_ATTEMPTS; attempt += 1) {
     const snapshot = claimIndexSnapshot(indexPath);
     for (const name of Object.keys(snapshot.index).filter((key) => key.startsWith('task-'))) {
@@ -346,7 +351,7 @@ export function releaseClaim(root, claim, status = 'COMPLETED') {
   const p = paths(root);
   const path = join(p.claims, `${claim.claim_id}.json`);
   const current = readJson(path);
-  if (current.claim_id !== claim.claim_id || current.task_id !== claim.task_id) {
+  if (!exactClaimIdentity(current, { ...claim, fence_generation: current.fence_generation })) {
     throw new Error('claim identity is ambiguous');
   }
   if (current.fence_generation !== claim.fence_generation) throw new Error('stale claim fence');
@@ -431,10 +436,8 @@ export function createAttempt(root, task, gearbox, claimFactory = acquireClaim) 
     reasoning_effort: gearbox.selected_route === 'codex' ? policy.providers.codex.reasoning_effort : null,
     gearbox_decision: gearbox,
     selected_route: structuredClone(gearbox.selected_route_config),
-    allowed_providers: Object.entries(policy.providers).filter(([, value]) => value.enabled).map(([name]) => name),
-    review_mode: policy.review.mode,
-    reviewer: policy.review.reviewer,
-    independent_review: 'none',
+    providers: structuredClone(policy.providers),
+    review: structuredClone(policy.review),
     authorization_envelope: task.authorization,
     policy_version: policy.version,
     policy_sha256: policyHash(root),

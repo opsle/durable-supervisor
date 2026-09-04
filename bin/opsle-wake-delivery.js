@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { runWakeDispatcher } from '../src/wakeup.js';
+import { loadRuntimeRelease } from '../src/runtime-release.js';
 
 function valueAfter(args, flag) {
   const index = args.indexOf(flag);
@@ -17,6 +18,7 @@ if (!root || !dispatcherId || !launchNonce || !Number.isSafeInteger(dispatcherGe
   process.stderr.write('wake dispatcher requires root, dispatcher identity, generation, and launch nonce\n');
   process.exitCode = 1;
 } else {
+  loadRuntimeRelease();
   runWakeDispatcher(root, {
     dispatcherId,
     dispatcherGeneration,

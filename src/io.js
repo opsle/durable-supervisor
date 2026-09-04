@@ -14,6 +14,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname } from 'node:path';
+import { operationalRootForPath } from './runtime-release.js';
 
 export const now = () => new Date().toISOString();
 export const id = (prefix) => `${prefix}-${randomUUID()}`;
@@ -28,17 +29,31 @@ function canonicalize(value) {
 
 export const canonicalJson = (value) => `${JSON.stringify(canonicalize(value))}\n`;
 export const sha256 = (value) => createHash('sha256').update(value).digest('hex');
-export const fileSha256 = (path) => sha256(readFileSync(path));
+export const fileSha256 = (path) => {
+  return sha256(readFileSync(path));
+};
 
 export function readJson(path) {
   let value;
   try {
     value = JSON.parse(readFileSync(path, 'utf8'));
   } catch (error) {
-    throw new Error(`invalid durable JSON ${path}: ${error.message}`);
+    const wrapped = new Error(`invalid durable JSON ${path}: ${error.message}`);
+    if (operationalRootForPath(path)) {
+      wrapped.name = 'CorruptStateError';
+      wrapped.code = 'CORRUPT';
+      wrapped.classification = 'CORRUPT';
+    }
+    throw wrapped;
   }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`durable JSON must be an object: ${path}`);
+    const error = new Error(`durable JSON must be an object: ${path}`);
+    if (operationalRootForPath(path)) {
+      error.name = 'CorruptStateError';
+      error.code = 'CORRUPT';
+      error.classification = 'CORRUPT';
+    }
+    throw error;
   }
   return value;
 }

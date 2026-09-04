@@ -26,7 +26,7 @@ function fixture() {
   mkdirSync(join(root, '.opsle'));
   cpSync(join(sourceRoot, '.opsle', 'specification.md'), join(root, '.opsle', 'specification.md'));
   cpSync(join(sourceRoot, '.opsle', 'requirements.json'), join(root, '.opsle', 'requirements.json'));
-  initialize(root, { actor: 'test' });
+  initialize(root, { actor: 'test', objectiveText: 'Exercise the generic requirement matrix.' });
   return root;
 }
 
@@ -78,8 +78,10 @@ test('deterministic discovery feeds Gearbox and claim conflict fails closed', ()
     const { attempt } = createAttempt(root, task, decision);
     assert.throws(() => createAttempt(root, task, decision), /claim conflict/);
     assert.match(attempt.attempt_id, /attempt-001$/);
-    assert.equal(attempt.policy_snapshot.review_mode, 'off');
-    assert.deepEqual(attempt.policy_snapshot.allowed_providers, ['codex']);
+    assert.equal(attempt.policy_snapshot.review.mode, 'off');
+    assert.equal(attempt.policy_snapshot.providers.codex.enabled, true);
+    assert.equal(attempt.policy_snapshot.providers.claude.enabled, false);
+    assert.deepEqual(attempt.policy_snapshot.review, { mode: 'off', reviewer: null });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

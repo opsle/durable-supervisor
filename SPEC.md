@@ -85,10 +85,10 @@ Healthy heartbeat, host-wrapper yield/timeout, and any other nonterminal return
 cannot enter the wake queue. Only terminal completion/failure/timeout/stall or
 an intervention-required event can.
 
-Wake classification is owned by one detached repository-local provider-free
-dispatcher fenced by exact PID/start/executable, dispatcher generation,
-supervisor identity/generation, and request queue version. Receipt-free requests
-have no expiry. Filesystem observation is registered before the queue scan.
+Wake delivery is owned by the single host-level opsled service, fenced by exact
+release, PID/start/executable, service generation, supervisor identity/generation,
+and request queue version. Receipt-free requests have no expiry. Runner and the
+repository supervisor MUST NOT create a persistent dispatcher.
 
 New requests bind only durable supervisor identity/generation, not a frontend.
 A separate `codex-session-binding/v2` records repository realpath, Codex UUID,
@@ -106,11 +106,11 @@ per-event decision record provides the non-replayable exactly-once boundary.
 The message contains only event ID, generation, and a durable-state instruction.
 Delivery requires one exact accepted-message rollout record and its matching
 turn-began record, hashed from their complete raw JSONL line bytes. Confirmed
-delivery terminates and verifies the temporary process group. Live PTY output
-detects busy rejection before frontend exit, while an already-observed exact
-rollout confirmation remains authoritative. Busy remains queued for retry only
-after the pre-registered exact-bound-rollout watcher observes an append;
-uncertainty after spawn is never replayed.
+delivery terminates and verifies the temporary process group. An active turn or
+busy output MUST NOT gate submission: Codex serializes the submitted message and
+the frontend remains alive until the authoritative rollout proves the original
+Herdr TUI began that turn. Stale-session rejection fails closed; uncertainty
+after spawn is never replayed.
 
 Legacy tmux request bytes remain readable and immutable. Prior-generation and
 already-evaluated requests are obsolete, not adopted. `SupervisorHostAdapter`,
@@ -154,16 +154,35 @@ Acceptance, or terminal publication.
 
 Recovery preserves the existing supervisor identity and reconstructs from
 repository files. Known terminal work is not relaunched. A live PID preserves
-its claim only for the explicit foreground path. Detached work requires a live
-exact `OWNED` Runner worker matching the attempt, active claim, fence, supervisor,
-launch generation, and worker PID. A live child without that worker is orphaned,
+its claim only when the canonical task, attempt, active claim, owner, fence, and
+claim-index record agree; detached work additionally requires a live exact
+`OWNED` Runner worker matching the supervisor, launch generation, and worker PID.
+A live child without that complete ownership vector is orphaned,
 marked `UNKNOWN`, pauses progression, and requires reconciliation. Recovery does
 not require a conversation summary and does not infer a retry. It never rewrites
-or adopts wake requests: prior generations become obsolete. It supersedes a
-stale dispatcher and ensures one current dispatcher. Session-binding generation
+or adopts wake requests: prior generations become obsolete. It leaves
+persistent wake ownership to the host opsled. Session-binding generation
 adoption is a separate explicit command after every other identity fact validates.
 Claimed or uncertain activation decisions remain non-replayable; delivered and
 consumed receipts are idempotent.
+
+Wake delivery commitment and consumption are fenced by repository, event ID,
+queue version, delivery ID and activation fence, current supervisor identity and
+generation, current session/host binding, and dispatcher implementation hash.
+Any one-dimensional or multi-stale mismatch rejects before consumption evidence
+or other durable bytes change.
+
+Task creation, evaluation, recovery, status, reconstruction, cutover, and
+next-action derivation use the single effective-requirements derivation. Its
+profiles are objective/no-matrix, inert foreign historical DS matrix, explicit
+requirement-driven, completed requirements, and malformed or contradictory
+authority. The last profile fails closed; completed requirements never select a
+nonexistent next requirement slice.
+
+Context Firewall reduction is mandatory in V0.1. Disabling it is rejected
+without policy mutation, and a disabled attempt snapshot cannot enter Runner
+execution. Dispatcher machine and verbose diagnostics expose the expected and
+observed implementation hashes plus their currentness.
 
 A terminal `FAILED` worker record is Runner evidence, not child success or
 failure evidence. The explicit reconciliation path requires exact task, attempt,
@@ -189,3 +208,91 @@ sibling repository is not an import or integration claim.
 
 Breaking schema or lifecycle semantics require a new protocol version. Optional
 fields must preserve fail-closed behavior and truthful unknowns.
+
+The runtime release manifest MUST be canonical and immutable for a release. It
+MUST contain the runtime release ID, semantic version, source revision,
+complete packaged-artifact digest, supported reader versions, supported writer
+versions, migration versions, runtime epoch, and every helper entrypoint with
+its digest. The complete artifact digest MUST include every declared package
+file. Any manifest self-reference normalization MUST be explicit and
+reproducible; an excluded or undisclosed byte set is not a complete artifact
+digest.
+
+Before compatibility succeeds, a runtime MAY read only the bounded
+compatibility header. It MUST NOT semantically read or mutate other operational
+state. A well-formed newer state version unsupported by the active reader or
+writer MUST produce `UPGRADE_REQUIRED` before validation, recovery,
+replacement, launch, wake delivery, mutation, or authority transition, and all
+operational bytes MUST remain identical. Malformed state within a supported
+version and malformed or unknown compatibility metadata MUST produce `CORRUPT`,
+not `UPGRADE_REQUIRED`.
+
+Every executable helper MUST verify its release from packaged bytes and MUST
+carry a release fence containing runtime release ID, complete artifact digest,
+runtime epoch, helper role, and exact PID/start/executable identity. A wrong,
+old, superseded, wrong-role, wrong-artifact, wrong-epoch, or stale-process helper
+MUST fail before side effects. Existing implementation hashes remain an
+additional fence until all historical records are beyond replay.
+A historical dispatcher record that predates the release-fence field MAY be
+read through the exact-current implementation-hash transition path, but no
+helper may acquire ownership and no new record may omit the complete release
+fence.
+
+## Host opsled requirements
+
+One host-level opsled MUST own process infrastructure for all explicitly
+registered repositories. Its registry MUST be canonical, atomic, fail closed,
+and contain exactly one mapping per repository realpath. Registry and host
+status records MUST contain operational identifiers and references only; each
+repository's objective, requirements, policy, decisions, tasks, reasoning
+history, Gearbox route, Context Firewall packet, Acceptance, and evidence MUST
+remain in that repository's `.opsle`.
+
+Before registry or repository state access, every opsled process MUST verify the
+exact runtime release ID, complete artifact digest, runtime epoch, helper role,
+and PID/start/executable identity. A live incompatible service or a supported
+repository state newer than the active reader MUST be classified
+`UPGRADE_REQUIRED`; malformed supported state MUST be `CORRUPT`.
+
+Opsled wake dispatch MUST be repository-scoped and restart-safe. It MUST refresh
+the current authoritative Herdr/Codex session immediately before transport,
+reject stale session or repository fences, use canonical plain `codex resume`,
+require rollout acceptance and turn-began confirmation, durably commit a
+receipt, and permit consumption only after that receipt. Queued requests MUST
+survive opsled absence or restart. Runner and repository supervisors MUST NOT
+start or maintain persistent wake infrastructure. Existing repository
+dispatcher code MAY remain as an explicit compatibility path.
+
+Opsled Runner supervision MUST bind repository ID and realpath, task, attempt,
+claim and generation fence, exact worker PID/start/executable, and runtime
+release. It MUST retain raw result references, heartbeat and deadline state, and
+terminal publication. It MUST reject cross-repository or stale PID/fence
+confusion. A failure, pause, or upgrade requirement in one repository MUST NOT
+block another registered repository.
+
+The default identity primitives for new architecture are exact process identity
+(PID, process start ticks, executable) and immutable content or release digest.
+No new generation, nonce, lease, fencing token, or ownership ID may be added
+unless the implementation and review name the specific concurrent writer it
+orders and prove why those two primitives are insufficient. Existing live
+legacy fences are not removed by this rule.
+
+Registration MUST create one repository-local host ownership pointer from the
+repository realpath to the canonical opsled registry, its Herdr
+workspace/pane/terminal, and the current Codex session-binding pointer. Normal
+callers MUST NOT choose the opsled root through `OPSLED_HOME`, `XDG_STATE_HOME`,
+cwd, tmux, inherited Codex variables, or a caller Herdr pane.
+
+The repository supervisor MUST express execution as an immutable request under
+`.opsle/runner/requests/`. Opsled MUST validate the registered repository,
+supervisor, task, attempt, claim, and existing claim fence before launching the
+request. Opsled MUST NOT derive execution intent by scanning project objectives
+or tasks. Wake transports that may block MUST execute as transient supervised
+workers so one repository cannot block another.
+
+Runtime upgrade MUST verify the complete target artifact, install it under its
+immutable digest, stop the exact current opsled process, reject live transient
+workers, run the target release's real migrations, and switch the current
+runtime pointer only after every migration succeeds. Upgrade inventory MUST
+retain per-repository failures rather than allowing one repository to hide the
+state of another.

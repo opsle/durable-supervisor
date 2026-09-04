@@ -2,30 +2,32 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
   closeSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   openSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
-import { readJson, sha256, writeJson } from '../src/io.js';
+import { fileSha256, readJson, sha256, writeJson } from '../src/io.js';
 import {
   EVIDENCE_OUTPUT_BYTE_CEILING,
   PACKET_BYTE_CEILING,
   PACKET_CHARACTER_CEILING,
-  PACKET_TOKEN_BUDGET,
   RESUME_PACKET_SCHEMA,
   generateResumePacket,
   readResumeEvidence,
+  readResumePacket,
 } from '../src/reconstruction.js';
 import { paths } from '../src/state.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 const cliPath = join(sourceRoot, 'bin', 'opsle.js');
-const LIVE_OBJECTIVE_740 = 'Make Durable Supervisor reconstruction extremely cheap by deriving a deterministic compact authoritative resume packet from full durable .opsle state, enforcing a normal <=1000 estimated or exactly measured model-input-token budget and deterministic size ceiling, exposing bounded escalation and provenance, instrumenting reconstruction, updating fresh-activation procedure to read only the packet in the normal case, preserving all history and the proven Herdr/Runner/wake/routing/fencing architecture, proving clean and escalation behavior including a fresh-context no-broad-scan live proof, running focused and full verification, continuing unmerged PR #1, verifying the exact new head in a fresh detached worktree, and finishing PAUSED.';
+const LIVE_OBJECTIVE_740 = 'Make Durable Supervisor reconstruction extremely cheap by deriving a deterministic compact authoritative resume packet from full durable .opsle state, enforcing exact byte and character ceilings, exposing bounded escalation and provenance, instrumenting reconstruction, updating fresh-activation procedure to read only the packet in the normal case, preserving all history and the proven Herdr/Runner/wake/routing/fencing architecture, proving clean and escalation behavior including a fresh-context no-broad-scan live proof, running focused and full verification, continuing unmerged PR #1, verifying the exact new head in a fresh detached worktree, and finishing PAUSED. Keep this sentence long enough to exercise complete objective retention without claiming a tokenizer measurement.';
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'durable-supervisor-reconstruction-'));
@@ -75,8 +77,12 @@ function fixture() {
     model_polling: { permitted: false },
     affected_verification: { authority: 'advisory_only' },
   });
+  writeFileSync(join(root, '.opsle', 'specification.md'), '# Reconstruction fixture\n');
   writeJson(join(root, '.opsle', 'requirements.json'), {
     schema: 'opsle.durable-supervisor.requirements/v1',
+    specification: '.opsle/specification.md',
+    specification_sha256: fileSha256(join(root, '.opsle', 'specification.md')),
+    allowed_states: ['UNSTARTED', 'VERIFIED'],
     requirements: Array.from({ length: 101 }, (_, index) => ({
       id: `DS-${String(index).padStart(3, '0')}`,
       title: `Verified reconstruction fixture requirement ${index}`,
@@ -254,9 +260,9 @@ test('clean packet is complete, authoritative, and within every deterministic bu
   assert.equal(packet.next_action, 'Evaluate objective completion from the authoritative requirement state.');
   assert.ok(Buffer.byteLength(serialized) <= PACKET_BYTE_CEILING);
   assert.ok([...serialized].length <= PACKET_CHARACTER_CEILING);
-  assert.ok(packet.budget.estimated_tokens <= PACKET_TOKEN_BUDGET);
-  assert.ok(packet.budget.estimated_tokens >= 300 && packet.budget.estimated_tokens <= 700);
-  assert.match(packet.budget.method, /ceil\(UTF-8_bytes\/4\)/);
+  assert.equal(packet.budget.packet_bytes, Buffer.byteLength(serialized));
+  assert.equal(packet.budget.packet_characters, [...serialized].length);
+  assert.match(packet.budget.measurement, /exact serialized UTF-8 bytes/);
   assert.ok(telemetry.durable_state_bytes_considered > packet.budget.packet_bytes);
   assert.equal(packet.evidence.authoritative.count, 6);
   assert.match(packet.evidence.authoritative.manifest_sha256, /^[a-f0-9]{64}$/);
@@ -398,6 +404,83 @@ test('receipt-free current-generation queued wake requires its exact request evi
   }]);
 });
 
+test('wake reconstruction selects one current event and reports omitted attention within budget', () => {
+  const root = fixture();
+  for (let index = 0; index < 5; index += 1) {
+    const eventId = `event-bounded-${index}`;
+    writeJson(join(root, '.opsle', 'wake', 'requests', `${eventId}.json`), {
+      schema: 'opsle.durable-supervisor.host-wake-request/v1',
+      event_id: eventId,
+      terminal_type: 'intervention-required',
+      queued_at: `2026-09-03T00:00:0${index}.000Z`,
+      target: {
+        supervisor_id: 'supervisor-reconstruction-fixture',
+        supervisor_generation: 3,
+      },
+    });
+  }
+  const { packet, serialized } = generate(root);
+  assert.equal(packet.wake_attention.attention_count, 5);
+  assert.equal(packet.wake_attention.selected_count, 1);
+  assert.equal(packet.wake_attention.omitted_count, 4);
+  assert.equal(packet.wake_attention.items[0].event_id, 'event-bounded-4');
+  assert.ok(Buffer.byteLength(serialized) <= PACKET_BYTE_CEILING);
+  assert.equal(packet.evidence.escalation.length, 1);
+});
+
+test('historically evaluated delivery without consumption is inert without rewriting evidence', () => {
+  const root = fixture();
+  addActiveWork(root);
+  const statePath = join(root, '.opsle', 'state.json');
+  const taskPath = join(root, '.opsle', 'tasks', 'task-active.json');
+  const attemptPath = join(root, '.opsle', 'children', 'task-active-attempt-001.json');
+  const state = readJson(statePath);
+  state.active_task_id = null;
+  state.active_attempt_id = null;
+  state.latest_accepted_task_id = 'task-active';
+  writeJson(statePath, state);
+  const task = readJson(taskPath);
+  task.state = 'ACCEPTED';
+  writeJson(taskPath, task);
+  const attempt = readJson(attemptPath);
+  attempt.supervisor_evaluation = {
+    decision_id: 'decision-historical',
+    decision: 'ACCEPT',
+    rationale: 'historical pre-consumption enforcement',
+    evaluated_at: '2026-09-02T00:00:00.000Z',
+  };
+  writeJson(attemptPath, attempt);
+  const eventId = 'event-historical-delivered';
+  writeJson(join(root, '.opsle', 'wake', 'requests', `${eventId}.json`), {
+    schema: 'opsle.durable-supervisor.native-wake-request/v2',
+    event_id: eventId,
+    task_id: 'task-active',
+    attempt_id: 'task-active-attempt-001',
+    terminal_type: 'child-completed',
+    target: {
+      supervisor_id: 'supervisor-reconstruction-fixture',
+      supervisor_generation: 3,
+    },
+  });
+  const deliveryPath = join(root, '.opsle', 'wake', 'deliveries', `${eventId}.json`);
+  writeJson(deliveryPath, {
+    schema: 'opsle.durable-supervisor.host-wake-delivery/v1',
+    delivery_id: 'delivery-historical',
+    event_id: eventId,
+    supervisor_id: 'supervisor-reconstruction-fixture',
+    supervisor_generation: 3,
+    status: 'DELIVERED',
+    consumed_at: null,
+  });
+  const before = readFileSync(deliveryPath);
+  const packet = generate(root).packet;
+  assert.equal(packet.wake_attention.attention_count, 0);
+  assert.deepEqual(readFileSync(deliveryPath), before);
+  assert.equal(existsSync(join(
+    root, '.opsle', 'wake', 'consumptions', `${eventId}.json`,
+  )), false);
+});
+
 test('claim and fence contradictions are explicit and never cleaned by inference', () => {
   const root = fixture();
   addActiveWork(root, { indexedClaim: { fence_generation: 99 } });
@@ -496,9 +579,9 @@ test('latest rejected supervisor decision for the current objective outranks old
   assert.equal(packet.next_action, 'Perform bounded reconciliation using only the selected escalation evidence.');
 });
 
-test('the exact 740-character live objective is retained when the complete packet fits', () => {
+test('a long live objective is retained when the complete packet fits', () => {
   const root = fixture();
-  assert.equal([...LIVE_OBJECTIVE_740].length, 740);
+  assert.ok([...LIVE_OBJECTIVE_740].length > 740);
   const objective = readJson(join(root, '.opsle', 'objective.json'));
   objective.history[0].objective = LIVE_OBJECTIVE_740;
   writeJson(join(root, '.opsle', 'objective.json'), objective);
@@ -516,7 +599,7 @@ test('the exact 740-character live objective is retained when the complete packe
   assert.equal(first.packet.objective.source_reference, undefined);
   assert.ok(Buffer.byteLength(first.serialized) <= PACKET_BYTE_CEILING);
   assert.ok([...first.serialized].length <= PACKET_CHARACTER_CEILING);
-  assert.ok(first.packet.budget.estimated_tokens <= PACKET_TOKEN_BUDGET);
+  assert.ok(first.packet.budget.packet_bytes <= PACKET_BYTE_CEILING);
 });
 
 test('oversize objective compaction is explicit, deterministic, and escalation-linked', () => {
@@ -553,9 +636,95 @@ test('oversize objective compaction is explicit, deterministic, and escalation-l
   assert.match(first.packet.evidence.escalation[0].sha256, /^[a-f0-9]{64}$/);
   assert.ok(Buffer.byteLength(first.serialized) <= PACKET_BYTE_CEILING);
   assert.ok([...first.serialized].length <= PACKET_CHARACTER_CEILING);
-  assert.ok(first.packet.budget.estimated_tokens <= PACKET_TOKEN_BUDGET);
+  assert.ok(first.packet.budget.packet_characters <= PACKET_CHARACTER_CEILING);
   assert.doesNotMatch(first.serialized, /x{1000}/);
   assert.notEqual(first.telemetry.generated_at, second.telemetry.generated_at);
+});
+
+test('complete resume packets fence every decision-relevant authority change', () => {
+  const cases = [
+    ['objective', (root) => {
+      const objective = readJson(join(root, '.opsle', 'objective.json'));
+      objective.history[0].objective = 'Changed objective authority.';
+      writeJson(join(root, '.opsle', 'objective.json'), objective);
+      return {};
+    }],
+    ['task', (root) => {
+      const task = readJson(join(root, '.opsle', 'tasks', 'task-active.json'));
+      task.scope = ['changed-authority'];
+      writeJson(join(root, '.opsle', 'tasks', 'task-active.json'), task);
+      return {};
+    }],
+    ['decision', (root) => {
+      const path = join(root, '.opsle', 'children', 'task-active-attempt-001.json');
+      const attempt = readJson(path);
+      attempt.policy_snapshot.gearbox_decision.decision_id = 'gearbox-replaced';
+      writeJson(path, attempt);
+      return {};
+    }],
+    ['pause', (root) => {
+      const state = readJson(join(root, '.opsle', 'state.json'));
+      state.pause = { active: true, after_current: true, reason: 'new pause', changed_at: 'later' };
+      writeJson(join(root, '.opsle', 'state.json'), state);
+      return {};
+    }],
+    ['unresolved', (root) => {
+      const state = readJson(join(root, '.opsle', 'state.json'));
+      state.latest_unresolved_issue = 'new unresolved authority';
+      writeJson(join(root, '.opsle', 'state.json'), state);
+      return {};
+    }],
+    ['wake', (root) => {
+      writeJson(join(root, '.opsle', 'wake', 'requests', 'event-new.json'), {
+        schema: 'opsle.durable-supervisor.host-wake-request/v1',
+        event_id: 'event-new',
+        terminal_type: 'intervention-required',
+        target: { supervisor_id: 'supervisor-reconstruction-fixture', supervisor_generation: 3 },
+      });
+      return {};
+    }],
+    ['session binding', () => ({ sessionStatus: {
+      ...currentSession(),
+      binding: { ...currentSession().binding, binding_id: 'binding-replaced' },
+    } })],
+    ['supervisor generation', (root) => {
+      const supervisor = readJson(join(root, '.opsle', 'supervisor.json'));
+      supervisor.generation = 4;
+      writeJson(join(root, '.opsle', 'supervisor.json'), supervisor);
+      return { sessionStatus: currentSession(4) };
+    }],
+  ];
+
+  for (const [label, mutate] of cases) {
+    const root = fixture();
+    try {
+      addActiveWork(root);
+      generateResumePacket(root, { sessionStatus: currentSession() });
+      const cached = readResumePacket(root, { sessionStatus: currentSession() });
+      assert.equal(cached.complete_for_resume, true);
+      const options = mutate(root);
+      const fresh = readResumePacket(root, { sessionStatus: currentSession(), ...options });
+      assert.notEqual(fresh.freshness.authority_sha256, cached.freshness.authority_sha256, label);
+      assert.deepEqual(readJson(paths(root).resumePacket), fresh, label);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('resume freshness ignores telemetry-only timestamp changes', () => {
+  const root = fixture();
+  try {
+    addActiveWork(root);
+    generateResumePacket(root, { sessionStatus: currentSession() });
+    const path = join(root, '.opsle', 'children', 'task-active-attempt-001.json');
+    const attempt = readJson(path);
+    attempt.telemetry = { updated_at: '2099-01-01T00:00:00.000Z' };
+    writeJson(path, attempt);
+    assert.equal(readResumePacket(root, { sessionStatus: currentSession() }).complete_for_resume, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('fresh process consumes packet only and generation never ingests broad history', () => {

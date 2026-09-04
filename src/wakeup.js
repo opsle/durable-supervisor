@@ -33,21 +33,38 @@ import {
   writeJson,
 } from './io.js';
 import { emit, paths, updateState } from './state.js';
+import {
+  assertReleaseFence,
+  createReleaseFence,
+  releaseIdentity,
+} from './runtime-release.js';
 
 const WAIT_SCHEMA = 'opsle.durable-supervisor.wait-registration/v1';
 const WAKE_REQUEST_SCHEMA = 'opsle.durable-supervisor.host-wake-request/v1';
 const NATIVE_WAKE_REQUEST_SCHEMA = 'opsle.durable-supervisor.native-wake-request/v2';
 const DELIVERY_SCHEMA = 'opsle.durable-supervisor.host-wake-delivery/v1';
 const DISPATCHER_SCHEMA = 'opsle.durable-supervisor.host-wake-dispatcher/v1';
-export const CODEX_SESSION_BINDING_SCHEMA = 'opsle.durable-supervisor.codex-session-binding/v2';
+const WAKEUP_SOURCE_PATH = fileURLToPath(import.meta.url);
+const DEFAULT_DISPATCHER_SCRIPT = fileURLToPath(
+  new URL('../bin/opsle-wake-delivery.js', import.meta.url),
+);
+export const WAKE_DISPATCHER_IMPLEMENTATION_SHA256 = sha256(canonicalJson({
+  schema: 'opsle.durable-supervisor.wake-dispatcher-implementation/v1',
+  wakeup_source_sha256: fileSha256(WAKEUP_SOURCE_PATH),
+  dispatcher_entrypoint_sha256: fileSha256(DEFAULT_DISPATCHER_SCRIPT),
+}));
+export const CODEX_SESSION_BINDING_SCHEMA = 'opsle.durable-supervisor.codex-session-binding/v3';
+export const LEGACY_CODEX_SESSION_BINDING_SCHEMA = 'opsle.durable-supervisor.codex-session-binding/v2';
+export const CODEX_SESSION_BINDING_INVALID_SCHEMA = 'opsle.durable-supervisor.codex-session-binding-invalid/v1';
+export const WAKE_CONSUMPTION_SCHEMA = 'opsle.durable-supervisor.wake-consumption/v1';
 export const ACTIVATION_LEASE_SCHEMA = 'opsle.durable-supervisor.activation-lease/v1';
 export const ACTIVATION_DECISION_SCHEMA = 'opsle.durable-supervisor.activation-decision/v1';
-export const CODEX_RESUME_HELPER_TIMEOUT_MS = (
+export const CODEX_RESUME_HELPER_TIMEOUT_MS = null;
+export const ACTIVATION_LEASE_TTL_MS = (
   CODEX_RESUME_CONFIRMATION_TIMEOUT_MS
   + CODEX_RESUME_WORST_CASE_CLEANUP_TIMEOUT_MS
-  + 5_000
+  + 50_000
 );
-export const ACTIVATION_LEASE_TTL_MS = CODEX_RESUME_HELPER_TIMEOUT_MS + 45_000;
 
 export const TERMINAL_WAKE_TYPES = Object.freeze(new Set([
   'child-completed',
@@ -138,6 +155,8 @@ function wakePaths(root) {
     dispatcher: join(base, 'dispatcher.json'),
     dispatcherLock: join(base, 'dispatcher.lock'),
     sessionBinding: join(base, 'codex-session-binding.json'),
+    sessionBindingHistory: join(base, 'session-binding-history'),
+    consumptions: join(base, 'consumptions'),
     activationLease: join(base, 'activation-lease.json'),
     activationDecisions: join(base, 'activation-decisions'),
     transportAttempts: join(base, 'transport-attempts'),
@@ -152,6 +171,8 @@ function directories(root) {
     value.deliveries,
     value.activationDecisions,
     value.transportAttempts,
+    value.sessionBindingHistory,
+    value.consumptions,
   ]) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
   }
@@ -168,6 +189,34 @@ function requestPath(root, eventId) {
 
 function receiptPath(root, eventId) {
   return join(directories(root).deliveries, `${eventId}.json`);
+}
+
+function consumptionPath(root, eventId) {
+  return join(directories(root).consumptions, `${eventId}.json`);
+}
+
+function deliveryReceiptFence(receipt) {
+  return sha256(canonicalJson({
+    schema: receipt?.schema,
+    repository: receipt?.repository,
+    delivery_id: receipt?.delivery_id,
+    event_id: receipt?.event_id,
+    queue_version: receipt?.queue_version,
+    supervisor_id: receipt?.supervisor_id,
+    supervisor_generation: receipt?.supervisor_generation,
+    dispatcher_id: receipt?.dispatcher_id,
+    dispatcher_generation: receipt?.dispatcher_generation,
+    dispatcher_implementation_sha256: receipt?.dispatcher_implementation_sha256,
+    dispatcher_release_fence: receipt?.dispatcher_release_fence ?? null,
+    activation_lease_id: receipt?.activation_lease_id,
+    activation_fencing_token: receipt?.activation_fencing_token,
+    activation_decision_id: receipt?.activation_decision_id,
+    codex_session_binding_sha256: receipt?.codex_session_binding_sha256,
+    codex_session_uuid: receipt?.codex_session_uuid,
+    message_sha256: receipt?.message_sha256,
+    transport_attempt_id: receipt?.transport_attempt_id,
+    delivered_at: receipt?.delivered_at,
+  }));
 }
 
 function transportAttemptPath(root, transportAttemptId) {
@@ -316,11 +365,177 @@ function bindingDependencies(overrides = {}) {
     codexVersion: overrides.codexVersion ?? installedCodexVersion,
     uid: overrides.uid ?? (() => process.getuid?.() ?? null),
     legacyTmuxAuthority: overrides.legacyTmuxAuthority ?? legacyTmuxAuthority,
+    environment: overrides.environment ?? (() => process.env),
+    herdrSnapshot: overrides.herdrSnapshot ?? (() => {
+      const result = spawnSync('herdr', ['api', 'snapshot'], { encoding: 'utf8' });
+      if (result.status !== 0) throw new Error('Herdr snapshot unavailable');
+      return JSON.parse(result.stdout);
+    }),
+    herdrPaneProcessInfo: overrides.herdrPaneProcessInfo ?? ((paneId) => {
+      const result = spawnSync('herdr', ['pane', 'process-info', '--pane', paneId], { encoding: 'utf8' });
+      if (result.status !== 0) throw new Error('Herdr pane process facts unavailable');
+      return JSON.parse(result.stdout);
+    }),
   };
 }
 
+function normalizedHerdrSnapshot(value) {
+  if (value?.type === 'session_snapshot') return value.snapshot;
+  if (value?.result?.type === 'session_snapshot') return value.result.snapshot;
+  if (Array.isArray(value?.workspaces) && Array.isArray(value?.panes)) return value;
+  throw new Error('Herdr API did not return one session snapshot');
+}
+
+function normalizedPaneProcessInfo(value) {
+  if (value?.type === 'pane_process_info') return value.process_info;
+  if (value?.result?.type === 'pane_process_info') return value.result.process_info;
+  if (typeof value?.pane_id === 'string') return value;
+  throw new Error('Herdr API did not return pane process facts');
+}
+
+function sessionReference(value) {
+  if (value?.agent_session?.agent !== 'codex' || value.agent_session.kind !== 'id') return null;
+  return value.agent_session.value;
+}
+
+function repositoryPath(value, deps) {
+  if (typeof value !== 'string') return null;
+  try { return deps.realpath(value); } catch { return null; }
+}
+
+function exactHerdrFrontend(
+  snapshot,
+  repositoryRealpath,
+  environment,
+  deps,
+  allowEnvironmentMismatch,
+  priorBinding = null,
+) {
+  const paneRows = [...(snapshot.panes ?? []), ...(snapshot.agents ?? [])]
+    .filter((pane) => pane?.workspace_id);
+  const panes = [...new Map(paneRows.map((pane) => [pane.pane_id, pane])).values()]
+    .filter((pane) => (
+      pane.agent === 'codex'
+      && pane.terminal_id
+      && repositoryPath(pane.foreground_cwd ?? pane.cwd, deps) === repositoryRealpath
+    ));
+  if (panes.length !== 1) {
+    throw new Error(`Herdr discovery requires one attached repository Codex frontend; observed ${panes.length}`);
+  }
+  const pane = panes[0];
+  const workspaces = (snapshot.workspaces ?? []).filter((workspace) => (
+    workspace?.workspace_id === pane.workspace_id
+    && (repositoryPath(
+      workspace?.worktree?.checkout_path ?? workspace?.worktree?.repo_root,
+      deps,
+    ) ?? repositoryRealpath) === repositoryRealpath
+  ));
+  if (workspaces.length !== 1) {
+    throw new Error(`Herdr discovery requires one repository workspace; observed ${workspaces.length}`);
+  }
+  const workspace = workspaces[0];
+  const envSession = environment.CODEX_SESSION_ID?.trim() || null;
+  const envThread = environment.CODEX_THREAD_ID?.trim() || null;
+  if (!allowEnvironmentMismatch
+      && (envSession || envThread)
+      && (!envSession || !envThread || envSession !== envThread)) {
+    throw new Error('CODEX_SESSION_ID and CODEX_THREAD_ID are incomplete or disagree');
+  }
+  const herdrSession = sessionReference(pane);
+  if (herdrSession && envSession && envSession !== herdrSession && !allowEnvironmentMismatch) {
+    throw new Error('detached child or obsolete Codex environment does not match the live Herdr frontend');
+  }
+  let sessionId = herdrSession;
+  if (!sessionId && !allowEnvironmentMismatch && envSession && envThread === envSession) {
+    sessionId = envSession;
+  }
+  if (!sessionId
+      && allowEnvironmentMismatch
+      && priorBinding?.schema === CODEX_SESSION_BINDING_SCHEMA
+      && priorBinding.state === 'CURRENT'
+      && priorBinding.host?.workspace_id === workspace.workspace_id
+      && priorBinding.host?.pane_id === pane.pane_id
+      && priorBinding.host?.terminal_id === pane.terminal_id) {
+    sessionId = priorBinding.codex_session_uuid;
+  }
+  if (!sessionId) {
+    throw new Error('Herdr frontend session identity is unavailable to the authoritative frontend');
+  }
+  return {
+    workspace,
+    pane,
+    sessionId,
+    threadId: envThread === sessionId ? envThread : sessionId,
+  };
+}
+
+function exactFrontendProcess(info, pane, repositoryRealpath, deps) {
+  if (info?.pane_id !== pane.pane_id || typeof pane.terminal_id !== 'string') {
+    throw new Error('Herdr pane, terminal, and process facts are incomplete');
+  }
+  const candidates = (info.foreground_processes ?? []).filter((entry) => {
+    const command = `${entry.name ?? ''} ${entry.argv0 ?? ''} ${entry.cmdline ?? ''}`;
+    return /(^|[ /])codex([ /]|$)|@openai\/codex/.test(command)
+      && repositoryPath(entry.cwd, deps) === repositoryRealpath;
+  });
+  const leaders = candidates.filter((entry) => entry.pid === info.foreground_process_group_id);
+  const selected = leaders.length === 1
+    ? leaders[0]
+    : (candidates.length === 1 ? candidates[0] : null);
+  if (!selected) {
+    throw new Error(`Herdr discovery requires one exact Codex frontend process; observed ${candidates.length}`);
+  }
+  const identity = deps.processIdentity(selected.pid);
+  if (!validProcessIdentity(identity) || (info.tty != null && identity.tty !== info.tty)) {
+    throw new Error('live Codex frontend process identity is unavailable or mismatched');
+  }
+  return identity;
+}
+
+function bindingIdentity(value) {
+  if (value?.schema !== CODEX_SESSION_BINDING_SCHEMA || value.state !== 'CURRENT') return null;
+  return {
+    repository_realpath: value.repository_realpath,
+    supervisor_id: value.supervisor_id,
+    supervisor_generation: value.supervisor_generation,
+    codex_session_uuid: value.codex_session_uuid,
+    codex_thread_uuid: value.codex_thread_uuid,
+    rollout: {
+      realpath: value.rollout?.realpath,
+      device: value.rollout?.device,
+      inode: value.rollout?.inode,
+      session_meta_line_sha256: value.rollout?.session_meta_line_sha256,
+      session_meta_payload_sha256: value.rollout?.session_meta_payload_sha256,
+    },
+    sessions_root_realpath: value.sessions_root_realpath,
+    codex_cli_version: value.codex_cli_version,
+    uid: value.uid,
+    host: {
+      workspace_id: value.host?.workspace_id,
+      workspace_cwd: value.host?.workspace_cwd,
+      pane_id: value.host?.pane_id,
+      terminal_id: value.host?.terminal_id,
+      process: value.host?.process,
+    },
+  };
+}
+
+function sameBindingIdentity(left, right) {
+  return left && right && canonicalJson(bindingIdentity(left)) === canonicalJson(bindingIdentity(right));
+}
+
 function validateSessionBindingShape(binding) {
-  if (binding?.schema !== CODEX_SESSION_BINDING_SCHEMA) throw new Error('unsupported Codex session binding');
+  if (![CODEX_SESSION_BINDING_SCHEMA, LEGACY_CODEX_SESSION_BINDING_SCHEMA].includes(binding?.schema)) {
+    throw new Error('unsupported Codex session binding');
+  }
+  if (binding.schema === CODEX_SESSION_BINDING_SCHEMA
+      && (binding.state !== 'CURRENT'
+        || !Number.isSafeInteger(binding.binding_revision)
+        || binding.binding_revision <= 0
+        || !/^[0-9a-f-]{36}$/i.test(binding.codex_thread_uuid ?? '')
+        || binding.codex_thread_uuid !== binding.codex_session_uuid)) {
+    throw new Error('incomplete ephemeral Codex session binding');
+  }
   if (typeof binding.repository_realpath !== 'string'
       || typeof binding.supervisor_id !== 'string'
       || !Number.isSafeInteger(binding.supervisor_generation)
@@ -341,7 +556,8 @@ function validateSessionBindingShape(binding) {
       || binding.host?.workspace_cwd !== binding.repository_realpath
       || typeof binding.host?.pane_id !== 'string'
       || typeof binding.host?.terminal_id !== 'string'
-      || typeof binding.authority_fence?.legacy_tmux_session !== 'string') {
+      || (binding.authority_fence?.legacy_tmux_session !== null
+        && typeof binding.authority_fence?.legacy_tmux_session !== 'string')) {
     throw new Error('incomplete Codex session binding');
   }
   if (binding.native_wake?.supported !== true
@@ -354,6 +570,7 @@ function validateSessionBindingShape(binding) {
 
 export function createCodexSessionBinding(root, {
   sessionId,
+  threadId = sessionId,
   rolloutPath,
   sessionsRoot,
   hostPid,
@@ -362,6 +579,8 @@ export function createCodexSessionBinding(root, {
   paneId,
   terminalId,
   legacyTmuxSession = null,
+  bindingRevision = null,
+  discoveryEvidence = null,
 }, dependencyOverrides = {}) {
   const deps = bindingDependencies(dependencyOverrides);
   const p = paths(root);
@@ -374,7 +593,7 @@ export function createCodexSessionBinding(root, {
   const hostProcess = deps.processIdentity(Number(hostPid));
   const cliVersion = deps.codexVersion();
   const uid = deps.uid();
-  const fencedTmuxSession = legacyTmuxSession ?? supervisor.session_id;
+  const fencedTmuxSession = legacyTmuxSession;
   if (!hostProcess || !cliVersion || !Number.isSafeInteger(uid)) {
     throw new Error('session binding probes did not produce exact Herdr process, CLI, and UID facts');
   }
@@ -396,13 +615,37 @@ export function createCodexSessionBinding(root, {
   }
   const oldPath = wakePaths(root).sessionBinding;
   const supersedes = existsSync(oldPath) ? fileSha256(oldPath) : null;
+  const oldBinding = readOptional(oldPath);
+  const revision = bindingRevision ?? ((Number(oldBinding?.binding_revision) || 0) + 1);
+  const identity = {
+    repositoryRealpath,
+    supervisorId: supervisor.supervisor_id,
+    supervisorGeneration: supervisor.generation,
+    sessionId,
+    threadId,
+    rolloutRealpath,
+    rolloutDevice: rollout.dev,
+    rolloutInode: rollout.ino,
+    workspaceId,
+    workspaceCwd,
+    paneId,
+    terminalId,
+    hostProcess,
+  };
   return validateSessionBindingShape({
     schema: CODEX_SESSION_BINDING_SCHEMA,
-    binding_id: id('codex-session-binding'),
+    state: 'CURRENT',
+    binding_id: `codex-session-binding-${sha256(canonicalJson({
+      identity,
+      revision,
+      supersedes,
+    }))}`,
+    binding_revision: revision,
     repository_realpath: repositoryRealpath,
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
     codex_session_uuid: sessionId,
+    codex_thread_uuid: threadId,
     rollout: {
       realpath: rolloutRealpath,
       device: rollout.dev,
@@ -425,9 +668,11 @@ export function createCodexSessionBinding(root, {
       pane_id: paneId,
       terminal_id: terminalId,
       process: hostProcess,
+      discovery: discoveryEvidence,
     },
     authority_fence: {
       legacy_tmux_session: fencedTmuxSession,
+      legacy_tmux_fallback_configured: typeof fencedTmuxSession === 'string' && fencedTmuxSession.length > 0,
       legacy_tmux_absent_at_bind: true,
     },
     native_wake: {
@@ -441,6 +686,190 @@ export function createCodexSessionBinding(root, {
   });
 }
 
+function archiveBinding(wake, binding, sourceSha256) {
+  if (!binding || !sourceSha256) return;
+  atomicCreateJson(join(wake.sessionBindingHistory, `${sourceSha256}.json`), binding);
+}
+
+function replaceBindingPointer(root, build) {
+  const wake = directories(root);
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const prior = readOptional(wake.sessionBinding);
+    const priorSha256 = prior ? fileSha256(wake.sessionBinding) : null;
+    const replacement = build(prior, priorSha256);
+    if (replacement === prior) return { changed: false, binding: prior };
+    archiveBinding(wake, prior, priorSha256);
+    const replacementSha256 = sha256(canonicalJson(replacement));
+    archiveBinding(wake, replacement, replacementSha256);
+    const swapped = atomicCompareAndSwapJson(wake.sessionBinding, priorSha256, replacement);
+    if (swapped.swapped) return { changed: true, binding: replacement };
+    if (!['cas-content-changed', 'cas-lock-busy'].includes(swapped.reason)) {
+      throw new Error(`session binding atomic replacement failed: ${swapped.reason}`);
+    }
+  }
+  throw new Error('session binding replacement raced repeatedly');
+}
+
+function invalidStatus(binding, error = null) {
+  return {
+    classification: 'attention',
+    valid: false,
+    supported: false,
+    reasons: binding?.reasons ?? ['session-binding-refresh-unproven'],
+    binding,
+    binding_revision: binding?.binding_revision ?? null,
+    ...(error ? { error } : {}),
+  };
+}
+
+export function refreshCodexSessionBinding(root, {
+  dependencies = {},
+  allowEnvironmentMismatch = false,
+} = {}) {
+  const deps = bindingDependencies(dependencies);
+  const wake = directories(root);
+  let discovered;
+  try {
+    const repositoryRealpath = deps.realpath(root);
+    const supervisor = readJson(paths(root).supervisor);
+    if (deps.legacyTmuxAuthority(supervisor.session_id)) {
+      throw new Error('concurrent live tmux supervisor authority detected');
+    }
+    const environment = deps.environment();
+    const priorBinding = readOptional(wake.sessionBinding);
+    const firstRaw = deps.herdrSnapshot();
+    const first = normalizedHerdrSnapshot(firstRaw);
+    const frontend = exactHerdrFrontend(
+      first,
+      repositoryRealpath,
+      environment,
+      deps,
+      allowEnvironmentMismatch,
+      priorBinding,
+    );
+    const expectedHerdr = dependencies.expectedHerdr ?? null;
+    if (expectedHerdr && (
+      (expectedHerdr.workspace_id && expectedHerdr.workspace_id !== frontend.workspace.workspace_id)
+      || (expectedHerdr.pane_id && expectedHerdr.pane_id !== frontend.pane.pane_id)
+      || (expectedHerdr.terminal_id && expectedHerdr.terminal_id !== frontend.pane.terminal_id)
+    )) {
+      throw new Error('Herdr discovery does not match the registered host ownership pointer');
+    }
+    const processInfo = normalizedPaneProcessInfo(deps.herdrPaneProcessInfo(frontend.pane.pane_id));
+    const frontendProcess = exactFrontendProcess(
+      processInfo,
+      frontend.pane,
+      repositoryRealpath,
+      deps,
+    );
+    if (allowEnvironmentMismatch
+        && !sessionReference(frontend.pane)
+        && !exactProcess(priorBinding?.host?.process, frontendProcess)) {
+      throw new Error('dispatcher cannot infer a changed Herdr frontend session identity');
+    }
+    const sessionsRoot = dependencies.sessionsRoot
+      ? dependencies.sessionsRoot(environment)
+      : (allowEnvironmentMismatch
+        ? priorBinding?.sessions_root_realpath ?? null
+        : (environment.CODEX_HOME
+          ? join(environment.CODEX_HOME, 'sessions')
+          : priorBinding?.sessions_root_realpath ?? null));
+    if (!sessionsRoot) throw new Error('CODEX_HOME sessions root is unavailable');
+    const sessionsRootRealpath = deps.realpath(sessionsRoot);
+    const candidates = deps.sessionCandidates(sessionsRootRealpath, frontend.sessionId);
+    if (candidates.length !== 1) {
+      throw new Error(`Codex refresh requires one exact rollout candidate; observed ${candidates.length}`);
+    }
+    const secondRaw = deps.herdrSnapshot();
+    const second = normalizedHerdrSnapshot(secondRaw);
+    const confirmed = exactHerdrFrontend(
+      second,
+      repositoryRealpath,
+      environment,
+      deps,
+      allowEnvironmentMismatch,
+      priorBinding,
+    );
+    if (confirmed.workspace.workspace_id !== frontend.workspace.workspace_id
+        || confirmed.pane.pane_id !== frontend.pane.pane_id
+        || confirmed.pane.terminal_id !== frontend.pane.terminal_id
+        || confirmed.sessionId !== frontend.sessionId) {
+      throw new Error('Herdr frontend changed during binding discovery');
+    }
+    if (!exactProcess(frontendProcess, deps.processIdentity(frontendProcess.pid))) {
+      throw new Error('Codex frontend process changed during binding discovery');
+    }
+    discovered = {
+      sessionId: frontend.sessionId,
+      threadId: frontend.threadId,
+      rolloutPath: candidates[0],
+      sessionsRoot: sessionsRootRealpath,
+      hostPid: frontendProcess.pid,
+      workspaceId: frontend.workspace.workspace_id,
+      workspaceCwd: repositoryRealpath,
+      paneId: frontend.pane.pane_id,
+      terminalId: frontend.pane.terminal_id,
+      legacyTmuxSession: supervisor.session_id ?? null,
+      discoveryEvidence: {
+        source: 'herdr-api-snapshot-and-pane-process-info',
+        protocol: first.protocol ?? null,
+        version: first.version ?? null,
+        tab_id: frontend.pane.tab_id ?? null,
+        pane_revision: frontend.pane.revision ?? null,
+        snapshot_sha256: sha256(canonicalJson(firstRaw)),
+        confirmation_snapshot_sha256: sha256(canonicalJson(secondRaw)),
+        process_tty: frontendProcess.tty,
+      },
+    };
+  } catch (error) {
+    const reason = error.message || 'session binding refresh failed';
+    if (!existsSync(wake.sessionBinding)) {
+      return {
+        classification: 'unbound',
+        valid: false,
+        supported: false,
+        attention: true,
+        reasons: [reason],
+        binding: null,
+        binding_revision: null,
+        refreshed: false,
+        error: reason,
+      };
+    }
+    let prior;
+    try { prior = readOptional(wake.sessionBinding); } catch {
+      return {
+        classification: 'attention',
+        valid: false,
+        supported: false,
+        reasons: [reason, 'existing-session-binding-unreadable'],
+        binding: null,
+        binding_revision: null,
+        refreshed: false,
+        error: reason,
+      };
+    }
+    const priorStatus = codexSessionBindingStatus(root, { binding: prior, dependencies });
+    return {
+      ...priorStatus,
+      refreshed: false,
+      refresh_error: reason,
+      preserved_prior_binding: true,
+    };
+  }
+
+  const replaced = replaceBindingPointer(root, (prior) => {
+    const candidate = createCodexSessionBinding(root, {
+      ...discovered,
+      bindingRevision: (Number(prior?.binding_revision) || 0) + 1,
+    }, dependencies);
+    if (sameBindingIdentity(prior, candidate)) return prior;
+    return candidate;
+  });
+  const status = codexSessionBindingStatus(root, { binding: replaced.binding, dependencies });
+  return { ...status, refreshed: replaced.changed };
+}
+
 export function codexSessionBindingStatus(root, {
   binding = null,
   ignoreSupersession = false,
@@ -449,6 +878,9 @@ export function codexSessionBindingStatus(root, {
   const deps = bindingDependencies(dependencies);
   const record = binding ?? readOptional(wakePaths(root).sessionBinding);
   if (!record) return { classification: 'unbound', valid: false, supported: false, reasons: ['session-binding-missing'] };
+  if (record.schema === CODEX_SESSION_BINDING_INVALID_SCHEMA && record.state === 'INVALID') {
+    return invalidStatus(record);
+  }
   try { validateSessionBindingShape(record); } catch (error) {
     return { classification: 'stale', valid: false, supported: false, reasons: ['binding-schema-invalid'], error: error.message };
   }
@@ -505,19 +937,26 @@ export function codexSessionBindingStatus(root, {
     supported: record.native_wake.supported,
     reason: record.native_wake.reason,
     binding: record,
+    binding_revision: record.binding_revision ?? 0,
   };
 }
 
 export function bindCodexSession(root, input, options = {}) {
-  const binding = createCodexSessionBinding(root, input, options.dependencies);
+  const replaced = replaceBindingPointer(root, (prior) => {
+    const candidate = createCodexSessionBinding(root, {
+      ...input,
+      bindingRevision: (Number(prior?.binding_revision) || 0) + 1,
+    }, options.dependencies);
+    return sameBindingIdentity(prior, candidate) ? prior : candidate;
+  });
+  const binding = replaced.binding;
   const status = codexSessionBindingStatus(root, {
     binding,
     ignoreSupersession: true,
     dependencies: options.dependencies,
   });
   if (!status.valid) throw new Error(`Codex session binding validation failed: ${status.reasons.join(', ')}`);
-  writeJson(directories(root).sessionBinding, binding);
-  return status;
+  return { ...status, refreshed: replaced.changed };
 }
 
 export function adoptCodexSessionBinding(root, { dependencies = {} } = {}) {
@@ -534,12 +973,34 @@ function activationDecisionPath(root, eventId) {
   return join(wakePaths(root).activationDecisions, `${eventId}.json`);
 }
 
-function leaseOwner(dispatcher) {
+function leaseOwner(dispatcher, activationOwner = null) {
+  if (activationOwner) return structuredClone(activationOwner);
   return {
     dispatcher_id: dispatcher?.dispatcher_id ?? 'explicit-provider-free-dispatcher',
     dispatcher_generation: dispatcher?.dispatcher_generation ?? 1,
     process: dispatcher?.process ?? processIdentity(process.pid),
   };
+}
+
+function sameActivationOwner(left, right) {
+  return canonicalJson(left ?? null) === canonicalJson(right ?? null);
+}
+
+function activationOwnerCurrent(owner, getProcessIdentity = processIdentity) {
+  if (!owner || !sameProcess(owner.process, getProcessIdentity(owner.process?.pid))) return false;
+  if (!['opsled', 'opsled-wake-worker'].includes(owner.kind)) return true;
+  if (owner.schema !== 'opsle.durable-supervisor.opsled-wake-owner/v1'
+      || typeof owner.service_id !== 'string'
+      || !Number.isSafeInteger(owner.service_generation)) return false;
+  try {
+    assertReleaseFence(owner.release_fence, {
+      role: owner.kind === 'opsled-wake-worker' ? 'opsled-wake-worker' : 'opsled-worker',
+      processIdentity: owner.process,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function leaseExpired(lease, nowMs) {
@@ -549,6 +1010,7 @@ function leaseExpired(lease, nowMs) {
 
 export function acquireActivationLease(root, eventId, {
   dispatcher = null,
+  activationOwner = null,
   ttlMs = ACTIVATION_LEASE_TTL_MS,
   nowMs = Date.now(),
   getProcessIdentity = processIdentity,
@@ -560,8 +1022,8 @@ export function acquireActivationLease(root, eventId, {
   if (dispatcher && !dispatcherFence(root, dispatcher).current) {
     return { acquired: false, classification: 'stale-dispatcher', reason: 'dispatcher-fence-no-longer-current' };
   }
-  const owner = leaseOwner(dispatcher);
-  if (!owner.process || !sameProcess(owner.process, getProcessIdentity(owner.process.pid))) {
+  const owner = leaseOwner(dispatcher, activationOwner);
+  if (!activationOwnerCurrent(owner, getProcessIdentity)) {
     return { acquired: false, classification: 'stale-dispatcher', reason: 'activation-owner-process-dead-or-reused' };
   }
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -572,9 +1034,7 @@ export function acquireActivationLease(root, eventId, {
         && current.supervisor_generation === supervisor.generation
         && !leaseExpired(current, nowMs)) {
       if (current.event_id === eventId
-          && current.owner.dispatcher_id === owner.dispatcher_id
-          && current.owner.dispatcher_generation === owner.dispatcher_generation
-          && sameProcess(current.owner.process, owner.process)) {
+          && sameActivationOwner(current.owner, owner)) {
         return { acquired: true, duplicate: true, lease: current };
       }
       return { acquired: false, classification: 'busy', reason: 'another-activation-lease-is-current', lease: current };
@@ -644,9 +1104,8 @@ export function decisionFenceCurrent(root, lease, { nowMs = Date.now() } = {}) {
     && current.supervisor_generation === lease?.supervisor_generation
     && current.supervisor_id === supervisor.supervisor_id
     && current.supervisor_generation === supervisor.generation
-    && current.owner?.dispatcher_id === lease?.owner?.dispatcher_id
-    && current.owner?.dispatcher_generation === lease?.owner?.dispatcher_generation
-    && sameProcess(current.owner?.process, lease?.owner?.process);
+    && sameActivationOwner(current.owner, lease?.owner)
+    && activationOwnerCurrent(current.owner);
 }
 
 export function claimActivationDecision(root, eventId, lease, {
@@ -660,7 +1119,8 @@ export function claimActivationDecision(root, eventId, lease, {
   }
   const request = readJson(requestPath(root, eventId));
   const supervisor = readJson(paths(root).supervisor);
-  if (request.target.supervisor_id !== supervisor.supervisor_id
+  if (request.target.repository !== supervisor.repository
+      || request.target.supervisor_id !== supervisor.supervisor_id
       || request.target.supervisor_generation !== supervisor.generation) {
     return { claimed: false, classification: 'obsolete', reason: 'wake-target-generation-is-stale' };
   }
@@ -683,7 +1143,8 @@ export function claimActivationDecision(root, eventId, lease, {
   const path = activationDecisionPath(root, eventId);
   if (atomicCreateJson(path, decision)) return { claimed: true, duplicate: false, decision };
   const current = readJson(path);
-  if (current.status === 'BUSY' && decisionFenceCurrent(root, lease)) {
+  if (['BUSY', 'TRANSPORT_NOT_STARTED'].includes(current.status)
+      && decisionFenceCurrent(root, lease)) {
     const expected = sha256(canonicalJson(current));
     decision.prior_attempts = [
       ...(Array.isArray(current.prior_attempts) ? current.prior_attempts : []),
@@ -740,7 +1201,8 @@ export function classifyQueuedWake(root, request, supervisor = readJson(paths(ro
   if (![WAKE_REQUEST_SCHEMA, NATIVE_WAKE_REQUEST_SCHEMA].includes(request?.schema)) {
     return { classification: 'queued', reason: 'invalid-wake-request' };
   }
-  if (request.target?.supervisor_id !== supervisor.supervisor_id
+  if (request.target?.repository !== supervisor.repository
+      || request.target?.supervisor_id !== supervisor.supervisor_id
       || request.target?.supervisor_generation !== supervisor.generation) {
     return { classification: 'obsolete', reason: 'wake-target-generation-is-stale' };
   }
@@ -757,7 +1219,7 @@ export function classifyQueuedWake(root, request, supervisor = readJson(paths(ro
   }
   if (existsSync(activationDecisionPath(root, request.event_id))) {
     const decision = readJson(activationDecisionPath(root, request.event_id));
-    if (decision.status === 'BUSY') {
+    if (['BUSY', 'TRANSPORT_NOT_STARTED'].includes(decision.status)) {
       return {
         classification: 'queued',
         reason: 'awaiting-supported-native-transport',
@@ -771,6 +1233,100 @@ export function classifyQueuedWake(root, request, supervisor = readJson(paths(ro
     };
   }
   return { classification: 'queued', reason: 'awaiting-supported-native-transport' };
+}
+
+export function reconcileWakeTransportNotStarted(root, eventId) {
+  const repositoryRoot = realpathSync(root);
+  const request = readJson(requestPath(repositoryRoot, eventId));
+  const supervisor = readJson(paths(repositoryRoot).supervisor);
+  const decisionPath = activationDecisionPath(repositoryRoot, eventId);
+  const decision = readJson(decisionPath);
+  if (request.target?.repository !== supervisor.repository
+      || request.target?.supervisor_id !== supervisor.supervisor_id
+      || request.target?.supervisor_generation !== supervisor.generation
+      || decision.schema !== ACTIVATION_DECISION_SCHEMA
+      || decision.event_id !== eventId
+      || decision.supervisor_id !== supervisor.supervisor_id
+      || decision.supervisor_generation !== supervisor.generation
+      || decision.status !== 'UNCERTAIN'
+      || typeof decision.transport_attempt_id !== 'string') {
+    throw new Error('uncertain wake reconciliation fence mismatch');
+  }
+  const evidencePath = transportAttemptPath(repositoryRoot, decision.transport_attempt_id);
+  const evidence = readJson(evidencePath);
+  const timestamps = evidence.timestamps ?? {};
+  const transportNeverStarted = evidence.event_id === eventId
+    && evidence.transport_attempt_id === decision.transport_attempt_id
+    && evidence.delivery_id === decision.delivery_id
+    && evidence.activation?.decision_id === decision.decision_id
+    && evidence.confirmation_absence === 'native-transport-not-started'
+    && evidence.rollout_confirmation == null
+    && timestamps.spawn_requested_at == null
+    && timestamps.spawned_at == null
+    && timestamps.transport_started_at == null
+    && !existsSync(receiptPath(repositoryRoot, eventId));
+  if (!transportNeverStarted) {
+    throw new Error('native transport absence is not proven; wake remains uncertain');
+  }
+  const expected = sha256(canonicalJson(decision));
+  const reconciled = {
+    ...decision,
+    status: 'TRANSPORT_NOT_STARTED',
+    failure: 'transport-not-started',
+    reconciled_at: now(),
+    reconciliation: {
+      classification: 'transport-not-started',
+      native_transport_spawned: false,
+      transport_attempt_id: decision.transport_attempt_id,
+      evidence_sha256: fileSha256(evidencePath),
+    },
+  };
+  const updated = atomicCompareAndSwapJson(decisionPath, expected, reconciled);
+  if (!updated.swapped) throw new Error(updated.reason ?? 'wake reconciliation CAS failed');
+  emit(repositoryRoot, 'HOST_WAKE_TRANSPORT_NOT_STARTED_RECONCILED', {
+    source_event_id: eventId,
+    transport_attempt_id: decision.transport_attempt_id,
+    native_transport_spawned: false,
+  });
+  return {
+    event_id: eventId,
+    status: reconciled.status,
+    classification: reconciled.reconciliation.classification,
+    native_transport_spawned: false,
+    transport_attempt_id: decision.transport_attempt_id,
+    child_attempt_id: request.attempt_id,
+  };
+}
+
+export function consumeReconciledTransportNotStarted(root, eventId, { generation }) {
+  const repositoryRoot = realpathSync(root);
+  const supervisor = readJson(paths(repositoryRoot).supervisor);
+  const request = readOptional(requestPath(repositoryRoot, eventId));
+  if (!request) return null;
+  const decision = readJson(activationDecisionPath(repositoryRoot, eventId));
+  if (Number(generation) !== supervisor.generation
+      || request.target?.repository !== supervisor.repository
+      || request.target?.supervisor_id !== supervisor.supervisor_id
+      || request.target?.supervisor_generation !== supervisor.generation
+      || decision.schema !== ACTIVATION_DECISION_SCHEMA
+      || decision.event_id !== eventId
+      || decision.supervisor_id !== supervisor.supervisor_id
+      || decision.supervisor_generation !== supervisor.generation
+      || decision.status !== 'TRANSPORT_NOT_STARTED'
+      || decision.reconciliation?.classification !== 'transport-not-started'
+      || decision.reconciliation?.native_transport_spawned !== false
+      || existsSync(receiptPath(repositoryRoot, eventId))) {
+    throw new Error('transport-not-started event consumption fence mismatch');
+  }
+  return {
+    delivered: false,
+    consumed: true,
+    reconciled: true,
+    classification: 'transport-not-started',
+    native_transport_spawned: false,
+    transport_attempt_id: decision.transport_attempt_id,
+    reconciliation_evidence_sha256: decision.reconciliation.evidence_sha256,
+  };
 }
 
 export function enqueueTerminalWake(root, completionEvent, { hostBinding = null } = {}) {
@@ -789,6 +1345,7 @@ export function enqueueTerminalWake(root, completionEvent, { hostBinding = null 
     attempt_id: completionEvent.attempt_id,
     wait_id: completionEvent.wait_id,
     target: {
+      repository: supervisor.repository,
       supervisor_id: supervisor.supervisor_id,
       supervisor_generation: supervisor.generation,
     },
@@ -812,6 +1369,8 @@ function sameDispatcher(left, right) {
   return left && right
     && left.dispatcher_id === right.dispatcher_id
     && left.dispatcher_generation === right.dispatcher_generation
+    && left.implementation_sha256 === right.implementation_sha256
+    && canonicalJson(left.release_fence ?? null) === canonicalJson(right.release_fence ?? null)
     && left.supervisor_id === right.supervisor_id
     && left.supervisor_generation === right.supervisor_generation
     && sameProcess(left.process, right.process);
@@ -857,7 +1416,10 @@ export function classifyWakeDelivery({
       || dispatcher.supervisor_generation !== supervisor.generation)) {
     return { classification: 'stale-generation', reason: 'dispatcher-supervisor-generation-mismatch' };
   }
-  if (busy) return { classification: 'busy', reason: 'active-delivery-or-supervisor-busy-marker' };
+  const nativeResume = request.schema === NATIVE_WAKE_REQUEST_SCHEMA;
+  if (!nativeResume && busy) {
+    return { classification: 'busy', reason: 'active-delivery-or-supervisor-busy-marker' };
+  }
   if (binding && evidence?.host_kind && evidence.host_kind !== binding.host) {
     return { classification: 'unavailable', reason: 'stale-or-mismatched-host-adapter' };
   }
@@ -869,6 +1431,12 @@ export function classifyWakeDelivery({
   }
   if (!evidence?.available || !evidence.session_alive || evidence.pane_dead) {
     return { classification: 'unavailable', reason: evidence?.reason ?? 'tmux-unavailable' };
+  }
+  if (nativeResume) {
+    return {
+      classification: 'native-ready',
+      reason: 'plain-codex-resume-does-not-require-idle-supervisor',
+    };
   }
   if (evidence.attached_clients?.length) {
     return { classification: 'human-interacting', reason: 'tmux-client-attached' };
@@ -922,6 +1490,8 @@ export function plainCodexResumeTransport({
       const before = readJson(evidencePath);
       before.helper = {
         executable: process.execPath,
+        expected_release: releaseIdentity('codex-resume'),
+        release_fence: null,
         argv: [process.execPath, ...helperArgs],
         cwd: binding.repository_realpath,
         invoked_at: now(),
@@ -940,7 +1510,6 @@ export function plainCodexResumeTransport({
       const result = run(process.execPath, helperArgs, {
         encoding: 'utf8',
         maxBuffer: 256 * 1024,
-        timeout: CODEX_RESUME_HELPER_TIMEOUT_MS,
         cwd: binding.repository_realpath,
         env: process.env,
       });
@@ -980,9 +1549,13 @@ export function plainCodexResumeTransport({
   };
 }
 
-function validateDeliveryFence(root, eventId, expected, dispatcher) {
+function validateDeliveryFence(root, eventId, expected, dispatcher, activationOwner = null) {
   const request = readJson(requestPath(root, eventId));
   const supervisor = readJson(paths(root).supervisor);
+  if (supervisor.repository !== root
+      || request.target.repository !== supervisor.repository) {
+    return { current: false, reason: 'repository-delivery-fence-changed' };
+  }
   if (supervisor.supervisor_id !== expected.supervisorId
       || supervisor.generation !== expected.supervisorGeneration) {
     return { current: false, reason: 'supervisor-delivery-fence-changed' };
@@ -1002,14 +1575,77 @@ function validateDeliveryFence(root, eventId, expected, dispatcher) {
         || request.target.host_binding.supervisor_generation !== supervisor.generation)) {
     return { current: false, reason: 'wake-host-binding-generation-mismatch' };
   }
+  if (expected.bindingSha256 != null) {
+    const bindingPath = wakePaths(root).sessionBinding;
+    if (!existsSync(bindingPath) || fileSha256(bindingPath) !== expected.bindingSha256) {
+      return { current: false, reason: 'session-binding-revision-changed' };
+    }
+  }
   const dispatcherDecision = dispatcherFence(root, dispatcher);
   if (!dispatcherDecision.current) {
     return { current: false, reason: 'dispatcher-fence-no-longer-current' };
+  }
+  if (activationOwner && !activationOwnerCurrent(activationOwner)) {
+    return { current: false, reason: 'opsled-owner-fence-no-longer-current' };
   }
   return { current: true, request, supervisor };
 }
 
 function commitDeliveredReceipt(root, request, receipt) {
+  const p = paths(root);
+  const supervisor = readJson(p.supervisor);
+  const durableRequest = readJson(requestPath(root, request.event_id));
+  const bindingPath = wakePaths(root).sessionBinding;
+  const binding = readJson(bindingPath);
+  const decision = readJson(activationDecisionPath(root, request.event_id));
+  let bindingValid = true;
+  try { validateSessionBindingShape(binding); } catch { bindingValid = false; }
+  const dispatcherCurrent = receipt.dispatcher_id == null || dispatcherFence(root, {
+    schema: DISPATCHER_SCHEMA,
+    dispatcher_id: receipt.dispatcher_id,
+    dispatcher_generation: receipt.dispatcher_generation,
+    implementation_sha256: receipt.dispatcher_implementation_sha256,
+    release_fence: receipt.dispatcher_release_fence,
+    supervisor_id: receipt.supervisor_id,
+    supervisor_generation: receipt.supervisor_generation,
+    process: receipt.dispatcher_process,
+  }).current;
+  const wakeOwnerCurrent = receipt.wake_owner == null
+    || activationOwnerCurrent(receipt.wake_owner);
+  if (supervisor.repository !== root
+      || request.target?.repository !== supervisor.repository
+      || receipt.repository !== supervisor.repository
+      || canonicalJson(durableRequest) !== canonicalJson(request)
+      || request.event_id !== receipt.event_id
+      || request.queue_version !== receipt.queue_version
+      || request.target.supervisor_id !== supervisor.supervisor_id
+      || request.target.supervisor_generation !== supervisor.generation
+      || receipt.supervisor_id !== supervisor.supervisor_id
+      || receipt.supervisor_generation !== supervisor.generation
+      || receipt.dispatcher_implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
+      || !dispatcherCurrent
+      || !wakeOwnerCurrent
+      || !bindingValid
+      || binding.repository_realpath !== realpathSync(root)
+      || binding.supervisor_id !== supervisor.supervisor_id
+      || binding.supervisor_generation !== supervisor.generation
+      || receipt.codex_session_binding_sha256 !== fileSha256(bindingPath)
+      || receipt.codex_session_uuid !== binding.codex_session_uuid
+      || receipt.host_kind !== binding.host.kind
+      || receipt.native_transport !== binding.native_wake.transport
+      || decision?.schema !== ACTIVATION_DECISION_SCHEMA
+      || !['CLAIMED', 'DELIVERED'].includes(decision.status)
+      || decision.event_id !== request.event_id
+      || decision.supervisor_id !== supervisor.supervisor_id
+      || decision.supervisor_generation !== supervisor.generation
+      || decision.delivery_id !== receipt.delivery_id
+      || decision.transport_attempt_id !== receipt.transport_attempt_id
+      || decision.decision_id !== receipt.activation_decision_id
+      || decision.lease_id !== receipt.activation_lease_id
+      || decision.fencing_token !== receipt.activation_fencing_token
+      || decision.message_sha256 !== receipt.message_sha256) {
+    throw new Error('wake delivery commitment ownership fence mismatch');
+  }
   const existingPath = receiptPath(root, request.event_id);
   receipt.status = 'DELIVERED';
   receipt.delivered_at ??= now();
@@ -1102,11 +1738,11 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
   const binding = readJson(wake.sessionBinding);
   const decision = readJson(activationDecisionPath(repositoryRoot, evidence.event_id));
   const lease = readJson(wake.activationLease);
-  const expectedDispatcher = {
+  const expectedDispatcher = evidence.dispatcher ? {
     ...evidence.dispatcher,
     supervisor_id: evidence.supervisor?.supervisor_id,
     supervisor_generation: evidence.supervisor?.generation,
-  };
+  } : null;
   const message = evidence.canonical_argv?.[3];
   const baselineOrdinal = evidence.transport?.baseline_ordinal;
   const currentConfirmation = exactRolloutConfirmation(confirmation);
@@ -1124,7 +1760,7 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
     requestSha256: evidence.request?.sha256,
     supervisorId: evidence.supervisor?.supervisor_id,
     supervisorGeneration: evidence.supervisor?.generation,
-  }, expectedDispatcher);
+  }, expectedDispatcher, evidence.wake_owner ?? null);
   const fencesCurrent = deliveryFence.current
     && Number.isFinite(nowMs)
     && decisionFenceCurrent(repositoryRoot, lease, { nowMs })
@@ -1133,9 +1769,13 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
     && evidence.request?.queue_version === request.queue_version
     && evidence.supervisor?.supervisor_id === supervisor.supervisor_id
     && evidence.supervisor?.generation === supervisor.generation
-    && evidence.dispatcher?.dispatcher_id === lease.owner?.dispatcher_id
-    && evidence.dispatcher?.dispatcher_generation === lease.owner?.dispatcher_generation
-    && sameProcess(evidence.dispatcher?.process, lease.owner?.process)
+    && ((expectedDispatcher
+      && evidence.dispatcher?.dispatcher_id === lease.owner?.dispatcher_id
+      && evidence.dispatcher?.dispatcher_generation === lease.owner?.dispatcher_generation
+      && sameProcess(evidence.dispatcher?.process, lease.owner?.process))
+      || (!expectedDispatcher
+        && sameActivationOwner(evidence.wake_owner, lease.owner)
+        && activationOwnerCurrent(lease.owner)))
     && evidence.activation?.lease_id === lease.lease_id
     && evidence.activation?.fencing_token === lease.fencing_token
     && decision.status === 'CLAIMED'
@@ -1169,14 +1809,19 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
 
   const receipt = {
     schema: DELIVERY_SCHEMA,
+    repository: supervisor.repository,
     delivery_id: evidence.delivery_id,
     event_id: request.event_id,
     queue_version: request.queue_version,
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
-    dispatcher_id: evidence.dispatcher.dispatcher_id,
-    dispatcher_generation: evidence.dispatcher.dispatcher_generation,
-    dispatcher_process: evidence.dispatcher.process,
+    dispatcher_id: evidence.dispatcher?.dispatcher_id ?? null,
+    dispatcher_generation: evidence.dispatcher?.dispatcher_generation ?? null,
+    dispatcher_implementation_sha256: evidence.dispatcher?.implementation_sha256
+      ?? WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+    dispatcher_release_fence: evidence.dispatcher?.release_fence ?? null,
+    dispatcher_process: evidence.dispatcher?.process ?? evidence.wake_owner?.process ?? null,
+    wake_owner: evidence.wake_owner ?? null,
     activation_lease_id: lease.lease_id,
     activation_fencing_token: lease.fencing_token,
     activation_decision_id: decision.decision_id,
@@ -1445,6 +2090,7 @@ function reconcileLateConfirmation(root, request, deliveryFence, bindingStatus, 
   const cleanup = evidence.cleanup;
   const receipt = {
     schema: DELIVERY_SCHEMA,
+    repository: readJson(paths(root).supervisor).repository,
     delivery_id: evidence.delivery_id,
     event_id: request.event_id,
     queue_version: request.queue_version,
@@ -1452,6 +2098,8 @@ function reconcileLateConfirmation(root, request, deliveryFence, bindingStatus, 
     supervisor_generation: binding.supervisor_generation,
     dispatcher_id: evidence.dispatcher.dispatcher_id,
     dispatcher_generation: evidence.dispatcher.dispatcher_generation,
+    dispatcher_implementation_sha256: evidence.dispatcher.implementation_sha256,
+    dispatcher_release_fence: evidence.dispatcher.release_fence,
     dispatcher_process: evidence.dispatcher.process,
     activation_lease_id: evidence.activation.lease_id,
     activation_fencing_token: evidence.activation.fencing_token,
@@ -1499,18 +2147,23 @@ export function deliverWake(root, eventId, {
   nativeTransport = null,
   bindingDependencies = {},
   dispatcher = null,
+  activationOwner = null,
   expectedQueueVersion = null,
   getActivationNowMs = Date.now,
 } = {}) {
   const wake = directories(root);
   const request = readJson(requestPath(root, eventId));
   const queueVersion = expectedQueueVersion ?? request.queue_version;
-  const deliveryFence = {
-    queueVersion,
-    requestSha256: sha256(canonicalJson(request)),
-    supervisorId: request.target.supervisor_id,
-    supervisorGeneration: request.target.supervisor_generation,
-  };
+  if (dispatcher && !dispatcherFence(root, dispatcher).current) {
+    const decision = readOptional(activationDecisionPath(root, eventId));
+    return {
+      classification: 'stale-generation',
+      reason: decision?.status === 'UNCERTAIN'
+        ? 'late-confirmation-dispatcher-fence-not-current'
+        : 'dispatcher-fence-no-longer-current',
+      delivered: false,
+    };
+  }
   const existingPath = receiptPath(root, eventId);
   if (existsSync(existingPath)) {
     let existing;
@@ -1523,7 +2176,23 @@ export function deliverWake(root, eventId, {
     return { classification: 'queued', reason: 'crash-uncertain-delivery-claim', receipt: existing, replayed: false };
   }
   const supervisor = readJson(paths(root).supervisor);
-  const bindingStatus = codexSessionBindingStatus(root, { dependencies: bindingDependencies });
+  const preflightLifecycle = classifyQueuedWake(root, request, supervisor);
+  if (preflightLifecycle.classification === 'obsolete') {
+    return { ...preflightLifecycle, event_id: eventId, delivered: false };
+  }
+  const refreshOptions = {
+    dependencies: bindingDependencies,
+    allowEnvironmentMismatch: Boolean(dispatcher)
+      || ['opsled', 'opsled-wake-worker'].includes(activationOwner?.kind),
+  };
+  const bindingStatus = refreshCodexSessionBinding(root, refreshOptions);
+  const deliveryFence = {
+    queueVersion,
+    requestSha256: sha256(canonicalJson(request)),
+    supervisorId: request.target.supervisor_id,
+    supervisorGeneration: request.target.supervisor_generation,
+    bindingSha256: bindingStatus.valid ? fileSha256(wake.sessionBinding) : null,
+  };
   if (bindingStatus.valid && bindingStatus.supported) {
     const reconciled = reconcileLateConfirmation(
       root,
@@ -1533,6 +2202,15 @@ export function deliverWake(root, eventId, {
       dispatcher,
     );
     if (reconciled) return reconciled;
+  }
+  if (bindingStatus.refresh_error) {
+    return {
+      classification: 'queued',
+      reason: 'codex-session-binding-refresh-unproven',
+      binding_status: bindingStatus,
+      event_id: eventId,
+      delivered: false,
+    };
   }
   const lifecycle = classifyQueuedWake(root, request, supervisor);
   if (lifecycle.classification !== 'queued'
@@ -1573,12 +2251,19 @@ export function deliverWake(root, eventId, {
   if (!currentDispatcher.current) {
     return { classification: 'stale-generation', reason: 'dispatcher-fence-no-longer-current', delivered: false };
   }
-  const fence = validateDeliveryFence(root, eventId, deliveryFence, dispatcher);
+  const fence = validateDeliveryFence(
+    root,
+    eventId,
+    deliveryFence,
+    dispatcher,
+    activationOwner,
+  );
   if (!fence.current) {
     return { classification: 'stale-generation', reason: fence.reason, event_id: eventId, delivered: false };
   }
   const leaseResult = acquireActivationLease(root, eventId, {
     dispatcher,
+    activationOwner,
     nowMs: getActivationNowMs(),
   });
   if (!leaseResult.acquired) {
@@ -1596,29 +2281,6 @@ export function deliverWake(root, eventId, {
     rolloutActivity = boundRolloutActivity(bindingStatus.binding.rollout.realpath);
   } catch (error) {
     rolloutActivity = { classification: 'unknown', reason: error.message };
-  }
-  if (rolloutActivity.classification === 'busy') {
-    const busyClaim = claimActivationDecision(root, eventId, lease, {
-      message,
-      nowMs: getActivationNowMs(),
-    });
-    if (busyClaim.claimed) {
-      updateActivationDecision(
-        root,
-        busyClaim.decision,
-        'BUSY',
-        `bound-rollout-known-busy-at-ordinal-${rolloutActivity.latest_ordinal}`,
-      );
-    }
-    releaseActivationLease(root, lease);
-    return {
-      classification: 'busy',
-      reason: 'bound-rollout-known-busy-before-transport',
-      rollout_activity: rolloutActivity,
-      event_id: eventId,
-      delivered: false,
-      replayed: false,
-    };
   }
   const transportAttemptId = id('transport-attempt');
   const deliveryId = id('delivery');
@@ -1645,6 +2307,7 @@ export function deliverWake(root, eventId, {
   }
   const receipt = {
     schema: DELIVERY_SCHEMA,
+    repository: supervisor.repository,
     delivery_id: deliveryId,
     event_id: eventId,
     queue_version: queueVersion,
@@ -1652,7 +2315,11 @@ export function deliverWake(root, eventId, {
     supervisor_generation: supervisor.generation,
     dispatcher_id: dispatcher?.dispatcher_id ?? null,
     dispatcher_generation: dispatcher?.dispatcher_generation ?? null,
+    dispatcher_implementation_sha256: dispatcher?.implementation_sha256
+      ?? WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+    dispatcher_release_fence: dispatcher?.release_fence ?? null,
     dispatcher_process: dispatcher?.process ?? lease.owner.process,
+    wake_owner: activationOwner ? structuredClone(activationOwner) : null,
     activation_lease_id: lease.lease_id,
     activation_fencing_token: lease.fencing_token,
     activation_decision_id: claim.decision.decision_id,
@@ -1685,12 +2352,16 @@ export function deliverWake(root, eventId, {
       wait_id: request.wait_id,
     },
     delivery_id: deliveryId,
-    dispatcher: {
+    dispatcher: dispatcher ? {
       dispatcher_id: dispatcher?.dispatcher_id ?? lease.owner.dispatcher_id,
       dispatcher_generation: dispatcher?.dispatcher_generation
         ?? lease.owner.dispatcher_generation,
+      implementation_sha256: dispatcher?.implementation_sha256
+        ?? WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+      release_fence: dispatcher?.release_fence ?? null,
       process: dispatcher?.process ?? lease.owner.process,
-    },
+    } : null,
+    wake_owner: activationOwner ? structuredClone(activationOwner) : null,
     supervisor: {
       supervisor_id: supervisor.supervisor_id,
       generation: supervisor.generation,
@@ -1727,7 +2398,13 @@ export function deliverWake(root, eventId, {
       replayed: false,
     };
   }
-  const finalFence = validateDeliveryFence(root, eventId, deliveryFence, dispatcher);
+  const finalFence = validateDeliveryFence(
+    root,
+    eventId,
+    deliveryFence,
+    dispatcher,
+    activationOwner,
+  );
   const finalLeaseFenceCurrent = decisionFenceCurrent(root, lease, {
     nowMs: getActivationNowMs(),
   });
@@ -1743,13 +2420,43 @@ export function deliverWake(root, eventId, {
       delivered: false,
     };
   }
+  const preDeliveryBinding = refreshCodexSessionBinding(root, refreshOptions);
+  const preDeliveryFence = validateDeliveryFence(
+    root,
+    eventId,
+    deliveryFence,
+    dispatcher,
+    activationOwner,
+  );
+  const preDeliveryBindingReady = preDeliveryBinding.valid
+    && preDeliveryBinding.supported
+    && !preDeliveryBinding.refresh_error;
+  if (!preDeliveryBindingReady || !preDeliveryFence.current) {
+    updateActivationDecision(
+      root,
+      claim.decision,
+      'TRANSPORT_NOT_STARTED',
+      preDeliveryBindingReady ? preDeliveryFence.reason : 'live session binding refresh unproven',
+    );
+    releaseActivationLease(root, lease);
+    return {
+      classification: 'queued',
+      reason: preDeliveryBindingReady
+        ? preDeliveryFence.reason
+        : 'codex-session-binding-refresh-unproven',
+      binding_status: preDeliveryBinding,
+      event_id: eventId,
+      delivered: false,
+      replayed: false,
+    };
+  }
   try {
     const committed = transport.resume({
-      session_id: bindingStatus.binding.codex_session_uuid,
+      session_id: preDeliveryBinding.binding.codex_session_uuid,
       event_id: eventId,
       generation: supervisor.generation,
       message,
-      binding: bindingStatus.binding,
+      binding: preDeliveryBinding.binding,
       transport_attempt_id: transportAttemptId,
       transport_attempt_path: transportEvidencePath,
     });
@@ -1779,22 +2486,6 @@ export function deliverWake(root, eventId, {
           : 'supported-native-session-transport',
         receipt: readJson(existingPath),
         delivered: true,
-        transport_attempt_id: transportAttemptId,
-      };
-    }
-    if (['busy', 'rejected'].includes(committed?.classification)) {
-      updateActivationDecision(root, claim.decision, 'BUSY', committed.reason);
-      releaseActivationLease(root, lease);
-      emit(root, 'HOST_WAKE_DEFERRED', {
-        source_event_id: eventId,
-        classification: committed.classification,
-        reason: committed.reason,
-      });
-      return {
-        classification: committed.classification,
-        reason: committed.reason,
-        delivered: false,
-        replayed: false,
         transport_attempt_id: transportAttemptId,
       };
     }
@@ -1912,6 +2603,7 @@ export function deliverWake(root, eventId, {
       eventId,
       deliveryFence,
       dispatcher,
+      activationOwner,
     );
     const leaseFenceCurrent = decisionFenceCurrent(root, lease, {
       nowMs: getActivationNowMs(),
@@ -1953,30 +2645,153 @@ export function deliverWake(root, eventId, {
   return commitDeliveredReceipt(root, request, receipt);
 }
 
-export function consumeWakeDelivery(root, eventId, { deliveryId, generation }) {
-  const request = readOptional(requestPath(root, eventId));
+export function consumeWakeDelivery(root, eventId, { deliveryId = null, generation }) {
+  const wakePathsForRead = wakePaths(root);
+  const exactRequestPath = join(wakePathsForRead.requests, `${eventId}.json`);
+  const exactReceiptPath = join(wakePathsForRead.deliveries, `${eventId}.json`);
+  const request = readOptional(exactRequestPath);
   if (!request) return null;
-  const receipt = readJson(receiptPath(root, eventId));
+  const receipt = readJson(exactReceiptPath);
   const supervisor = readJson(paths(root).supervisor);
-  const wake = directories(root);
-  if (receipt.status === 'CONSUMED') {
-    const busy = readOptional(wake.busy);
-    if (busy?.delivery_id === receipt.delivery_id) removeIfPresent(wake.busy);
-    return { duplicate: true, receipt };
+  const bindingPath = wakePathsForRead.sessionBinding;
+  const binding = readOptional(bindingPath);
+  const decision = readOptional(activationDecisionPath(root, eventId));
+  let bindingValid = true;
+  try { validateSessionBindingShape(binding); } catch { bindingValid = false; }
+  if (receipt.schema !== DELIVERY_SCHEMA || !['DELIVERED', 'CONSUMED'].includes(receipt.status)) {
+    throw new Error('wake delivery is not durably delivered');
   }
-  if (receipt.status !== 'DELIVERED') throw new Error('wake delivery is not durably delivered');
-  if (receipt.delivery_id !== deliveryId) throw new Error('wake delivery identity mismatch');
+  if (supervisor.repository !== root
+      || request.target?.repository !== supervisor.repository
+      || receipt.repository !== supervisor.repository
+      || !bindingValid
+      || binding.repository_realpath !== realpathSync(root)) {
+    throw new Error('wake delivery repository identity mismatch');
+  }
+  if (request.event_id !== eventId || receipt.event_id !== eventId) {
+    throw new Error('wake delivery event identity mismatch');
+  }
+  if (typeof deliveryId !== 'string' || !deliveryId) {
+    throw new Error('wake consumption requires exact delivery identity');
+  }
+  const exactDeliveryId = deliveryId;
+  if (receipt.delivery_id !== exactDeliveryId) throw new Error('wake delivery identity mismatch');
   if (Number(generation) !== receipt.supervisor_generation
       || receipt.supervisor_generation !== supervisor.generation
       || request.target.supervisor_generation !== supervisor.generation) {
     throw new Error('stale supervisor generation cannot consume wake event');
   }
-  receipt.status = 'CONSUMED';
-  receipt.consumed_at = now();
-  writeJson(receiptPath(root, eventId), receipt);
+  if (receipt.supervisor_id !== supervisor.supervisor_id
+      || request.target.supervisor_id !== supervisor.supervisor_id
+      || binding.supervisor_id !== supervisor.supervisor_id) {
+    throw new Error('wrong supervisor identity cannot consume wake event');
+  }
+  if (binding.supervisor_generation !== supervisor.generation) {
+    throw new Error('stale session binding cannot consume wake event');
+  }
+  if (receipt.queue_version !== request.queue_version
+      || receipt.dispatcher_implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
+      || receipt.codex_session_binding_sha256 !== fileSha256(bindingPath)
+      || receipt.codex_session_uuid !== binding.codex_session_uuid
+      || receipt.host_kind !== binding.host.kind
+      || receipt.native_transport !== binding.native_wake.transport) {
+    throw new Error('wake delivery implementation or session fence mismatch');
+  }
+  if (decision?.schema !== ACTIVATION_DECISION_SCHEMA
+      || decision.status !== 'DELIVERED'
+      || decision.event_id !== eventId
+      || decision.delivery_id !== receipt.delivery_id
+      || decision.supervisor_id !== supervisor.supervisor_id
+      || decision.supervisor_generation !== supervisor.generation
+      || decision.decision_id !== receipt.activation_decision_id
+      || decision.lease_id !== receipt.activation_lease_id
+      || decision.fencing_token !== receipt.activation_fencing_token
+      || decision.transport_attempt_id !== receipt.transport_attempt_id
+      || decision.message_sha256 !== receipt.message_sha256) {
+    throw new Error('wake delivery receipt fence mismatch');
+  }
+  const wake = directories(root);
+  const consumption = {
+    schema: WAKE_CONSUMPTION_SCHEMA,
+    consumption_id: `wake-consumption-${sha256(canonicalJson({
+      repository: supervisor.repository,
+      event_id: eventId,
+      delivery_id: exactDeliveryId,
+      supervisor_id: supervisor.supervisor_id,
+      supervisor_generation: supervisor.generation,
+      codex_session_binding_sha256: receipt.codex_session_binding_sha256,
+      dispatcher_implementation_sha256: receipt.dispatcher_implementation_sha256,
+      delivery_receipt_fence_sha256: deliveryReceiptFence(receipt),
+    }))}`,
+    event_id: eventId,
+    task_id: request.task_id,
+    attempt_id: request.attempt_id,
+    delivery_id: receipt.delivery_id,
+    repository: supervisor.repository,
+    supervisor_id: supervisor.supervisor_id,
+    supervisor_generation: supervisor.generation,
+    codex_session_binding_sha256: receipt.codex_session_binding_sha256,
+    dispatcher_implementation_sha256: receipt.dispatcher_implementation_sha256,
+    request_sha256: fileSha256(exactRequestPath),
+    delivery_receipt_fence_sha256: deliveryReceiptFence(receipt),
+    consumed_at: now(),
+  };
+  const path = consumptionPath(root, eventId);
+  const created = atomicCreateJson(path, consumption);
+  const durable = created ? consumption : readJson(path);
+  if (durable.schema !== WAKE_CONSUMPTION_SCHEMA
+      || durable.event_id !== eventId
+      || durable.delivery_id !== receipt.delivery_id
+      || durable.repository !== supervisor.repository
+      || durable.supervisor_id !== supervisor.supervisor_id
+      || durable.supervisor_generation !== supervisor.generation
+      || durable.codex_session_binding_sha256 !== receipt.codex_session_binding_sha256
+      || durable.dispatcher_implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
+      || durable.request_sha256 !== consumption.request_sha256
+      || durable.delivery_receipt_fence_sha256 !== consumption.delivery_receipt_fence_sha256) {
+    throw new Error('wake consumption evidence fence mismatch');
+  }
   const busy = readOptional(wake.busy);
   if (busy?.delivery_id === receipt.delivery_id) removeIfPresent(wake.busy);
-  return { duplicate: false, receipt };
+  return { duplicate: !created, receipt, consumption: durable };
+}
+
+export function wakeDeliveryConsumptionStatus(root, eventId) {
+  const receipt = readOptional(receiptPath(root, eventId));
+  if (!receipt || !['DELIVERED', 'CONSUMED'].includes(receipt.status)) {
+    return { delivered: false, consumed: false, receipt };
+  }
+  if (receipt.status === 'CONSUMED') {
+    return { delivered: true, consumed: true, legacy: true, receipt };
+  }
+  const consumption = readOptional(consumptionPath(root, eventId));
+  const request = readOptional(requestPath(root, eventId));
+  const consumed = consumption?.schema === WAKE_CONSUMPTION_SCHEMA
+    && consumption.event_id === eventId
+    && consumption.delivery_id === receipt.delivery_id
+    && consumption.repository === receipt.repository
+    && consumption.supervisor_id === receipt.supervisor_id
+    && consumption.supervisor_generation === receipt.supervisor_generation
+    && consumption.codex_session_binding_sha256 === receipt.codex_session_binding_sha256
+    && consumption.dispatcher_implementation_sha256 === receipt.dispatcher_implementation_sha256
+    && request
+    && consumption.task_id === request.task_id
+    && consumption.attempt_id === request.attempt_id
+    && consumption.request_sha256 === fileSha256(requestPath(root, eventId))
+    && consumption.delivery_receipt_fence_sha256 === deliveryReceiptFence(receipt);
+  return { delivered: true, consumed, receipt, consumption: consumed ? consumption : null };
+}
+
+export function unconsumedDeliveredWakes(root, taskId, attemptId) {
+  const wake = directories(root);
+  return readdirSync(wake.requests).filter((name) => name.endsWith('.json')).sort()
+    .map((name) => readJson(join(wake.requests, name)))
+    .filter((request) => request.task_id === taskId && request.attempt_id === attemptId)
+    .filter((request) => {
+      const status = wakeDeliveryConsumptionStatus(root, request.event_id);
+      return status.delivered && !status.consumed;
+    })
+    .map((request) => request.event_id);
 }
 
 export function wakeQueueStatus(root, {
@@ -1987,18 +2802,21 @@ export function wakeQueueStatus(root, {
   const supervisor = readJson(paths(root).supervisor);
   const busy = readOptional(wake.busy);
   const dispatcher = readOptional(wake.dispatcher);
-  const dispatcherCurrent = dispatcher?.schema === DISPATCHER_SCHEMA
-    && ['LAUNCHED', 'OWNED'].includes(dispatcher.status)
-    && dispatcher.supervisor_id === supervisor.supervisor_id
-    && dispatcher.supervisor_generation === supervisor.generation
-    && sameProcess(dispatcher.process, getProcessIdentity(dispatcher.process?.pid));
-  const bindingStatus = codexSessionBindingStatus(root, { dependencies: bindingDependencies });
+  const dispatcherCurrent = dispatcherIsCurrent(dispatcher, supervisor, getProcessIdentity);
+  const implementationFence = {
+    expected_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+    observed_sha256: dispatcher?.implementation_sha256 ?? null,
+    current: dispatcher?.implementation_sha256 === WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+  };
+  const bindingStatus = refreshCodexSessionBinding(root, { dependencies: bindingDependencies });
   const requests = readdirSync(wake.requests).filter((name) => name.endsWith('.json')).sort().map((name) => {
     const request = readJson(join(wake.requests, name));
-    const authoritative = request.target?.supervisor_id === supervisor.supervisor_id
+    const authoritative = request.target?.repository === supervisor.repository
+      && request.target?.supervisor_id === supervisor.supervisor_id
       && request.target?.supervisor_generation === supervisor.generation;
     const receipt = readOptional(receiptPath(root, request.event_id));
     if (receipt) {
+      const consumption = wakeDeliveryConsumptionStatus(root, request.event_id);
       return {
         event_id: request.event_id,
         terminal_type: request.terminal_type,
@@ -2006,9 +2824,13 @@ export function wakeQueueStatus(root, {
         attempt_id: request.attempt_id,
         queued_at: request.queued_at,
         authoritative,
-        classification: ['DELIVERED', 'CONSUMED'].includes(receipt.status) ? 'duplicate' : 'queued',
-        reason: receipt.status,
+        classification: consumption.consumed
+          ? 'duplicate'
+          : (['DELIVERED', 'CONSUMED'].includes(receipt.status) ? 'awaiting-consumption' : 'queued'),
+        reason: consumption.consumed ? 'CONSUMED' : receipt.status,
         receipt,
+        delivery_receipt_fence_sha256: deliveryReceiptFence(receipt),
+        consumption: consumption.consumption ?? null,
       };
     }
     const lifecycle = classifyQueuedWake(root, request, supervisor);
@@ -2042,7 +2864,11 @@ export function wakeQueueStatus(root, {
   });
   return {
     supervisor_generation: supervisor.generation,
-    dispatcher: dispatcher ? { ...dispatcher, current: dispatcherCurrent } : null,
+    dispatcher: dispatcher ? {
+      ...dispatcher,
+      current: dispatcherCurrent,
+      implementation_fence: implementationFence,
+    } : null,
     session_binding: bindingStatus,
     busy,
     requests,
@@ -2068,9 +2894,28 @@ export function drainWakeQueue(root, options = {}) {
     });
 }
 
-function dispatcherIsCurrent(record, supervisor, getProcessIdentity, statuses = ['LAUNCHED', 'OWNED']) {
+function dispatcherIsCurrent(
+  record,
+  supervisor,
+  getProcessIdentity,
+  statuses = ['LAUNCHED', 'OWNED'],
+  implementationSha256 = WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+) {
+  const releaseCurrent = record?.release_fence == null
+    ? record?.implementation_sha256 === implementationSha256
+    : (() => {
+      try {
+        assertReleaseFence(record.release_fence, {
+          role: 'wake-delivery',
+          processIdentity: getProcessIdentity(record.process?.pid),
+        });
+        return true;
+      } catch { return false; }
+    })();
   return record?.schema === DISPATCHER_SCHEMA
     && statuses.includes(record.status)
+    && record.implementation_sha256 === implementationSha256
+    && releaseCurrent
     && record.supervisor_id === supervisor.supervisor_id
     && record.supervisor_generation === supervisor.generation
     && sameProcess(record.process, getProcessIdentity(record.process?.pid));
@@ -2094,12 +2939,19 @@ function acquireDispatcherLaunchLock(path, getProcessIdentity) {
 export function ensureWakeDispatcher(root, {
   spawnProcess = spawn,
   getProcessIdentity = processIdentity,
-  dispatcherScript = fileURLToPath(new URL('../bin/opsle-wake-delivery.js', import.meta.url)),
+  dispatcherScript = DEFAULT_DISPATCHER_SCRIPT,
+  implementationSha256 = WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
 } = {}) {
   const wake = directories(root);
   const supervisor = readJson(paths(root).supervisor);
   let existing = readOptional(wake.dispatcher);
-  if (dispatcherIsCurrent(existing, supervisor, getProcessIdentity)) {
+  if (dispatcherIsCurrent(
+    existing,
+    supervisor,
+    getProcessIdentity,
+    undefined,
+    implementationSha256,
+  )) {
     return { started: false, reason: 'current-dispatcher-already-live', dispatcher: existing };
   }
   const lock = acquireDispatcherLaunchLock(wake.dispatcherLock, getProcessIdentity);
@@ -2108,13 +2960,22 @@ export function ensureWakeDispatcher(root, {
   }
   try {
     existing = readOptional(wake.dispatcher);
-    if (dispatcherIsCurrent(existing, supervisor, getProcessIdentity)) {
+    if (dispatcherIsCurrent(
+      existing,
+      supervisor,
+      getProcessIdentity,
+      undefined,
+      implementationSha256,
+    )) {
       return { started: false, reason: 'current-dispatcher-already-live', dispatcher: existing };
     }
     const record = {
       schema: DISPATCHER_SCHEMA,
       dispatcher_id: id('wake-dispatcher'),
       dispatcher_generation: (Number(existing?.dispatcher_generation) || 0) + 1,
+      implementation_sha256: implementationSha256,
+      expected_release: releaseIdentity('wake-delivery'),
+      release_fence: null,
       supervisor_id: supervisor.supervisor_id,
       supervisor_generation: supervisor.generation,
       queue_generation: supervisor.generation,
@@ -2139,6 +3000,7 @@ export function ensureWakeDispatcher(root, {
       if (!Number.isSafeInteger(child.pid)) throw new Error('dispatcher did not receive a process ID');
       record.process = getProcessIdentity(child.pid);
       if (!record.process) throw new Error('dispatcher process-start identity was unavailable');
+      record.release_fence = createReleaseFence('wake-delivery', record.process);
       record.status = 'LAUNCHED';
       writeJson(wake.dispatcher, record);
       child.unref?.();
@@ -2306,8 +3168,17 @@ export async function runWakeDispatcher(root, {
     await delay(10);
   }
   const supervisor = readJson(paths(root).supervisor);
+  try {
+    assertReleaseFence(record.release_fence, {
+      role: 'wake-delivery',
+      processIdentity: processRecord,
+    });
+  } catch {
+    return { status: 'STALE', reason: 'dispatcher-runtime-release-fence-mismatch' };
+  }
   if (record.schema !== DISPATCHER_SCHEMA
       || record.status !== 'LAUNCHED'
+      || record.implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
       || record.dispatcher_id !== dispatcherId
       || record.dispatcher_generation !== dispatcherGeneration
       || record.launch_nonce !== launchNonce
@@ -2404,14 +3275,6 @@ export async function runWakeDispatcher(root, {
       try { signal = await opportunity.wait(); } finally { opportunity.close(); }
       if (signal.type !== 'bound-rollout-state-change') {
         return { status: 'OWNED', reason: 'late-confirmation-observation-unavailable', results };
-      }
-      continue;
-    }
-    if (results.some((result) => result.classification === 'busy')) {
-      let signal;
-      try { signal = await opportunity.wait(); } finally { opportunity.close(); }
-      if (signal.type !== 'bound-rollout-state-change') {
-        return { status: 'OWNED', reason: 'bound-rollout-observation-unavailable', results };
       }
       continue;
     }

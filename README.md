@@ -11,10 +11,11 @@ production service or a published installable package.
 ## Durable does not mean continuously inferring
 
 The supervisor may remain available in a terminal or tmux session, but an open
-session does not imply a running model turn. `task run` now defaults to a
-detached repository-local Runner worker. The command returns after durable
-worker ownership is established, while the supervisor remains logically
-`DORMANT`. The worker owns the child, heartbeat, timeout, evidence, verification,
+session does not imply a running model turn. `task run` now writes an immutable
+repository-local Runner request. The command returns after durable
+request publication; the host opsled validates that exact request and launches
+the transient Runner. Once worker ownership is established, the supervisor is
+logically `DORMANT`. The worker owns the child, heartbeat, timeout, evidence, verification,
 Context Firewall packet, Acceptance, terminal event, claim release, and wake
 queue. `--foreground-wait` is an explicit compatibility fallback.
 
@@ -27,30 +28,38 @@ remain separate: an exact failed worker can coexist with an unknown child.
 
 Only terminal completion, failure, timeout/stall, or intervention can enter the
 wake queue. Heartbeats, wrapper yields, timeouts, and nonterminal returns remain
-ineligible. A persistent detached provider-free dispatcher watches the durable
-queue independently of Runner and supervisor turns. It registers filesystem
-observation before every receipt-free queue check, so an event cannot be lost
-between the empty decision and watcher registration.
+ineligible. One host-level `opsled` scans every registered repository's durable
+queue independently of Runner and supervisor turns. Requests remain immutable
+and receipt-free until confirmed delivery, so service restart or a request
+arriving between scans cannot lose the wake.
 
-Automatic delivery fails closed unless `codex-session-binding/v2` proves the
-exact repository, supervisor generation, Codex UUID, rollout `session_meta` and
-inode, installed CLI, UID, authoritative Herdr process/workspace/pane/terminal,
-and absence of the old authoritative tmux session. The canonical transport is
-plain `codex resume SESSION_ID MESSAGE` in a temporary process group. A
-repository-local PTY launcher keeps that frontend alive only until the bound
+Automatic delivery fails closed unless the ephemeral
+`codex-session-binding/v3` current pointer proves the exact repository,
+supervisor generation, Codex session/thread UUID, rollout `session_meta` and
+inode, installed CLI, UID, authoritative Herdr frontend
+process/workspace/pane/terminal, and absence of concurrent tmux authority.
+Status, liveness, reconstruction, and dispatch refresh that pointer from two
+consistent read-only Herdr snapshots, exact pane-process facts, and the unique
+Codex rollout. Replacement is atomic and prior pointers remain immutable. An
+unprovable refresh installs an `INVALID` pointer with no usable session,
+rollout, or host values. The canonical transport is
+plain `codex resume SESSION_ID MESSAGE` in a temporary process group. Opsled
+submits immediately even while the bound session has an active turn; Codex owns
+that short-term serialization. The PTY launcher keeps the frontend alive until the bound
 rollout contains one exact accepted message and its matching turn-began record.
 It then terminates the temporary group and proves no new matching frontend
 remains. Normal dispatch never calls tmux input or a Herdr prompt primitive.
 
-Before any supported native send, a provider-free activation lease fences the
-supervisor generation, dispatcher/process, event, expiry, and monotonic token.
-An atomic per-event activation decision is the exactly-once boundary. Live PTY
-stdout and stderr classify a resume rejected before rollout acceptance as busy;
-it remains queued and may be reclaimed only after the already-registered watcher
-observes an append to that exact bound rollout. Any outcome uncertain after
-spawn is durably `UNCERTAIN` and is never automatically replayed. The transmitted
+Before any supported native send, an opsled-owned activation lease fences the
+supervisor generation, service/process, event, expiry, and monotonic token.
+An atomic per-event activation decision is the exactly-once boundary. A busy
+supervisor is not a delivery gate. Stale or rejected sessions fail closed, and
+any outcome uncertain after spawn is durably `UNCERTAIN` and is never
+automatically replayed. The transmitted
 message contains only event ID, generation, and an instruction to read durable
-state. Historical wake request bytes are immutable. Stale-generation and
+state. A delivered terminal wake has separate immutable, delivery- and
+generation-fenced consumption evidence, and task evaluation is blocked until
+it is consumed. Historical wake request and delivery bytes are immutable. Stale-generation and
 already-evaluated requests are classified obsolete rather than adopted.
 
 Herdr is the authoritative host, but the Herdr adapter remains read-only: it
@@ -127,9 +136,14 @@ The boundaries are deliberate:
 - Exact failed-worker reconciliation is generation- and fence-gated, commits the
   Runner failure while preserving an unknown child outcome, then idempotently
   releases the claim as `FAILED`; it never relaunches the rejected task.
+- Requirement-aware task creation, evaluation, recovery, status, reconstruction,
+  cutover, and next-action derivation share one effective-requirements boundary.
+  Bootstrap authority is only `matrix` or `none`: a matrix is validated and used
+  generically, while `none` leaves any retained historical matrix inert.
 - The Context Firewall keeps raw artifacts out of the normal return path and
   emits a bounded, provenance-linked packet. Raw evidence remains available
   for targeted escalation.
+- Context Firewall reduction is mandatory Runner behavior, not a policy option.
 - Child exit, verification, Acceptance, and the supervisor's objective-level
   decision are separate states. A successful process exit is not correctness.
 - Humans can inspect status without model inference, pause future progression,
@@ -151,9 +165,47 @@ npm test
 ```
 
 The package is currently private and has no supported cross-repository
-installer. `opsle init` is for a prepared repository that already contains the
-V0.1 specification and requirements matrix; it fails closed if an authoritative
-supervisor already exists.
+installer. When the CLI is available, `opsle init` initializes an ordinary Git
+repository without changing tracked project content or copying this repository.
+It records neutral `none` requirements authority and does not invent a
+requirement matrix or objective. Use `opsle init --objective TEXT` to record an
+initial objective explicitly. Pre-seeded specification/matrix repositories keep
+generic `matrix` semantics. Initialization
+fails closed if an authoritative supervisor already exists.
+
+`opsle --version` works outside initialized repositories. It reports the short
+package version, immutable runtime release ID, complete normalized package
+artifact SHA-256, and source/build revision when known. Every CLI and detached
+helper verifies `release-manifest.json`, the complete declared package payload,
+and every helper entrypoint digest before acting.
+
+## Runtime identity boundary
+
+Process identity is exactly PID plus process start ticks plus executable path;
+PID alone never proves a live owner. Content and release identity use the
+immutable complete packaged-artifact SHA-256 rather than a mutable path, version
+label, generation, nonce, lease, or fencing token. New host coordination must
+reuse the race-safe host lock and may add another ownership identifier only when
+a named concurrent writer and a proof that these identities are insufficient
+exist.
+
+Registry, service lifecycle, and the bounded future-upgrade primitive use one
+host lock. Its owner record contains exact process identity, stale takeover is
+an atomic rename, retries are bounded, and cleanup verifies the owner before
+removal. `opsled upgrade --release PATH` verifies and installs the complete
+artifact under its digest, stops the exact current service, inventories
+transient processes per repository, runs the target release's real repository
+migrations, switches the managed pointer, and starts that installed release.
+When a managed service conflicts with an invoking release, `UPGRADE_REQUIRED`
+reports distinct managed/current and invoking roots and artifact digests,
+including conflicts between builds with the same semantic version.
+
+Detached Runner and wake helpers carry a release fence over release ID,
+complete artifact digest, runtime epoch, helper role, and exact helper
+PID/start/executable identity. The wake fence retains the prior implementation
+hash as an additional historical and transition check. A superseded or
+mismatched helper retires before ownership, child launch, delivery, or durable
+mutation.
 
 ## Operate and recover
 
@@ -164,6 +216,10 @@ emits the canonical bounded model-facing reconstruction. A genuine new
 activation uses `resume-packet generate --recover`, reconciling first without
 exposing broad recovery output. The path does not replay chat history, ingest
 append-only logs or raw evidence, or silently retry uncertain work.
+Complete packets carry a semantic freshness fence over decision-relevant
+objective, task, decision, pause, unresolved/wake, policy, generation, and
+session authority. A stale cache is replaced and returned from the fresh packet
+already computed by that validation pass; telemetry-only timestamps are ignored.
 
 ## Self-hosting evidence
 
@@ -191,20 +247,47 @@ related Opsle sibling repositories, but this repository does not import their
 implementations.
 
 Affected Verification is `advisory_only` and did not authorize reduced testing.
-Semantic Edit, an external wakeup service, continuous trajectory
-ingestion, multi-repository supervision, distributed locking, a scheduler, a
-web UI, and production deployment are deferred. Codex is enabled in the
-recorded policy; Claude and independent review remained disabled.
+Semantic Edit, continuous trajectory ingestion, distributed locking, a scheduler, a
+web UI, and production deployment are deferred. Codex and Claude configured
+availability, model, reasoning effort, and review mode remain repository-local.
+Gearbox reads that configuration and executable discovery directly without
+persisting derived eligibility or rejection layers.
 
-The dispatcher is repository-local and single-host. Its durable record fences
-dispatcher ID/generation, supervisor ID/generation, exact PID/start/executable,
-and each request queue version. Recovery supersedes stale ownership, starts one
-current dispatcher, and leaves prior-generation requests immutable and obsolete.
+`opsled` is a repository-shipped implementation of a single host service. Its
+atomic host registry has exactly one mapping per repository realpath and stores
+only operational paths and identifiers. Registration writes the repository's
+single host-ownership pointer, including its Herdr workspace/pane and current
+session-binding pointer. The service and helpers fence release
+ID, complete artifact digest, runtime epoch, role, and PID/start/executable
+before repository state access. A stopped or upgraded service leaves each
+repository's queued requests intact for restart-safe replay. Repository
+supervisors and Runner workers enqueue terminal requests but never keep wake
+infrastructure alive. Blocking wake transports are transient opsled workers, so
+one repository cannot block another. The old repository dispatcher command
+remains an explicit compatibility surface.
+Delivery commitment and consumption recheck the complete ownership vector:
+repository, event, delivery and activation fence, supervisor identity and
+generation, current session/host binding, queue version, opsled owner, and wake
+implementation hash. Rejected consumption leaves all durable bytes unchanged.
+`wake status --json` and verbose wake diagnostics expose the expected and
+observed implementation hashes and their currentness; concise status reports
+only whether the dispatcher as a whole is current.
 
-The repository-local transport is deterministically covered for binding,
-rollout confirmation, cleanup, busy, uncertainty, fencing, idempotency, and
-pause-after-current ordering. A live binding must still be created explicitly;
-the intentionally stale v1 record is not adopted or rewritten automatically.
+The repository-local transport is deterministically covered for binding refresh,
+rollout confirmation, cleanup, busy-session queueing, uncertainty, fencing, idempotency, and
+pause-after-current ordering. Legacy v2 bindings migrate deterministically on
+the first exact refresh; frontend replacement does not create a supervisor
+identity or advance its generation.
+
+Host setup remains explicit and local; no permanent service is installed:
+
+```sh
+./bin/opsled.js register /path/to/repository
+./bin/opsled.js start
+./bin/opsled.js status
+./bin/opsled.js status --verbose
+./bin/opsled.js status --json
+```
 
 ## License
 

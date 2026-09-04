@@ -20,7 +20,7 @@ import {
   createTask,
   routeTask,
 } from '../src/pipeline.js';
-import { canonicalJson, readJson } from '../src/io.js';
+import { canonicalJson, fileSha256, readJson, sha256, writeJson } from '../src/io.js';
 import {
   emit,
   initialize,
@@ -35,6 +35,7 @@ import {
   validateContextPacketMeasurement,
 } from '../src/runner.js';
 import { profileCodexActivations } from '../src/activation-telemetry.js';
+import { WAKE_DISPATCHER_IMPLEMENTATION_SHA256 } from '../src/wakeup.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 const cliPath = join(sourceRoot, 'bin', 'opsle.js');
@@ -55,7 +56,7 @@ function fixture() {
   mkdirSync(join(root, '.opsle'));
   cpSync(join(sourceRoot, '.opsle', 'specification.md'), join(root, '.opsle', 'specification.md'));
   cpSync(join(sourceRoot, '.opsle', 'requirements.json'), join(root, '.opsle', 'requirements.json'));
-  initialize(root, { actor: 'operator-controls-test' });
+  initialize(root, { actor: 'operator-controls-test', objectiveText: 'Exercise operator controls.' });
   return root;
 }
 
@@ -329,6 +330,132 @@ test('accepted task cannot recreate an automatic next action after terminal comp
   }
 });
 
+test('task evaluation fails closed until its delivered terminal wake is explicitly consumed', async () => {
+  const root = fixture();
+  try {
+    const p = paths(root);
+    const task = createTask(root, handoff('task-consume-before-evaluate', { requirement_ids: [] }));
+    const decision = routeTask(root, task);
+    const { attempt, claim } = createAttempt(root, task, decision);
+    const completed = await runAttempt(root, task, attempt, claim);
+    const eventId = completed.completion_event.event_id;
+    const supervisor = readJson(p.supervisor);
+    const deliveryId = 'delivery-consume-before-evaluate';
+    const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
+    const bindingPath = join(p.opsle, 'wake', 'codex-session-binding.json');
+    writeJson(bindingPath, {
+      schema: 'opsle.durable-supervisor.codex-session-binding/v3',
+      state: 'CURRENT',
+      binding_id: 'binding-consume-before-evaluate',
+      binding_revision: 1,
+      repository_realpath: root,
+      supervisor_id: supervisor.supervisor_id,
+      supervisor_generation: supervisor.generation,
+      codex_session_uuid: sessionId,
+      codex_thread_uuid: sessionId,
+      rollout: {
+        realpath: join(root, 'rollout.jsonl'), device: 1, inode: 1,
+        bound_size_bytes: 1, session_meta_line: 1,
+        session_meta_session_id: sessionId,
+        session_meta_repository_realpath: root,
+        session_meta_line_sha256: 'a'.repeat(64),
+        session_meta_payload_sha256: 'b'.repeat(64),
+      },
+      sessions_root_realpath: root,
+      codex_cli_version: 'codex-cli fixture',
+      uid: 1000,
+      host: {
+        kind: 'herdr', authority: 'authoritative', workspace_id: 'workspace-fixture',
+        workspace_cwd: root, pane_id: 'pane-fixture', terminal_id: 'terminal-fixture',
+        process: {
+          pid: 700, start_time_ticks: '7000', executable: '/opt/codex', uid: 1000,
+          tty: '/dev/pts/7', command_line_sha256: 'c'.repeat(64),
+        },
+      },
+      authority_fence: { legacy_tmux_session: null },
+      native_wake: {
+        supported: true, transport: 'plain-codex-resume',
+        confirmation: 'bound-rollout-exact-message-and-turn-began', reason: null,
+      },
+      supersedes_binding_sha256: null,
+      bound_at: '2026-09-03T00:00:00.000Z',
+    });
+    const messageSha256 = sha256(`wake:${eventId}`);
+    const activation = {
+      schema: 'opsle.durable-supervisor.activation-decision/v1',
+      decision_id: 'activation-consume-before-evaluate',
+      event_id: eventId,
+      supervisor_id: supervisor.supervisor_id,
+      supervisor_generation: supervisor.generation,
+      lease_id: 'lease-consume-before-evaluate',
+      fencing_token: 1,
+      message_sha256: messageSha256,
+      transport_attempt_id: 'transport-consume-before-evaluate',
+      delivery_id: deliveryId,
+      status: 'DELIVERED',
+    };
+    writeJson(join(p.opsle, 'wake', 'activation-decisions', `${eventId}.json`), activation);
+    writeJson(join(p.opsle, 'wake', 'requests', `${eventId}.json`), {
+      schema: 'opsle.durable-supervisor.native-wake-request/v2',
+      event_id: eventId,
+      terminal_type: completed.completion_event.terminal_type,
+      task_id: task.task_id,
+      attempt_id: attempt.attempt_id,
+      target: {
+        repository: root,
+        supervisor_id: supervisor.supervisor_id,
+        supervisor_generation: supervisor.generation,
+      },
+      queue_version: 1,
+    });
+    writeJson(join(p.opsle, 'wake', 'deliveries', `${eventId}.json`), {
+      schema: 'opsle.durable-supervisor.host-wake-delivery/v1',
+      repository: root,
+      delivery_id: deliveryId,
+      event_id: eventId,
+      queue_version: 1,
+      supervisor_id: supervisor.supervisor_id,
+      supervisor_generation: supervisor.generation,
+      dispatcher_id: null,
+      dispatcher_generation: null,
+      dispatcher_implementation_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+      activation_lease_id: activation.lease_id,
+      activation_fencing_token: activation.fencing_token,
+      activation_decision_id: activation.decision_id,
+      codex_session_binding_sha256: fileSha256(bindingPath),
+      host_kind: 'herdr',
+      native_transport: 'plain-codex-resume',
+      codex_session_uuid: sessionId,
+      message_sha256: messageSha256,
+      transport_attempt_id: activation.transport_attempt_id,
+      status: 'DELIVERED',
+      delivered_at: '2026-09-03T00:00:00.000Z',
+    });
+
+    const blocked = await runCli(root, [
+      'task', 'evaluate', task.task_id,
+      '--accept', '--rationale', 'must not bypass consumption',
+    ]);
+    assert.equal(blocked.code, 1);
+    assert.match(blocked.stderr, /delivered terminal wake must be consumed/);
+
+    const consumed = await runCli(root, [
+      'events', 'consume', eventId,
+      '--delivery', deliveryId,
+      '--generation', String(supervisor.generation),
+    ]);
+    assert.equal(consumed.code, 0, consumed.stderr);
+    const evaluated = await runCli(root, [
+      'task', 'evaluate', task.task_id,
+      '--accept', '--rationale', 'delivery consumption is now durable',
+    ]);
+    assert.equal(evaluated.code, 0, evaluated.stderr);
+    assert.equal(readJson(join(p.tasks, `${task.task_id}.json`)).state, 'ACCEPTED');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('pause after current evaluates and terminalizes the task before PAUSED blocks the next launch', async () => {
   const root = fixture();
   try {
@@ -561,7 +688,12 @@ test('operator status commands separate concise, verbose, and JSON output', asyn
     const concise = await runCli(root, ['status']);
     assert.equal(concise.code, 0, concise.stderr);
     assert.ok(concise.stdout.trim().split('\n').length <= 10, concise.stdout);
-    assert.match(concise.stdout, /^Supervisor: READY/m);
+    assert.match(concise.stdout, /^Lifecycle: Active — objective r1/m);
+    assert.match(concise.stdout, /^Pause: clear/m);
+    assert.match(concise.stdout, /^Work: none/m);
+    assert.match(concise.stdout, /^Wake: clear/m);
+    assert.match(concise.stdout, /^Herdr: unbound/m);
+    assert.match(concise.stdout, /^Next: /m);
     assert.doesNotMatch(concise.stdout, /Repository:|Tmux fallback:/);
     assert.doesNotMatch(concise.stdout, /^\s*\{/);
 
@@ -575,7 +707,7 @@ test('operator status commands separate concise, verbose, and JSON output', asyn
     assert.equal(structured.code, 0, structured.stderr);
     const statusValue = JSON.parse(structured.stdout);
     assert.equal(statusValue.supervisor.repository, root);
-    assert.equal(statusValue.operator_state.supervisor, 'READY');
+    assert.equal(statusValue.operator_state.supervisor, 'ATTENTION');
     assert.equal(statusValue.session_binding.classification, 'unbound');
 
     const policy = readJson(paths(root).policy);

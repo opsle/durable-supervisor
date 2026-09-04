@@ -54,12 +54,12 @@ function fixture() {
   mkdirSync(join(root, '.opsle'));
   cpSync(join(sourceRoot, '.opsle', 'specification.md'), join(root, '.opsle', 'specification.md'));
   cpSync(join(sourceRoot, '.opsle', 'requirements.json'), join(root, '.opsle', 'requirements.json'));
-  initialize(root, { actor: 'claim-fencing-test' });
+  initialize(root, { actor: 'claim-fencing-test', objectiveText: 'Exercise claim fencing.' });
   return root;
 }
 
-function claimTask(taskId) {
-  return { task_id: taskId };
+function claimTask(root, taskId) {
+  return createTask(root, handoff(taskId));
 }
 
 function indexedClaim(root, taskId) {
@@ -145,7 +145,7 @@ function handoff(taskId) {
 test('stale and exact idempotent release cannot replace a newer authoritative claim', () => {
   const root = fixture();
   try {
-    const task = claimTask('task-stale-release');
+    const task = claimTask(root, 'task-stale-release');
     const first = acquireClaim(root, task, 'attempt-001');
     const firstReleased = releaseClaim(root, first, 'FAILED');
     const firstHistoryBeforeReplay = readFileSync(join(paths(root).claims, `${first.claim_id}.json`));
@@ -176,7 +176,7 @@ test('stale and exact idempotent release cannot replace a newer authoritative cl
 test('release with the exact claim ID but wrong fence fails without mutation', () => {
   const root = fixture();
   try {
-    const task = claimTask('task-wrong-fence');
+    const task = claimTask(root, 'task-wrong-fence');
     const claim = acquireClaim(root, task, 'attempt-001');
     const historyBefore = readFileSync(join(paths(root).claims, `${claim.claim_id}.json`));
     const indexBefore = readFileSync(join(paths(root).claims, 'index.json'));
@@ -197,7 +197,7 @@ test('release with the exact claim ID but wrong fence fails without mutation', (
 test('competing acquisitions yield one ACTIVE authority and duplicate_active_claims=false', async () => {
   const root = fixture();
   try {
-    const task = claimTask('task-competing-acquire');
+    const task = claimTask(root, 'task-competing-acquire');
     const results = await race([
       { action: 'acquire', root, task, attempt_id: 'attempt-a' },
       { action: 'acquire', root, task, attempt_id: 'attempt-b' },
@@ -228,7 +228,7 @@ test('competing acquisitions yield one ACTIVE authority and duplicate_active_cla
 test('release/acquire interleaving cannot create duplicate authority or restore stale ownership', async () => {
   const root = fixture();
   try {
-    const task = claimTask('task-release-acquire-race');
+    const task = claimTask(root, 'task-release-acquire-race');
     const first = acquireClaim(root, task, 'attempt-001');
     const [released, competing] = await race([
       { action: 'release', root, claim: first, status: 'FAILED' },

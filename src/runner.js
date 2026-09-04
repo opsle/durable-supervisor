@@ -20,10 +20,15 @@ import { releaseClaim, validateTaskCommands } from './pipeline.js';
 import {
   applyWakeEvent,
   enqueueTerminalWake,
-  ensureWakeDispatcher,
   registerWait,
   terminalWakeType,
 } from './wakeup.js';
+import {
+  assertReleaseFence,
+  createReleaseFence,
+  processStartIdentity,
+  releaseIdentity,
+} from './runtime-release.js';
 
 const CONTEXT_PACKET_SCHEMA = 'opsle.durable-supervisor.context-firewall-packet/v2';
 const BYTE_MEASUREMENT = Object.freeze({
@@ -93,6 +98,7 @@ function snapshotFiles(root) {
       if (rel.startsWith('.opsle/')) {
         const protectedAuthority = new Set([
           '.opsle/specification.md',
+          '.opsle/bootstrap.json',
           '.opsle/requirements.json',
           '.opsle/objective.json',
           '.opsle/policy.json',
@@ -276,16 +282,16 @@ export function codexLaunchSpec(root, task, attempt, {
       || decision.selected_route !== 'codex'
       || canonicalJson(decision.selected_route_config) !== canonicalJson(route)
       || decision.operator_policy_sha256 !== attempt.policy_snapshot.policy_sha256
-      || decision.permitted_capabilities?.commands?.codex?.eligible !== true
-      || !Array.isArray(attempt.policy_snapshot.allowed_providers)
-      || !attempt.policy_snapshot.allowed_providers.includes('codex')
-      || attempt.policy_snapshot.review_mode !== 'off'
-      || attempt.policy_snapshot.reviewer != null
-      || attempt.policy_snapshot.independent_review !== 'none') {
+      || decision.discovery?.commands?.codex?.available !== true
+      || attempt.policy_snapshot.providers?.codex?.enabled !== true
+      || attempt.policy_snapshot.providers.codex.model !== route.provider.model
+      || attempt.policy_snapshot.providers.codex.reasoning_effort !== route.provider.reasoning_effort
+      || attempt.policy_snapshot.review?.mode !== 'off'
+      || attempt.policy_snapshot.review?.reviewer != null) {
     throw new Error('Codex policy snapshot does not exactly authorize the selected isolated route');
   }
   if (!codexHome || !lastMessagePath) throw new Error('isolated Codex launch paths are required');
-  const command = decision.permitted_capabilities.commands.codex.path;
+  const command = decision.discovery.commands.codex.path;
   const prompt = childPrompt(task, attempt);
   const args = [
     'exec',
@@ -466,6 +472,10 @@ function contextPacket({ task, attempt, result, verification, changed, unexpecte
     : 'requires_escalation';
   const base = {
     schema: CONTEXT_PACKET_SCHEMA,
+    context_firewall: {
+      enforcement: 'mandatory',
+      output_contract: 'bounded-decision-evidence',
+    },
     task_id: task.task_id,
     attempt_id: attempt.attempt_id,
     completeness,
@@ -674,6 +684,8 @@ export async function launchDetachedAttempt(root, task, attempt, claim, {
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
     launch_nonce: launchNonce,
+    expected_release: releaseIdentity('runner-worker'),
+    release_fence: null,
     launcher_pid: process.pid,
     worker_pid: null,
     status: 'SPAWNING',
@@ -693,6 +705,9 @@ export async function launchDetachedAttempt(root, task, attempt, claim, {
     ], { cwd: root, detached: true, stdio: 'ignore' });
     if (!Number.isInteger(worker.pid)) throw new Error('detached Runner did not receive a worker PID');
     record.worker_pid = worker.pid;
+    const workerIdentity = processStartIdentity(worker.pid);
+    if (!workerIdentity) throw new Error('detached Runner process-start identity was unavailable');
+    record.release_fence = createReleaseFence('runner-worker', workerIdentity);
     record.status = 'LAUNCHED';
     writeJson(recordPath, record);
     worker.unref();
@@ -758,6 +773,7 @@ export async function runDetachedWorker(root, attemptId, launchNonce, {
       'detached Runner launch identity did not match durable record',
     );
   }
+  assertReleaseFence(record.release_fence, { role: 'runner-worker' });
   const supervisor = readJson(p.supervisor);
   if (record.supervisor_id !== supervisor.supervisor_id
       || record.supervisor_generation !== supervisor.generation) {
@@ -1082,11 +1098,7 @@ export async function runAttempt(root, task, attempt, claim, {
   let wakeDispatcher = null;
   if (detached) {
     wakeRequest = enqueueTerminalWake(root, completionEvent);
-    try {
-      wakeDispatcher = ensureWakeDispatcher(root);
-    } catch (error) {
-      wakeDispatcher = { started: false, reason: 'dispatcher-start-error', error: error.message };
-    }
+    wakeDispatcher = { started: false, reason: 'opsled-owns-persistent-wake-dispatch' };
   } else {
     emit(root, 'SUPERVISOR_ACTIVATION', {
       classification: 'terminal-event',
