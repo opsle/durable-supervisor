@@ -13,7 +13,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
-import { readJson, sha256, writeJson } from '../src/io.js';
+import { fileSha256, readJson, sha256, writeJson } from '../src/io.js';
 import {
   EVIDENCE_OUTPUT_BYTE_CEILING,
   PACKET_BYTE_CEILING,
@@ -78,8 +78,12 @@ function fixture() {
     model_polling: { permitted: false },
     affected_verification: { authority: 'advisory_only' },
   });
+  writeFileSync(join(root, '.opsle', 'specification.md'), '# Reconstruction fixture\n');
   writeJson(join(root, '.opsle', 'requirements.json'), {
     schema: 'opsle.durable-supervisor.requirements/v1',
+    specification: '.opsle/specification.md',
+    specification_sha256: fileSha256(join(root, '.opsle', 'specification.md')),
+    allowed_states: ['UNSTARTED', 'VERIFIED'],
     requirements: Array.from({ length: 101 }, (_, index) => ({
       id: `DS-${String(index).padStart(3, '0')}`,
       title: `Verified reconstruction fixture requirement ${index}`,

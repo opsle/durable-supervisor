@@ -75,7 +75,13 @@ import {
   unconsumedDeliveredWakes,
   wakeDeliveryConsumptionStatus,
   wakeQueueStatus,
+  reconcileWakeTransportNotStarted,
+  consumeReconciledTransportNotStarted,
 } from './wakeup.js';
+import {
+  compatibilityPreflight,
+  loadRuntimeRelease,
+} from './runtime-release.js';
 
 function usage() {
   return `usage: opsle COMMAND
@@ -113,6 +119,7 @@ commands:
   wake start
   wake status [--verbose|--json]
   wake drain
+  wake reconcile-transport-not-started EVENT_ID
   session bind --session UUID --rollout PATH --sessions-root PATH
     --host-pid PID --workspace-id ID --workspace-cwd PATH
     --pane-id ID --terminal-id ID [--legacy-tmux-session NAME]
@@ -139,7 +146,8 @@ function print(value) {
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 export function versionInfo({ run = spawnSync } = {}) {
-  const manifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
+  const packageManifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
+  const release = loadRuntimeRelease();
   const source = run('git', ['-C', packageRoot, 'rev-parse', '--verify', 'HEAD'], { encoding: 'utf8' });
   const sourceRevision = source.status === 0 ? source.stdout.trim() : null;
   const sourceStatus = sourceRevision
@@ -151,8 +159,11 @@ export function versionInfo({ run = spawnSync } = {}) {
   const sourceDirty = sourceStatus?.status === 0 ? sourceStatus.stdout.trim().length > 0 : null;
   const buildRevision = process.env.OPSLE_BUILD_REVISION?.trim() || null;
   return {
-    name: manifest.name,
-    version: manifest.version,
+    name: packageManifest.name,
+    version: release.version,
+    runtime_release_id: release.runtime_release_id,
+    packaged_artifact_sha256: release.packaged_artifact_sha256,
+    runtime_epoch: release.runtime_epoch,
     source_revision: sourceRevision,
     source_dirty: sourceDirty,
     build_revision: buildRevision,
@@ -164,7 +175,7 @@ function renderVersion(value) {
     value.source_revision ? `source ${value.source_revision}${value.source_dirty ? ' (dirty worktree)' : ''}` : null,
     value.build_revision ? `build ${value.build_revision}` : null,
   ].filter(Boolean).join('; ');
-  return `opsle ${value.version}${provenance ? `\n${provenance}` : ''}`;
+  return `opsle ${value.version}\nrelease ${value.runtime_release_id}\nartifact ${value.packaged_artifact_sha256}${provenance ? `\n${provenance}` : ''}`;
 }
 
 function outputMode(args) {
@@ -260,14 +271,7 @@ function updatePolicy(root, mutate, actor = 'operator-cli') {
 }
 
 function requirementsSummary(root, json) {
-  const p = paths(root);
-  const bootstrap = existsSync(p.bootstrap) ? readJson(p.bootstrap) : null;
-  const rawMatrix = existsSync(p.requirements) ? readJson(p.requirements) : null;
-  const matrix = effectiveRequirementMatrix(root, {
-    bootstrap,
-    matrix: rawMatrix,
-    state: readJson(p.state),
-  });
+  const matrix = effectiveRequirementMatrix(root);
   if (!matrix) {
     return json ? { mode: 'objective_driven', requirements: null } : 'Requirements: none (objective-driven repository)';
   }
@@ -338,13 +342,7 @@ function setObjective(root, text, actor = 'operator-cli') {
   objective.current_revision = revision.revision;
   writeJson(p.objective, objective);
   if (!state.active_task_id) {
-    const bootstrap = existsSync(p.bootstrap) ? readJson(p.bootstrap) : null;
-    const rawMatrix = existsSync(p.requirements) ? readJson(p.requirements) : null;
-    const requirementDriven = Boolean(effectiveRequirementMatrix(root, {
-      bootstrap,
-      matrix: rawMatrix,
-      state,
-    }));
+    const requirementDriven = Boolean(effectiveRequirementMatrix(root, { state }));
     updateState(root, {
       phase: state.phase === 'COMPLETE'
         ? (requirementDriven ? 'SELF_HOSTED' : 'ACTIVE')
@@ -377,7 +375,8 @@ function lifecycleWakeAttention(root, supervisor, state) {
     const attemptPath = request.attempt_id ? join(paths(root).attempts, `${request.attempt_id}.json`) : null;
     const task = taskPath && existsSync(taskPath) ? readJson(taskPath) : null;
     const attempt = attemptPath && existsSync(attemptPath) ? readJson(attemptPath) : null;
-    const authoritative = request.target?.supervisor_id === supervisor.supervisor_id
+    const authoritative = request.target?.repository === supervisor.repository
+      && request.target?.supervisor_id === supervisor.supervisor_id
       && request.target?.supervisor_generation === supervisor.generation;
     const awaitingConsumption = consumption?.delivered === true && consumption.consumed !== true;
     const historicallyEvaluated = ['ACCEPTED', 'REJECTED'].includes(task?.state)
@@ -401,9 +400,7 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
   const state = readJson(p.state);
   const objective = readJson(p.objective);
   const policy = policyWithDefaults(readJson(p.policy));
-  const rawMatrix = existsSync(p.requirements) ? readJson(p.requirements) : null;
-  const bootstrap = existsSync(p.bootstrap) ? readJson(p.bootstrap) : null;
-  const matrix = effectiveRequirementMatrix(root, { bootstrap, matrix: rawMatrix, state });
+  const matrix = effectiveRequirementMatrix(root, { state });
   const task = state.active_task_id && existsSync(join(p.tasks, `${state.active_task_id}.json`))
     ? readJson(join(p.tasks, `${state.active_task_id}.json`)) : null;
   const attempt = state.active_attempt_id && existsSync(join(p.attempts, `${state.active_attempt_id}.json`))
@@ -553,15 +550,14 @@ function processAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-function exactDetachedRunnerOwner({ attempt, claim, runner, supervisor, isProcessAlive }) {
-  return runner?.schema === 'opsle.durable-supervisor.detached-runner/v1'
-    && runner.status === 'OWNED'
-    && runner.task_id === attempt.task_id
-    && runner.attempt_id === attempt.attempt_id
-    && runner.claim_id === attempt.claim_id
-    && runner.fence_generation === attempt.fence_generation
-    && runner.supervisor_id === supervisor.supervisor_id
-    && runner.supervisor_generation === attempt.policy_snapshot?.supervisor_generation
+function exactAttemptClaimOwner({ state, task, attempt, claim, index, supervisor }) {
+  const indexed = index?.[`task-${state.active_task_id}`];
+  return task?.task_id === state.active_task_id
+    && task.supervisor_id === supervisor.supervisor_id
+    && task.attempts?.filter((value) => value === state.active_attempt_id).length === 1
+    && attempt?.schema === 'opsle.durable-supervisor.child-attempt/v1'
+    && attempt.task_id === state.active_task_id
+    && attempt.attempt_id === state.active_attempt_id
     && claim?.schema === 'opsle.durable-supervisor.claim/v1'
     && claim.status === 'ACTIVE'
     && claim.task_id === attempt.task_id
@@ -569,6 +565,27 @@ function exactDetachedRunnerOwner({ attempt, claim, runner, supervisor, isProces
     && claim.claim_id === attempt.claim_id
     && claim.fence_generation === attempt.fence_generation
     && claim.owner_supervisor_id === supervisor.supervisor_id
+    && claim.owner_generation === attempt.policy_snapshot?.supervisor_generation
+    && indexed?.schema === claim.schema
+    && indexed.task_id === claim.task_id
+    && indexed.attempt_id === claim.attempt_id
+    && indexed.claim_id === claim.claim_id
+    && indexed.fence_generation === claim.fence_generation
+    && indexed.owner_supervisor_id === claim.owner_supervisor_id
+    && indexed.owner_generation === claim.owner_generation
+    && indexed.status === claim.status;
+}
+
+function exactDetachedRunnerOwner({ state, task, attempt, claim, index, runner, supervisor, isProcessAlive }) {
+  return exactAttemptClaimOwner({ state, task, attempt, claim, index, supervisor })
+    && runner?.schema === 'opsle.durable-supervisor.detached-runner/v1'
+    && runner.status === 'OWNED'
+    && runner.task_id === attempt.task_id
+    && runner.attempt_id === attempt.attempt_id
+    && runner.claim_id === attempt.claim_id
+    && runner.fence_generation === attempt.fence_generation
+    && runner.supervisor_id === supervisor.supervisor_id
+    && runner.supervisor_generation === attempt.policy_snapshot?.supervisor_generation
     && claim.owner_generation === runner.supervisor_generation
     && Number.isInteger(runner.worker_pid)
     && isProcessAlive(runner.worker_pid);
@@ -722,12 +739,13 @@ export function reconcileRunnerFailure(root, {
 
 export function recover(root, {
   isProcessAlive = processAlive,
-  startWakeDispatcher = ensureWakeDispatcher,
+  startWakeDispatcher = null,
   dispatcherOptions = {},
 } = {}) {
   const p = paths(root);
   const supervisor = readJson(p.supervisor);
   const state = readJson(p.state);
+  const requirements = effectiveRequirementMatrix(root, { state });
   let stateChanged = false;
   let reconciliation = { classification: 'no_active_work', action: 'none' };
   if (state.active_attempt_id) {
@@ -758,14 +776,24 @@ export function recover(root, {
           ? join(p.claims, `${attempt.claim_id}.json`)
           : null;
         const claim = claimPath && existsSync(claimPath) ? readJson(claimPath) : null;
+        const taskPath = state.active_task_id
+          ? join(p.tasks, `${state.active_task_id}.json`)
+          : null;
+        const task = taskPath && existsSync(taskPath) ? readJson(taskPath) : null;
+        const indexPath = join(p.claims, 'index.json');
+        const index = existsSync(indexPath) ? readJson(indexPath) : null;
         const detachedOwned = exactDetachedRunnerOwner({
+          state,
+          task,
           attempt,
           claim,
+          index,
           runner,
           supervisor,
           isProcessAlive,
         });
         const foregroundOwned = !runner
+          && exactAttemptClaimOwner({ state, task, attempt, claim, index, supervisor })
           && Number.isInteger(attempt.pid)
           && isProcessAlive(attempt.pid);
         if (detachedOwned || foregroundOwned) reconciliation = {
@@ -804,7 +832,7 @@ export function recover(root, {
   }
   const pendingNextAction = derivePendingNextAction(
     state,
-    existsSync(p.requirements) ? readJson(p.requirements) : null,
+    requirements,
   );
   if (pendingNextAction !== state.pending_next_action) {
     state.pending_next_action = pendingNextAction;
@@ -816,7 +844,9 @@ export function recover(root, {
   writeJson(p.supervisor, supervisor);
   emit(root, 'SUPERVISOR_RECOVERED', { reconciliation });
   const adopted_wake_event_ids = adoptQueuedWakes(root);
-  const wake_dispatcher = startWakeDispatcher(root, dispatcherOptions);
+  const wake_dispatcher = typeof startWakeDispatcher === 'function'
+    ? startWakeDispatcher(root, dispatcherOptions)
+    : { started: false, reason: 'opsled-owns-persistent-wake-dispatch' };
   return {
     supervisor,
     state: readJson(p.state),
@@ -826,8 +856,11 @@ export function recover(root, {
   };
 }
 
-function evaluateTask(root, taskId, accept, rationale) {
+export function evaluateTask(root, taskId, accept, rationale) {
   const p = paths(root);
+  // Authority is preflighted before decision, task, attempt, requirement, or
+  // lifecycle evidence can be mutated.
+  effectiveRequirementMatrix(root);
   const taskPath = join(p.tasks, `${taskId}.json`);
   const task = readJson(taskPath);
   const attemptId = task.attempts.at(-1);
@@ -896,7 +929,7 @@ function evaluateTask(root, taskId, accept, rationale) {
     pending_next_action: accept
       ? derivePendingNextAction(
         nextState,
-        existsSync(p.requirements) ? readJson(p.requirements) : null,
+        effectiveRequirementMatrix(root, { state: nextState }),
       )
       : nextState.pending_next_action,
   });
@@ -923,7 +956,10 @@ export function consumeEvent(root, eventId, { deliveryId = null, generation = nu
     return { event_id: eventId, duplicate: true, action: 'ignored', wake_delivery: wake };
   }
   const event = readJson(join(p.events, `${eventId}.json`));
-  const wake = consumeWakeDelivery(root, eventId, { deliveryId, generation });
+  const deliveryStatus = wakeDeliveryConsumptionStatus(root, eventId);
+  const wake = deliveryStatus.delivered
+    ? consumeWakeDelivery(root, eventId, { deliveryId, generation })
+    : consumeReconciledTransportNotStarted(root, eventId, { generation });
   state.processed_event_ids.push(eventId);
   writeJson(p.state, state);
   emit(root, 'EVENT_CONSUMED', {
@@ -1006,6 +1042,7 @@ function importActivationProfile(root, profile) {
 }
 
 export async function main(args) {
+  loadRuntimeRelease();
   if (args.length === 0 || args[0] === 'help' || args[0] === '--help') {
     print(usage());
     return;
@@ -1023,6 +1060,7 @@ export async function main(args) {
       : `Initialized Durable Supervisor for ${root} (${result.bootstrap.profile}); next: ${result.state.pending_next_action}`);
     return;
   }
+  compatibilityPreflight(root, { operation: 'read' });
   if (!existsSync(paths(root).supervisor)) throw new Error('run opsle init first');
   if (command === 'status') {
     const mode = outputMode(args);
@@ -1071,12 +1109,14 @@ export async function main(args) {
     if (!taskId) throw new Error('cutover requires --first-task TASK_ID');
     const p = paths(root);
     const state = readJson(p.state);
+    const requirements = effectiveRequirementMatrix(root, { state });
+    if (!requirements) throw new Error('cutover requires effective requirements authority');
     if (state.phase !== 'BOOTSTRAP') throw new Error(`cutover already occurred: ${state.phase}`);
     updateState(root, { phase: 'SELF_HOSTED', pending_next_action: `Run first post-cutover task ${taskId}.` });
     const event = emit(root, 'BOOTSTRAP_CUTOVER', {
       first_post_cutover_task_id: taskId,
       minimum_substrate: ['state', 'identity', 'policy', 'discovery', 'gearbox', 'authorization', 'handoff', 'claims', 'runner', 'events', 'context_firewall', 'acceptance', 'recovery'],
-      remaining_requirements: readJson(p.requirements).requirements.filter((item) => item.state !== 'VERIFIED').map((item) => item.id),
+      remaining_requirements: requirements.requirements.filter((item) => item.state !== 'VERIFIED').map((item) => item.id),
       rationale: 'The minimum end-to-end path is locally implemented and deterministically validated; remaining work can now be delegated safely.',
     });
     setRequirements(root, ['DS-005', 'DS-090', 'DS-091'], 'IMPLEMENTED', [relative(root, join(p.events, `${event.event_id}.json`))]);
@@ -1145,13 +1185,16 @@ export async function main(args) {
       if (!policy.providers[provider]) throw new Error(`unknown provider: ${provider}`);
       print(updatePolicy(root, (next) => { next.providers[provider].enabled = subcommand === 'enable'; }));
     } else if (subcommand === 'context-firewall') {
-      recordHumanActivation(root, 'policy-context-firewall');
       const mode = rest[0];
       if (!['enable', 'disable'].includes(mode)) {
         throw new Error('policy context-firewall requires enable or disable');
       }
+      if (mode === 'disable') {
+        throw new Error('Context Firewall is mandatory and cannot be disabled');
+      }
+      recordHumanActivation(root, 'policy-context-firewall');
       print(updatePolicy(root, (next) => {
-        next.context_firewall = { enabled: mode === 'enable' };
+        next.context_firewall = { enabled: true };
       }));
     } else if (subcommand === 'review') {
       recordHumanActivation(root, 'policy-review');
@@ -1249,6 +1292,9 @@ export async function main(args) {
       print(mode.json ? wake : renderWakeStatus(wake, mode));
     } else if (subcommand === 'drain') {
       print(drainWakeQueue(root));
+    } else if (subcommand === 'reconcile-transport-not-started') {
+      if (!rest[0]) throw new Error('wake reconciliation requires event ID');
+      print(reconcileWakeTransportNotStarted(root, rest[0]));
     } else throw new Error('wake requires start, status, or drain');
     return;
   }

@@ -27,6 +27,7 @@ import {
   runDetachedWorker,
 } from '../src/runner.js';
 import { registerWait } from '../src/wakeup.js';
+import { createReleaseFence, processStartIdentity } from '../src/runtime-release.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 const cliPath = join(sourceRoot, 'bin', 'opsle.js');
@@ -255,6 +256,7 @@ test('detached worker failure durably separates Runner failure and intervention 
     writeJson(join(paths(root).attempts, `${attempt.attempt_id}.json`), attempt);
     const supervisor = readJson(paths(root).supervisor);
     const launchNonce = 'runner-launch-fixture';
+    const workerIdentity = processStartIdentity();
     mkdirSync(join(root, '.opsle', 'workers'), { recursive: true });
     writeJson(join(root, '.opsle', 'workers', `${attempt.attempt_id}.json`), {
       schema: 'opsle.durable-supervisor.detached-runner/v1',
@@ -267,6 +269,13 @@ test('detached worker failure durably separates Runner failure and intervention 
       launch_nonce: launchNonce,
       launcher_pid: process.pid,
       worker_pid: process.pid,
+      expected_release: {
+        runtime_release_id: createReleaseFence('runner-worker', workerIdentity).runtime_release_id,
+        packaged_artifact_sha256: createReleaseFence('runner-worker', workerIdentity).packaged_artifact_sha256,
+        runtime_epoch: createReleaseFence('runner-worker', workerIdentity).runtime_epoch,
+        helper_role: 'runner-worker',
+      },
+      release_fence: createReleaseFence('runner-worker', workerIdentity),
       status: 'LAUNCHED',
       launched_at: registeredAt,
       owned_at: null,

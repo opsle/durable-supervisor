@@ -20,6 +20,7 @@ import {
   writeJson,
 } from './io.js';
 import { supervisorRoutingDecisionErrors } from './supervisor-routing.js';
+import { compatibilityHeader, compatibilityPreflight } from './runtime-release.js';
 
 export const OPSLE_SCHEMA = 'opsle.durable-supervisor';
 export const BOOTSTRAP_SCHEMA = `${OPSLE_SCHEMA}.bootstrap/v1`;
@@ -54,15 +55,58 @@ function isDurableSupervisorSource(root) {
   }
 }
 
-export function effectiveRequirementMatrix(root, {
-  bootstrap = null,
-  matrix = null,
-  state = null,
-} = {}) {
-  if (bootstrap) return bootstrap.requirements?.mode === 'matrix' ? matrix : null;
-  if (exactDurableSupervisorMatrix(matrix)
+export function effectiveRequirementMatrix(root, options = {}) {
+  const p = paths(root);
+  const bootstrap = Object.hasOwn(options, 'bootstrap')
+    ? options.bootstrap
+    : (existsSync(p.bootstrap) ? readJson(p.bootstrap) : null);
+  const matrix = Object.hasOwn(options, 'matrix')
+    ? options.matrix
+    : (existsSync(p.requirements) ? readJson(p.requirements) : null);
+  const state = Object.hasOwn(options, 'state')
+    ? options.state
+    : (existsSync(p.state) ? readJson(p.state) : null);
+  if (bootstrap) {
+    if (bootstrap.schema !== BOOTSTRAP_SCHEMA
+        || !['objective_driven', 'requirement_driven', 'durable_supervisor_v0_1'].includes(bootstrap.profile)
+        || !['none', 'matrix'].includes(bootstrap.requirements?.mode)
+        || (bootstrap.profile === 'objective_driven' && bootstrap.requirements?.mode !== 'none')
+        || (['requirement_driven', 'durable_supervisor_v0_1'].includes(bootstrap.profile)
+          && bootstrap.requirements?.mode !== 'matrix')) {
+      throw new Error('contradictory requirements authority');
+    }
+    if (bootstrap.requirements.mode === 'none') {
+      if (matrix) throw new Error('objective-driven authority contradicts a requirements matrix');
+      return null;
+    }
+    if (!matrix) throw new Error('requirement-driven authority is missing its matrix');
+  }
+  if (!bootstrap
+      && exactDurableSupervisorMatrix(matrix)
       && state?.phase !== 'SELF_HOSTED'
       && !isDurableSupervisorSource(root)) return null;
+  if (matrix) {
+    if (matrix.schema !== `${OPSLE_SCHEMA}.requirements/v1`
+        || matrix.specification !== '.opsle/specification.md'
+        || !/^[a-f0-9]{64}$/.test(matrix.specification_sha256 ?? '')
+        || !existsSync(p.specification)
+        || matrix.specification_sha256 !== fileSha256(p.specification)
+        || !Array.isArray(matrix.allowed_states)
+        || matrix.allowed_states.length === 0
+        || !Array.isArray(matrix.requirements)
+        || matrix.requirements.some((item) => (
+          typeof item?.id !== 'string'
+          || !item.id
+          || !matrix.allowed_states.includes(item.state)
+        ))
+        || new Set(matrix.requirements.map((item) => item.id)).size !== matrix.requirements.length) {
+      throw new Error('malformed effective requirements matrix');
+    }
+    if (bootstrap?.profile === 'durable_supervisor_v0_1'
+        && !exactDurableSupervisorMatrix(matrix)) {
+      throw new Error('Durable Supervisor requirements authority is malformed');
+    }
+  }
   return matrix;
 }
 
@@ -83,6 +127,10 @@ export function derivePendingNextAction(state, matrix, fallback = state.pending_
   }
   const unsatisfied = unsatisfiedRequirements(matrix);
   if (state.phase === 'COMPLETE' && unsatisfied.length === 0) return null;
+  if (unsatisfied.length === 0
+      && (fallback == null || fallback === NEXT_UNSATISFIED_REQUIREMENT_ACTION)) {
+    return 'Evaluate objective completion against accepted task evidence.';
+  }
   if (fallback == null && unsatisfied.length > 0) return NEXT_UNSATISFIED_REQUIREMENT_ACTION;
   return fallback;
 }
@@ -188,6 +236,7 @@ export const paths = (root) => {
     opsle,
     specification: join(opsle, 'specification.md'),
     bootstrap: join(opsle, 'bootstrap.json'),
+    compatibility: join(opsle, 'runtime-compatibility.json'),
     requirements: join(opsle, 'requirements.json'),
     objective: join(opsle, 'objective.json'),
     policy: join(opsle, 'policy.json'),
@@ -248,6 +297,7 @@ function gitWorktreeClean(root) {
 
 export function initialize(root, { actor = 'bootstrap-codex', objectiveText = null } = {}) {
   const p = paths(root);
+  if (existsSync(p.compatibility)) compatibilityPreflight(root, { operation: 'read' });
   const initialObjective = objectiveText?.trim() || null;
   const cleanBeforeBootstrap = gitWorktreeClean(root);
   const hasSpecification = existsSync(p.specification);
@@ -369,6 +419,7 @@ export function initialize(root, { actor = 'bootstrap-codex', objectiveText = nu
     inspected_at: now(),
     actor,
   };
+  writeJson(p.compatibility, compatibilityHeader());
   writeJson(p.bootstrap, bootstrap);
   writeJson(p.supervisor, supervisor);
   writeJson(p.policy, policy);
@@ -390,11 +441,11 @@ export function initialize(root, { actor = 'bootstrap-codex', objectiveText = nu
 
 export function setRequirements(root, ids, state, evidence = [], justification = null) {
   const p = paths(root);
-  if (!existsSync(p.requirements)) {
+  const matrix = effectiveRequirementMatrix(root);
+  if (!matrix) {
     if (ids.length === 0) return null;
-    throw new Error('repository has no requirements matrix');
+    throw new Error('repository has no effective requirements matrix');
   }
-  const matrix = readJson(p.requirements);
   if (!matrix.allowed_states.includes(state)) throw new Error(`invalid requirement state: ${state}`);
   for (const requirementId of ids) {
     const requirement = matrix.requirements.find((item) => item.id === requirementId);
@@ -441,11 +492,16 @@ export function validateDurableState(root) {
   }
   const rawMatrix = existsSync(p.requirements) ? readJson(p.requirements) : null;
   const lifecycleState = readJson(p.state);
-  const effectiveMatrix = effectiveRequirementMatrix(root, {
-    bootstrap,
-    matrix: rawMatrix,
-    state: lifecycleState,
-  });
+  let effectiveMatrix = null;
+  try {
+    effectiveMatrix = effectiveRequirementMatrix(root, {
+      bootstrap,
+      matrix: rawMatrix,
+      state: lifecycleState,
+    });
+  } catch (error) {
+    errors.push(error.message);
+  }
   const historicalForeignSeed = !bootstrap && rawMatrix && !effectiveMatrix;
   const requirementDriven = Boolean(effectiveMatrix);
   if (requirementDriven && (!existsSync(p.requirements) || !existsSync(p.specification))) {
@@ -466,7 +522,8 @@ export function validateDurableState(root) {
       for (const item of matrix.requirements) {
         if (!matrix.allowed_states.includes(item.state)) errors.push(`invalid requirement state: ${item.id}`);
       }
-      if (matrix.specification_sha256 !== fileSha256(p.specification)) errors.push('specification hash mismatch');
+      if (!existsSync(p.specification)) errors.push('requirements matrix specification is missing');
+      else if (matrix.specification_sha256 !== fileSha256(p.specification)) errors.push('specification hash mismatch');
       if (bootstrap?.profile === 'durable_supervisor_v0_1') {
         if (ids.length !== 101) errors.push('Durable Supervisor V0.1 requirements must contain 101 unique IDs');
         for (let index = 0; index <= 100; index += 1) {
@@ -480,6 +537,7 @@ export function validateDurableState(root) {
   const policy = policyWithDefaults(rawPolicy);
   if (!REVIEW_MODES.has(policy.review?.mode)) errors.push('invalid review mode');
   if (typeof policy.context_firewall?.enabled !== 'boolean') errors.push('invalid context firewall policy');
+  if (policy.context_firewall?.enabled === false) errors.push('Context Firewall is mandatory');
   const objective = readJson(p.objective);
   if (!Array.isArray(objective.history)) {
     errors.push('objective history must be an array');
@@ -527,7 +585,7 @@ export function validateDurableState(root) {
   }
   if (
     state.phase === 'COMPLETE'
-    && unsatisfiedRequirements(matrix).length === 0
+    && unsatisfiedRequirements(effectiveMatrix).length === 0
     && state.pending_next_action !== null
   ) {
     errors.push('complete state with no unsatisfied requirements must not have a pending next action');

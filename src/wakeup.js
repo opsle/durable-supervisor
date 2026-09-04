@@ -33,6 +33,11 @@ import {
   writeJson,
 } from './io.js';
 import { emit, paths, updateState } from './state.js';
+import {
+  assertReleaseFence,
+  createReleaseFence,
+  releaseIdentity,
+} from './runtime-release.js';
 
 const WAIT_SCHEMA = 'opsle.durable-supervisor.wait-registration/v1';
 const WAKE_REQUEST_SCHEMA = 'opsle.durable-supervisor.host-wake-request/v1';
@@ -54,12 +59,12 @@ export const CODEX_SESSION_BINDING_INVALID_SCHEMA = 'opsle.durable-supervisor.co
 export const WAKE_CONSUMPTION_SCHEMA = 'opsle.durable-supervisor.wake-consumption/v1';
 export const ACTIVATION_LEASE_SCHEMA = 'opsle.durable-supervisor.activation-lease/v1';
 export const ACTIVATION_DECISION_SCHEMA = 'opsle.durable-supervisor.activation-decision/v1';
-export const CODEX_RESUME_HELPER_TIMEOUT_MS = (
+export const CODEX_RESUME_HELPER_TIMEOUT_MS = null;
+export const ACTIVATION_LEASE_TTL_MS = (
   CODEX_RESUME_CONFIRMATION_TIMEOUT_MS
   + CODEX_RESUME_WORST_CASE_CLEANUP_TIMEOUT_MS
-  + 5_000
+  + 50_000
 );
-export const ACTIVATION_LEASE_TTL_MS = CODEX_RESUME_HELPER_TIMEOUT_MS + 45_000;
 
 export const TERMINAL_WAKE_TYPES = Object.freeze(new Set([
   'child-completed',
@@ -193,11 +198,18 @@ function consumptionPath(root, eventId) {
 function deliveryReceiptFence(receipt) {
   return sha256(canonicalJson({
     schema: receipt?.schema,
+    repository: receipt?.repository,
     delivery_id: receipt?.delivery_id,
     event_id: receipt?.event_id,
     queue_version: receipt?.queue_version,
     supervisor_id: receipt?.supervisor_id,
     supervisor_generation: receipt?.supervisor_generation,
+    dispatcher_id: receipt?.dispatcher_id,
+    dispatcher_generation: receipt?.dispatcher_generation,
+    dispatcher_implementation_sha256: receipt?.dispatcher_implementation_sha256,
+    dispatcher_release_fence: receipt?.dispatcher_release_fence ?? null,
+    activation_lease_id: receipt?.activation_lease_id,
+    activation_fencing_token: receipt?.activation_fencing_token,
     activation_decision_id: receipt?.activation_decision_id,
     codex_session_binding_sha256: receipt?.codex_session_binding_sha256,
     codex_session_uuid: receipt?.codex_session_uuid,
@@ -961,12 +973,34 @@ function activationDecisionPath(root, eventId) {
   return join(wakePaths(root).activationDecisions, `${eventId}.json`);
 }
 
-function leaseOwner(dispatcher) {
+function leaseOwner(dispatcher, activationOwner = null) {
+  if (activationOwner) return structuredClone(activationOwner);
   return {
     dispatcher_id: dispatcher?.dispatcher_id ?? 'explicit-provider-free-dispatcher',
     dispatcher_generation: dispatcher?.dispatcher_generation ?? 1,
     process: dispatcher?.process ?? processIdentity(process.pid),
   };
+}
+
+function sameActivationOwner(left, right) {
+  return canonicalJson(left ?? null) === canonicalJson(right ?? null);
+}
+
+function activationOwnerCurrent(owner, getProcessIdentity = processIdentity) {
+  if (!owner || !sameProcess(owner.process, getProcessIdentity(owner.process?.pid))) return false;
+  if (owner.kind !== 'opsled') return true;
+  if (owner.schema !== 'opsle.durable-supervisor.opsled-wake-owner/v1'
+      || typeof owner.service_id !== 'string'
+      || !Number.isSafeInteger(owner.service_generation)) return false;
+  try {
+    assertReleaseFence(owner.release_fence, {
+      role: 'opsled-worker',
+      processIdentity: owner.process,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function leaseExpired(lease, nowMs) {
@@ -976,6 +1010,7 @@ function leaseExpired(lease, nowMs) {
 
 export function acquireActivationLease(root, eventId, {
   dispatcher = null,
+  activationOwner = null,
   ttlMs = ACTIVATION_LEASE_TTL_MS,
   nowMs = Date.now(),
   getProcessIdentity = processIdentity,
@@ -987,8 +1022,8 @@ export function acquireActivationLease(root, eventId, {
   if (dispatcher && !dispatcherFence(root, dispatcher).current) {
     return { acquired: false, classification: 'stale-dispatcher', reason: 'dispatcher-fence-no-longer-current' };
   }
-  const owner = leaseOwner(dispatcher);
-  if (!owner.process || !sameProcess(owner.process, getProcessIdentity(owner.process.pid))) {
+  const owner = leaseOwner(dispatcher, activationOwner);
+  if (!activationOwnerCurrent(owner, getProcessIdentity)) {
     return { acquired: false, classification: 'stale-dispatcher', reason: 'activation-owner-process-dead-or-reused' };
   }
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -999,9 +1034,7 @@ export function acquireActivationLease(root, eventId, {
         && current.supervisor_generation === supervisor.generation
         && !leaseExpired(current, nowMs)) {
       if (current.event_id === eventId
-          && current.owner.dispatcher_id === owner.dispatcher_id
-          && current.owner.dispatcher_generation === owner.dispatcher_generation
-          && sameProcess(current.owner.process, owner.process)) {
+          && sameActivationOwner(current.owner, owner)) {
         return { acquired: true, duplicate: true, lease: current };
       }
       return { acquired: false, classification: 'busy', reason: 'another-activation-lease-is-current', lease: current };
@@ -1071,9 +1104,8 @@ export function decisionFenceCurrent(root, lease, { nowMs = Date.now() } = {}) {
     && current.supervisor_generation === lease?.supervisor_generation
     && current.supervisor_id === supervisor.supervisor_id
     && current.supervisor_generation === supervisor.generation
-    && current.owner?.dispatcher_id === lease?.owner?.dispatcher_id
-    && current.owner?.dispatcher_generation === lease?.owner?.dispatcher_generation
-    && sameProcess(current.owner?.process, lease?.owner?.process);
+    && sameActivationOwner(current.owner, lease?.owner)
+    && activationOwnerCurrent(current.owner);
 }
 
 export function claimActivationDecision(root, eventId, lease, {
@@ -1087,7 +1119,8 @@ export function claimActivationDecision(root, eventId, lease, {
   }
   const request = readJson(requestPath(root, eventId));
   const supervisor = readJson(paths(root).supervisor);
-  if (request.target.supervisor_id !== supervisor.supervisor_id
+  if (request.target.repository !== supervisor.repository
+      || request.target.supervisor_id !== supervisor.supervisor_id
       || request.target.supervisor_generation !== supervisor.generation) {
     return { claimed: false, classification: 'obsolete', reason: 'wake-target-generation-is-stale' };
   }
@@ -1110,7 +1143,8 @@ export function claimActivationDecision(root, eventId, lease, {
   const path = activationDecisionPath(root, eventId);
   if (atomicCreateJson(path, decision)) return { claimed: true, duplicate: false, decision };
   const current = readJson(path);
-  if (current.status === 'BUSY' && decisionFenceCurrent(root, lease)) {
+  if (['BUSY', 'TRANSPORT_NOT_STARTED'].includes(current.status)
+      && decisionFenceCurrent(root, lease)) {
     const expected = sha256(canonicalJson(current));
     decision.prior_attempts = [
       ...(Array.isArray(current.prior_attempts) ? current.prior_attempts : []),
@@ -1167,7 +1201,8 @@ export function classifyQueuedWake(root, request, supervisor = readJson(paths(ro
   if (![WAKE_REQUEST_SCHEMA, NATIVE_WAKE_REQUEST_SCHEMA].includes(request?.schema)) {
     return { classification: 'queued', reason: 'invalid-wake-request' };
   }
-  if (request.target?.supervisor_id !== supervisor.supervisor_id
+  if (request.target?.repository !== supervisor.repository
+      || request.target?.supervisor_id !== supervisor.supervisor_id
       || request.target?.supervisor_generation !== supervisor.generation) {
     return { classification: 'obsolete', reason: 'wake-target-generation-is-stale' };
   }
@@ -1184,7 +1219,7 @@ export function classifyQueuedWake(root, request, supervisor = readJson(paths(ro
   }
   if (existsSync(activationDecisionPath(root, request.event_id))) {
     const decision = readJson(activationDecisionPath(root, request.event_id));
-    if (decision.status === 'BUSY') {
+    if (['BUSY', 'TRANSPORT_NOT_STARTED'].includes(decision.status)) {
       return {
         classification: 'queued',
         reason: 'awaiting-supported-native-transport',
@@ -1198,6 +1233,100 @@ export function classifyQueuedWake(root, request, supervisor = readJson(paths(ro
     };
   }
   return { classification: 'queued', reason: 'awaiting-supported-native-transport' };
+}
+
+export function reconcileWakeTransportNotStarted(root, eventId) {
+  const repositoryRoot = realpathSync(root);
+  const request = readJson(requestPath(repositoryRoot, eventId));
+  const supervisor = readJson(paths(repositoryRoot).supervisor);
+  const decisionPath = activationDecisionPath(repositoryRoot, eventId);
+  const decision = readJson(decisionPath);
+  if (request.target?.repository !== supervisor.repository
+      || request.target?.supervisor_id !== supervisor.supervisor_id
+      || request.target?.supervisor_generation !== supervisor.generation
+      || decision.schema !== ACTIVATION_DECISION_SCHEMA
+      || decision.event_id !== eventId
+      || decision.supervisor_id !== supervisor.supervisor_id
+      || decision.supervisor_generation !== supervisor.generation
+      || decision.status !== 'UNCERTAIN'
+      || typeof decision.transport_attempt_id !== 'string') {
+    throw new Error('uncertain wake reconciliation fence mismatch');
+  }
+  const evidencePath = transportAttemptPath(repositoryRoot, decision.transport_attempt_id);
+  const evidence = readJson(evidencePath);
+  const timestamps = evidence.timestamps ?? {};
+  const transportNeverStarted = evidence.event_id === eventId
+    && evidence.transport_attempt_id === decision.transport_attempt_id
+    && evidence.delivery_id === decision.delivery_id
+    && evidence.activation?.decision_id === decision.decision_id
+    && evidence.confirmation_absence === 'native-transport-not-started'
+    && evidence.rollout_confirmation == null
+    && timestamps.spawn_requested_at == null
+    && timestamps.spawned_at == null
+    && timestamps.transport_started_at == null
+    && !existsSync(receiptPath(repositoryRoot, eventId));
+  if (!transportNeverStarted) {
+    throw new Error('native transport absence is not proven; wake remains uncertain');
+  }
+  const expected = sha256(canonicalJson(decision));
+  const reconciled = {
+    ...decision,
+    status: 'TRANSPORT_NOT_STARTED',
+    failure: 'transport-not-started',
+    reconciled_at: now(),
+    reconciliation: {
+      classification: 'transport-not-started',
+      native_transport_spawned: false,
+      transport_attempt_id: decision.transport_attempt_id,
+      evidence_sha256: fileSha256(evidencePath),
+    },
+  };
+  const updated = atomicCompareAndSwapJson(decisionPath, expected, reconciled);
+  if (!updated.swapped) throw new Error(updated.reason ?? 'wake reconciliation CAS failed');
+  emit(repositoryRoot, 'HOST_WAKE_TRANSPORT_NOT_STARTED_RECONCILED', {
+    source_event_id: eventId,
+    transport_attempt_id: decision.transport_attempt_id,
+    native_transport_spawned: false,
+  });
+  return {
+    event_id: eventId,
+    status: reconciled.status,
+    classification: reconciled.reconciliation.classification,
+    native_transport_spawned: false,
+    transport_attempt_id: decision.transport_attempt_id,
+    child_attempt_id: request.attempt_id,
+  };
+}
+
+export function consumeReconciledTransportNotStarted(root, eventId, { generation }) {
+  const repositoryRoot = realpathSync(root);
+  const supervisor = readJson(paths(repositoryRoot).supervisor);
+  const request = readOptional(requestPath(repositoryRoot, eventId));
+  if (!request) return null;
+  const decision = readJson(activationDecisionPath(repositoryRoot, eventId));
+  if (Number(generation) !== supervisor.generation
+      || request.target?.repository !== supervisor.repository
+      || request.target?.supervisor_id !== supervisor.supervisor_id
+      || request.target?.supervisor_generation !== supervisor.generation
+      || decision.schema !== ACTIVATION_DECISION_SCHEMA
+      || decision.event_id !== eventId
+      || decision.supervisor_id !== supervisor.supervisor_id
+      || decision.supervisor_generation !== supervisor.generation
+      || decision.status !== 'TRANSPORT_NOT_STARTED'
+      || decision.reconciliation?.classification !== 'transport-not-started'
+      || decision.reconciliation?.native_transport_spawned !== false
+      || existsSync(receiptPath(repositoryRoot, eventId))) {
+    throw new Error('transport-not-started event consumption fence mismatch');
+  }
+  return {
+    delivered: false,
+    consumed: true,
+    reconciled: true,
+    classification: 'transport-not-started',
+    native_transport_spawned: false,
+    transport_attempt_id: decision.transport_attempt_id,
+    reconciliation_evidence_sha256: decision.reconciliation.evidence_sha256,
+  };
 }
 
 export function enqueueTerminalWake(root, completionEvent, { hostBinding = null } = {}) {
@@ -1216,6 +1345,7 @@ export function enqueueTerminalWake(root, completionEvent, { hostBinding = null 
     attempt_id: completionEvent.attempt_id,
     wait_id: completionEvent.wait_id,
     target: {
+      repository: supervisor.repository,
       supervisor_id: supervisor.supervisor_id,
       supervisor_generation: supervisor.generation,
     },
@@ -1240,6 +1370,7 @@ function sameDispatcher(left, right) {
     && left.dispatcher_id === right.dispatcher_id
     && left.dispatcher_generation === right.dispatcher_generation
     && left.implementation_sha256 === right.implementation_sha256
+    && canonicalJson(left.release_fence ?? null) === canonicalJson(right.release_fence ?? null)
     && left.supervisor_id === right.supervisor_id
     && left.supervisor_generation === right.supervisor_generation
     && sameProcess(left.process, right.process);
@@ -1350,6 +1481,8 @@ export function plainCodexResumeTransport({
       const before = readJson(evidencePath);
       before.helper = {
         executable: process.execPath,
+        expected_release: releaseIdentity('codex-resume'),
+        release_fence: null,
         argv: [process.execPath, ...helperArgs],
         cwd: binding.repository_realpath,
         invoked_at: now(),
@@ -1368,7 +1501,6 @@ export function plainCodexResumeTransport({
       const result = run(process.execPath, helperArgs, {
         encoding: 'utf8',
         maxBuffer: 256 * 1024,
-        timeout: CODEX_RESUME_HELPER_TIMEOUT_MS,
         cwd: binding.repository_realpath,
         env: process.env,
       });
@@ -1408,9 +1540,13 @@ export function plainCodexResumeTransport({
   };
 }
 
-function validateDeliveryFence(root, eventId, expected, dispatcher) {
+function validateDeliveryFence(root, eventId, expected, dispatcher, activationOwner = null) {
   const request = readJson(requestPath(root, eventId));
   const supervisor = readJson(paths(root).supervisor);
+  if (supervisor.repository !== root
+      || request.target.repository !== supervisor.repository) {
+    return { current: false, reason: 'repository-delivery-fence-changed' };
+  }
   if (supervisor.supervisor_id !== expected.supervisorId
       || supervisor.generation !== expected.supervisorGeneration) {
     return { current: false, reason: 'supervisor-delivery-fence-changed' };
@@ -1440,10 +1576,67 @@ function validateDeliveryFence(root, eventId, expected, dispatcher) {
   if (!dispatcherDecision.current) {
     return { current: false, reason: 'dispatcher-fence-no-longer-current' };
   }
+  if (activationOwner && !activationOwnerCurrent(activationOwner)) {
+    return { current: false, reason: 'opsled-owner-fence-no-longer-current' };
+  }
   return { current: true, request, supervisor };
 }
 
 function commitDeliveredReceipt(root, request, receipt) {
+  const p = paths(root);
+  const supervisor = readJson(p.supervisor);
+  const durableRequest = readJson(requestPath(root, request.event_id));
+  const bindingPath = wakePaths(root).sessionBinding;
+  const binding = readJson(bindingPath);
+  const decision = readJson(activationDecisionPath(root, request.event_id));
+  let bindingValid = true;
+  try { validateSessionBindingShape(binding); } catch { bindingValid = false; }
+  const dispatcherCurrent = receipt.dispatcher_id == null || dispatcherFence(root, {
+    schema: DISPATCHER_SCHEMA,
+    dispatcher_id: receipt.dispatcher_id,
+    dispatcher_generation: receipt.dispatcher_generation,
+    implementation_sha256: receipt.dispatcher_implementation_sha256,
+    release_fence: receipt.dispatcher_release_fence,
+    supervisor_id: receipt.supervisor_id,
+    supervisor_generation: receipt.supervisor_generation,
+    process: receipt.dispatcher_process,
+  }).current;
+  const wakeOwnerCurrent = receipt.wake_owner == null
+    || activationOwnerCurrent(receipt.wake_owner);
+  if (supervisor.repository !== root
+      || request.target?.repository !== supervisor.repository
+      || receipt.repository !== supervisor.repository
+      || canonicalJson(durableRequest) !== canonicalJson(request)
+      || request.event_id !== receipt.event_id
+      || request.queue_version !== receipt.queue_version
+      || request.target.supervisor_id !== supervisor.supervisor_id
+      || request.target.supervisor_generation !== supervisor.generation
+      || receipt.supervisor_id !== supervisor.supervisor_id
+      || receipt.supervisor_generation !== supervisor.generation
+      || receipt.dispatcher_implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
+      || !dispatcherCurrent
+      || !wakeOwnerCurrent
+      || !bindingValid
+      || binding.repository_realpath !== realpathSync(root)
+      || binding.supervisor_id !== supervisor.supervisor_id
+      || binding.supervisor_generation !== supervisor.generation
+      || receipt.codex_session_binding_sha256 !== fileSha256(bindingPath)
+      || receipt.codex_session_uuid !== binding.codex_session_uuid
+      || receipt.host_kind !== binding.host.kind
+      || receipt.native_transport !== binding.native_wake.transport
+      || decision?.schema !== ACTIVATION_DECISION_SCHEMA
+      || !['CLAIMED', 'DELIVERED'].includes(decision.status)
+      || decision.event_id !== request.event_id
+      || decision.supervisor_id !== supervisor.supervisor_id
+      || decision.supervisor_generation !== supervisor.generation
+      || decision.delivery_id !== receipt.delivery_id
+      || decision.transport_attempt_id !== receipt.transport_attempt_id
+      || decision.decision_id !== receipt.activation_decision_id
+      || decision.lease_id !== receipt.activation_lease_id
+      || decision.fencing_token !== receipt.activation_fencing_token
+      || decision.message_sha256 !== receipt.message_sha256) {
+    throw new Error('wake delivery commitment ownership fence mismatch');
+  }
   const existingPath = receiptPath(root, request.event_id);
   receipt.status = 'DELIVERED';
   receipt.delivered_at ??= now();
@@ -1536,11 +1729,11 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
   const binding = readJson(wake.sessionBinding);
   const decision = readJson(activationDecisionPath(repositoryRoot, evidence.event_id));
   const lease = readJson(wake.activationLease);
-  const expectedDispatcher = {
+  const expectedDispatcher = evidence.dispatcher ? {
     ...evidence.dispatcher,
     supervisor_id: evidence.supervisor?.supervisor_id,
     supervisor_generation: evidence.supervisor?.generation,
-  };
+  } : null;
   const message = evidence.canonical_argv?.[3];
   const baselineOrdinal = evidence.transport?.baseline_ordinal;
   const currentConfirmation = exactRolloutConfirmation(confirmation);
@@ -1558,7 +1751,7 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
     requestSha256: evidence.request?.sha256,
     supervisorId: evidence.supervisor?.supervisor_id,
     supervisorGeneration: evidence.supervisor?.generation,
-  }, expectedDispatcher);
+  }, expectedDispatcher, evidence.wake_owner ?? null);
   const fencesCurrent = deliveryFence.current
     && Number.isFinite(nowMs)
     && decisionFenceCurrent(repositoryRoot, lease, { nowMs })
@@ -1567,9 +1760,13 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
     && evidence.request?.queue_version === request.queue_version
     && evidence.supervisor?.supervisor_id === supervisor.supervisor_id
     && evidence.supervisor?.generation === supervisor.generation
-    && evidence.dispatcher?.dispatcher_id === lease.owner?.dispatcher_id
-    && evidence.dispatcher?.dispatcher_generation === lease.owner?.dispatcher_generation
-    && sameProcess(evidence.dispatcher?.process, lease.owner?.process)
+    && ((expectedDispatcher
+      && evidence.dispatcher?.dispatcher_id === lease.owner?.dispatcher_id
+      && evidence.dispatcher?.dispatcher_generation === lease.owner?.dispatcher_generation
+      && sameProcess(evidence.dispatcher?.process, lease.owner?.process))
+      || (!expectedDispatcher
+        && sameActivationOwner(evidence.wake_owner, lease.owner)
+        && activationOwnerCurrent(lease.owner)))
     && evidence.activation?.lease_id === lease.lease_id
     && evidence.activation?.fencing_token === lease.fencing_token
     && decision.status === 'CLAIMED'
@@ -1603,14 +1800,19 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
 
   const receipt = {
     schema: DELIVERY_SCHEMA,
+    repository: supervisor.repository,
     delivery_id: evidence.delivery_id,
     event_id: request.event_id,
     queue_version: request.queue_version,
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
-    dispatcher_id: evidence.dispatcher.dispatcher_id,
-    dispatcher_generation: evidence.dispatcher.dispatcher_generation,
-    dispatcher_process: evidence.dispatcher.process,
+    dispatcher_id: evidence.dispatcher?.dispatcher_id ?? null,
+    dispatcher_generation: evidence.dispatcher?.dispatcher_generation ?? null,
+    dispatcher_implementation_sha256: evidence.dispatcher?.implementation_sha256
+      ?? WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+    dispatcher_release_fence: evidence.dispatcher?.release_fence ?? null,
+    dispatcher_process: evidence.dispatcher?.process ?? evidence.wake_owner?.process ?? null,
+    wake_owner: evidence.wake_owner ?? null,
     activation_lease_id: lease.lease_id,
     activation_fencing_token: lease.fencing_token,
     activation_decision_id: decision.decision_id,
@@ -1879,6 +2081,7 @@ function reconcileLateConfirmation(root, request, deliveryFence, bindingStatus, 
   const cleanup = evidence.cleanup;
   const receipt = {
     schema: DELIVERY_SCHEMA,
+    repository: readJson(paths(root).supervisor).repository,
     delivery_id: evidence.delivery_id,
     event_id: request.event_id,
     queue_version: request.queue_version,
@@ -1886,6 +2089,8 @@ function reconcileLateConfirmation(root, request, deliveryFence, bindingStatus, 
     supervisor_generation: binding.supervisor_generation,
     dispatcher_id: evidence.dispatcher.dispatcher_id,
     dispatcher_generation: evidence.dispatcher.dispatcher_generation,
+    dispatcher_implementation_sha256: evidence.dispatcher.implementation_sha256,
+    dispatcher_release_fence: evidence.dispatcher.release_fence,
     dispatcher_process: evidence.dispatcher.process,
     activation_lease_id: evidence.activation.lease_id,
     activation_fencing_token: evidence.activation.fencing_token,
@@ -1933,6 +2138,7 @@ export function deliverWake(root, eventId, {
   nativeTransport = null,
   bindingDependencies = {},
   dispatcher = null,
+  activationOwner = null,
   expectedQueueVersion = null,
   getActivationNowMs = Date.now,
 } = {}) {
@@ -1949,18 +2155,6 @@ export function deliverWake(root, eventId, {
       delivered: false,
     };
   }
-  const refreshOptions = {
-    dependencies: bindingDependencies,
-    allowEnvironmentMismatch: Boolean(dispatcher),
-  };
-  const bindingStatus = refreshCodexSessionBinding(root, refreshOptions);
-  const deliveryFence = {
-    queueVersion,
-    requestSha256: sha256(canonicalJson(request)),
-    supervisorId: request.target.supervisor_id,
-    supervisorGeneration: request.target.supervisor_generation,
-    bindingSha256: bindingStatus.valid ? fileSha256(wake.sessionBinding) : null,
-  };
   const existingPath = receiptPath(root, eventId);
   if (existsSync(existingPath)) {
     let existing;
@@ -1973,6 +2167,22 @@ export function deliverWake(root, eventId, {
     return { classification: 'queued', reason: 'crash-uncertain-delivery-claim', receipt: existing, replayed: false };
   }
   const supervisor = readJson(paths(root).supervisor);
+  const preflightLifecycle = classifyQueuedWake(root, request, supervisor);
+  if (preflightLifecycle.classification === 'obsolete') {
+    return { ...preflightLifecycle, event_id: eventId, delivered: false };
+  }
+  const refreshOptions = {
+    dependencies: bindingDependencies,
+    allowEnvironmentMismatch: Boolean(dispatcher),
+  };
+  const bindingStatus = refreshCodexSessionBinding(root, refreshOptions);
+  const deliveryFence = {
+    queueVersion,
+    requestSha256: sha256(canonicalJson(request)),
+    supervisorId: request.target.supervisor_id,
+    supervisorGeneration: request.target.supervisor_generation,
+    bindingSha256: bindingStatus.valid ? fileSha256(wake.sessionBinding) : null,
+  };
   if (bindingStatus.valid && bindingStatus.supported) {
     const reconciled = reconcileLateConfirmation(
       root,
@@ -2022,12 +2232,19 @@ export function deliverWake(root, eventId, {
   if (!currentDispatcher.current) {
     return { classification: 'stale-generation', reason: 'dispatcher-fence-no-longer-current', delivered: false };
   }
-  const fence = validateDeliveryFence(root, eventId, deliveryFence, dispatcher);
+  const fence = validateDeliveryFence(
+    root,
+    eventId,
+    deliveryFence,
+    dispatcher,
+    activationOwner,
+  );
   if (!fence.current) {
     return { classification: 'stale-generation', reason: fence.reason, event_id: eventId, delivered: false };
   }
   const leaseResult = acquireActivationLease(root, eventId, {
     dispatcher,
+    activationOwner,
     nowMs: getActivationNowMs(),
   });
   if (!leaseResult.acquired) {
@@ -2045,29 +2262,6 @@ export function deliverWake(root, eventId, {
     rolloutActivity = boundRolloutActivity(bindingStatus.binding.rollout.realpath);
   } catch (error) {
     rolloutActivity = { classification: 'unknown', reason: error.message };
-  }
-  if (rolloutActivity.classification === 'busy') {
-    const busyClaim = claimActivationDecision(root, eventId, lease, {
-      message,
-      nowMs: getActivationNowMs(),
-    });
-    if (busyClaim.claimed) {
-      updateActivationDecision(
-        root,
-        busyClaim.decision,
-        'BUSY',
-        `bound-rollout-known-busy-at-ordinal-${rolloutActivity.latest_ordinal}`,
-      );
-    }
-    releaseActivationLease(root, lease);
-    return {
-      classification: 'busy',
-      reason: 'bound-rollout-known-busy-before-transport',
-      rollout_activity: rolloutActivity,
-      event_id: eventId,
-      delivered: false,
-      replayed: false,
-    };
   }
   const transportAttemptId = id('transport-attempt');
   const deliveryId = id('delivery');
@@ -2094,6 +2288,7 @@ export function deliverWake(root, eventId, {
   }
   const receipt = {
     schema: DELIVERY_SCHEMA,
+    repository: supervisor.repository,
     delivery_id: deliveryId,
     event_id: eventId,
     queue_version: queueVersion,
@@ -2101,8 +2296,11 @@ export function deliverWake(root, eventId, {
     supervisor_generation: supervisor.generation,
     dispatcher_id: dispatcher?.dispatcher_id ?? null,
     dispatcher_generation: dispatcher?.dispatcher_generation ?? null,
-    dispatcher_implementation_sha256: dispatcher?.implementation_sha256 ?? null,
+    dispatcher_implementation_sha256: dispatcher?.implementation_sha256
+      ?? WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+    dispatcher_release_fence: dispatcher?.release_fence ?? null,
     dispatcher_process: dispatcher?.process ?? lease.owner.process,
+    wake_owner: activationOwner ? structuredClone(activationOwner) : null,
     activation_lease_id: lease.lease_id,
     activation_fencing_token: lease.fencing_token,
     activation_decision_id: claim.decision.decision_id,
@@ -2135,14 +2333,16 @@ export function deliverWake(root, eventId, {
       wait_id: request.wait_id,
     },
     delivery_id: deliveryId,
-    dispatcher: {
+    dispatcher: dispatcher ? {
       dispatcher_id: dispatcher?.dispatcher_id ?? lease.owner.dispatcher_id,
       dispatcher_generation: dispatcher?.dispatcher_generation
         ?? lease.owner.dispatcher_generation,
       implementation_sha256: dispatcher?.implementation_sha256
         ?? WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+      release_fence: dispatcher?.release_fence ?? null,
       process: dispatcher?.process ?? lease.owner.process,
-    },
+    } : null,
+    wake_owner: activationOwner ? structuredClone(activationOwner) : null,
     supervisor: {
       supervisor_id: supervisor.supervisor_id,
       generation: supervisor.generation,
@@ -2179,7 +2379,13 @@ export function deliverWake(root, eventId, {
       replayed: false,
     };
   }
-  const finalFence = validateDeliveryFence(root, eventId, deliveryFence, dispatcher);
+  const finalFence = validateDeliveryFence(
+    root,
+    eventId,
+    deliveryFence,
+    dispatcher,
+    activationOwner,
+  );
   const finalLeaseFenceCurrent = decisionFenceCurrent(root, lease, {
     nowMs: getActivationNowMs(),
   });
@@ -2196,12 +2402,18 @@ export function deliverWake(root, eventId, {
     };
   }
   const preDeliveryBinding = refreshCodexSessionBinding(root, refreshOptions);
-  const preDeliveryFence = validateDeliveryFence(root, eventId, deliveryFence, dispatcher);
+  const preDeliveryFence = validateDeliveryFence(
+    root,
+    eventId,
+    deliveryFence,
+    dispatcher,
+    activationOwner,
+  );
   if (!preDeliveryBinding.valid || !preDeliveryBinding.supported || !preDeliveryFence.current) {
     updateActivationDecision(
       root,
       claim.decision,
-      'BUSY',
+      'TRANSPORT_NOT_STARTED',
       preDeliveryBinding.valid ? preDeliveryFence.reason : 'live session binding refresh unproven',
     );
     releaseActivationLease(root, lease);
@@ -2218,11 +2430,11 @@ export function deliverWake(root, eventId, {
   }
   try {
     const committed = transport.resume({
-      session_id: bindingStatus.binding.codex_session_uuid,
+      session_id: preDeliveryBinding.binding.codex_session_uuid,
       event_id: eventId,
       generation: supervisor.generation,
       message,
-      binding: bindingStatus.binding,
+      binding: preDeliveryBinding.binding,
       transport_attempt_id: transportAttemptId,
       transport_attempt_path: transportEvidencePath,
     });
@@ -2252,22 +2464,6 @@ export function deliverWake(root, eventId, {
           : 'supported-native-session-transport',
         receipt: readJson(existingPath),
         delivered: true,
-        transport_attempt_id: transportAttemptId,
-      };
-    }
-    if (['busy', 'rejected'].includes(committed?.classification)) {
-      updateActivationDecision(root, claim.decision, 'BUSY', committed.reason);
-      releaseActivationLease(root, lease);
-      emit(root, 'HOST_WAKE_DEFERRED', {
-        source_event_id: eventId,
-        classification: committed.classification,
-        reason: committed.reason,
-      });
-      return {
-        classification: committed.classification,
-        reason: committed.reason,
-        delivered: false,
-        replayed: false,
         transport_attempt_id: transportAttemptId,
       };
     }
@@ -2385,6 +2581,7 @@ export function deliverWake(root, eventId, {
       eventId,
       deliveryFence,
       dispatcher,
+      activationOwner,
     );
     const leaseFenceCurrent = decisionFenceCurrent(root, lease, {
       nowMs: getActivationNowMs(),
@@ -2427,36 +2624,93 @@ export function deliverWake(root, eventId, {
 }
 
 export function consumeWakeDelivery(root, eventId, { deliveryId = null, generation }) {
-  const request = readOptional(requestPath(root, eventId));
+  const wakePathsForRead = wakePaths(root);
+  const exactRequestPath = join(wakePathsForRead.requests, `${eventId}.json`);
+  const exactReceiptPath = join(wakePathsForRead.deliveries, `${eventId}.json`);
+  const request = readOptional(exactRequestPath);
   if (!request) return null;
-  const receipt = readJson(receiptPath(root, eventId));
+  const receipt = readJson(exactReceiptPath);
   const supervisor = readJson(paths(root).supervisor);
-  const wake = directories(root);
-  if (!['DELIVERED', 'CONSUMED'].includes(receipt.status)) {
+  const bindingPath = wakePathsForRead.sessionBinding;
+  const binding = readOptional(bindingPath);
+  const decision = readOptional(activationDecisionPath(root, eventId));
+  let bindingValid = true;
+  try { validateSessionBindingShape(binding); } catch { bindingValid = false; }
+  if (receipt.schema !== DELIVERY_SCHEMA || !['DELIVERED', 'CONSUMED'].includes(receipt.status)) {
     throw new Error('wake delivery is not durably delivered');
   }
-  const exactDeliveryId = deliveryId ?? receipt.delivery_id;
+  if (supervisor.repository !== root
+      || request.target?.repository !== supervisor.repository
+      || receipt.repository !== supervisor.repository
+      || !bindingValid
+      || binding.repository_realpath !== realpathSync(root)) {
+    throw new Error('wake delivery repository identity mismatch');
+  }
+  if (request.event_id !== eventId || receipt.event_id !== eventId) {
+    throw new Error('wake delivery event identity mismatch');
+  }
+  if (typeof deliveryId !== 'string' || !deliveryId) {
+    throw new Error('wake consumption requires exact delivery identity');
+  }
+  const exactDeliveryId = deliveryId;
   if (receipt.delivery_id !== exactDeliveryId) throw new Error('wake delivery identity mismatch');
   if (Number(generation) !== receipt.supervisor_generation
       || receipt.supervisor_generation !== supervisor.generation
       || request.target.supervisor_generation !== supervisor.generation) {
     throw new Error('stale supervisor generation cannot consume wake event');
   }
+  if (receipt.supervisor_id !== supervisor.supervisor_id
+      || request.target.supervisor_id !== supervisor.supervisor_id
+      || binding.supervisor_id !== supervisor.supervisor_id) {
+    throw new Error('wrong supervisor identity cannot consume wake event');
+  }
+  if (binding.supervisor_generation !== supervisor.generation) {
+    throw new Error('stale session binding cannot consume wake event');
+  }
+  if (receipt.queue_version !== request.queue_version
+      || receipt.dispatcher_implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
+      || receipt.codex_session_binding_sha256 !== fileSha256(bindingPath)
+      || receipt.codex_session_uuid !== binding.codex_session_uuid
+      || receipt.host_kind !== binding.host.kind
+      || receipt.native_transport !== binding.native_wake.transport) {
+    throw new Error('wake delivery implementation or session fence mismatch');
+  }
+  if (decision?.schema !== ACTIVATION_DECISION_SCHEMA
+      || decision.status !== 'DELIVERED'
+      || decision.event_id !== eventId
+      || decision.delivery_id !== receipt.delivery_id
+      || decision.supervisor_id !== supervisor.supervisor_id
+      || decision.supervisor_generation !== supervisor.generation
+      || decision.decision_id !== receipt.activation_decision_id
+      || decision.lease_id !== receipt.activation_lease_id
+      || decision.fencing_token !== receipt.activation_fencing_token
+      || decision.transport_attempt_id !== receipt.transport_attempt_id
+      || decision.message_sha256 !== receipt.message_sha256) {
+    throw new Error('wake delivery receipt fence mismatch');
+  }
+  const wake = directories(root);
   const consumption = {
     schema: WAKE_CONSUMPTION_SCHEMA,
     consumption_id: `wake-consumption-${sha256(canonicalJson({
+      repository: supervisor.repository,
       event_id: eventId,
       delivery_id: exactDeliveryId,
       supervisor_id: supervisor.supervisor_id,
       supervisor_generation: supervisor.generation,
+      codex_session_binding_sha256: receipt.codex_session_binding_sha256,
+      dispatcher_implementation_sha256: receipt.dispatcher_implementation_sha256,
+      delivery_receipt_fence_sha256: deliveryReceiptFence(receipt),
     }))}`,
     event_id: eventId,
     task_id: request.task_id,
     attempt_id: request.attempt_id,
     delivery_id: receipt.delivery_id,
+    repository: supervisor.repository,
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
-    request_sha256: fileSha256(requestPath(root, eventId)),
+    codex_session_binding_sha256: receipt.codex_session_binding_sha256,
+    dispatcher_implementation_sha256: receipt.dispatcher_implementation_sha256,
+    request_sha256: fileSha256(exactRequestPath),
     delivery_receipt_fence_sha256: deliveryReceiptFence(receipt),
     consumed_at: now(),
   };
@@ -2466,8 +2720,11 @@ export function consumeWakeDelivery(root, eventId, { deliveryId = null, generati
   if (durable.schema !== WAKE_CONSUMPTION_SCHEMA
       || durable.event_id !== eventId
       || durable.delivery_id !== receipt.delivery_id
+      || durable.repository !== supervisor.repository
       || durable.supervisor_id !== supervisor.supervisor_id
       || durable.supervisor_generation !== supervisor.generation
+      || durable.codex_session_binding_sha256 !== receipt.codex_session_binding_sha256
+      || durable.dispatcher_implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
       || durable.request_sha256 !== consumption.request_sha256
       || durable.delivery_receipt_fence_sha256 !== consumption.delivery_receipt_fence_sha256) {
     throw new Error('wake consumption evidence fence mismatch');
@@ -2490,8 +2747,11 @@ export function wakeDeliveryConsumptionStatus(root, eventId) {
   const consumed = consumption?.schema === WAKE_CONSUMPTION_SCHEMA
     && consumption.event_id === eventId
     && consumption.delivery_id === receipt.delivery_id
+    && consumption.repository === receipt.repository
     && consumption.supervisor_id === receipt.supervisor_id
     && consumption.supervisor_generation === receipt.supervisor_generation
+    && consumption.codex_session_binding_sha256 === receipt.codex_session_binding_sha256
+    && consumption.dispatcher_implementation_sha256 === receipt.dispatcher_implementation_sha256
     && request
     && consumption.task_id === request.task_id
     && consumption.attempt_id === request.attempt_id
@@ -2520,15 +2780,17 @@ export function wakeQueueStatus(root, {
   const supervisor = readJson(paths(root).supervisor);
   const busy = readOptional(wake.busy);
   const dispatcher = readOptional(wake.dispatcher);
-  const dispatcherCurrent = dispatcher?.schema === DISPATCHER_SCHEMA
-    && ['LAUNCHED', 'OWNED'].includes(dispatcher.status)
-    && dispatcher.supervisor_id === supervisor.supervisor_id
-    && dispatcher.supervisor_generation === supervisor.generation
-    && sameProcess(dispatcher.process, getProcessIdentity(dispatcher.process?.pid));
+  const dispatcherCurrent = dispatcherIsCurrent(dispatcher, supervisor, getProcessIdentity);
+  const implementationFence = {
+    expected_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+    observed_sha256: dispatcher?.implementation_sha256 ?? null,
+    current: dispatcher?.implementation_sha256 === WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+  };
   const bindingStatus = refreshCodexSessionBinding(root, { dependencies: bindingDependencies });
   const requests = readdirSync(wake.requests).filter((name) => name.endsWith('.json')).sort().map((name) => {
     const request = readJson(join(wake.requests, name));
-    const authoritative = request.target?.supervisor_id === supervisor.supervisor_id
+    const authoritative = request.target?.repository === supervisor.repository
+      && request.target?.supervisor_id === supervisor.supervisor_id
       && request.target?.supervisor_generation === supervisor.generation;
     const receipt = readOptional(receiptPath(root, request.event_id));
     if (receipt) {
@@ -2545,6 +2807,7 @@ export function wakeQueueStatus(root, {
           : (['DELIVERED', 'CONSUMED'].includes(receipt.status) ? 'awaiting-consumption' : 'queued'),
         reason: consumption.consumed ? 'CONSUMED' : receipt.status,
         receipt,
+        delivery_receipt_fence_sha256: deliveryReceiptFence(receipt),
         consumption: consumption.consumption ?? null,
       };
     }
@@ -2579,7 +2842,11 @@ export function wakeQueueStatus(root, {
   });
   return {
     supervisor_generation: supervisor.generation,
-    dispatcher: dispatcher ? { ...dispatcher, current: dispatcherCurrent } : null,
+    dispatcher: dispatcher ? {
+      ...dispatcher,
+      current: dispatcherCurrent,
+      implementation_fence: implementationFence,
+    } : null,
     session_binding: bindingStatus,
     busy,
     requests,
@@ -2612,9 +2879,21 @@ function dispatcherIsCurrent(
   statuses = ['LAUNCHED', 'OWNED'],
   implementationSha256 = WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
 ) {
+  const releaseCurrent = record?.release_fence == null
+    ? record?.implementation_sha256 === implementationSha256
+    : (() => {
+      try {
+        assertReleaseFence(record.release_fence, {
+          role: 'wake-delivery',
+          processIdentity: getProcessIdentity(record.process?.pid),
+        });
+        return true;
+      } catch { return false; }
+    })();
   return record?.schema === DISPATCHER_SCHEMA
     && statuses.includes(record.status)
     && record.implementation_sha256 === implementationSha256
+    && releaseCurrent
     && record.supervisor_id === supervisor.supervisor_id
     && record.supervisor_generation === supervisor.generation
     && sameProcess(record.process, getProcessIdentity(record.process?.pid));
@@ -2673,6 +2952,8 @@ export function ensureWakeDispatcher(root, {
       dispatcher_id: id('wake-dispatcher'),
       dispatcher_generation: (Number(existing?.dispatcher_generation) || 0) + 1,
       implementation_sha256: implementationSha256,
+      expected_release: releaseIdentity('wake-delivery'),
+      release_fence: null,
       supervisor_id: supervisor.supervisor_id,
       supervisor_generation: supervisor.generation,
       queue_generation: supervisor.generation,
@@ -2697,6 +2978,7 @@ export function ensureWakeDispatcher(root, {
       if (!Number.isSafeInteger(child.pid)) throw new Error('dispatcher did not receive a process ID');
       record.process = getProcessIdentity(child.pid);
       if (!record.process) throw new Error('dispatcher process-start identity was unavailable');
+      record.release_fence = createReleaseFence('wake-delivery', record.process);
       record.status = 'LAUNCHED';
       writeJson(wake.dispatcher, record);
       child.unref?.();
@@ -2864,6 +3146,14 @@ export async function runWakeDispatcher(root, {
     await delay(10);
   }
   const supervisor = readJson(paths(root).supervisor);
+  try {
+    assertReleaseFence(record.release_fence, {
+      role: 'wake-delivery',
+      processIdentity: processRecord,
+    });
+  } catch {
+    return { status: 'STALE', reason: 'dispatcher-runtime-release-fence-mismatch' };
+  }
   if (record.schema !== DISPATCHER_SCHEMA
       || record.status !== 'LAUNCHED'
       || record.implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
@@ -2963,14 +3253,6 @@ export async function runWakeDispatcher(root, {
       try { signal = await opportunity.wait(); } finally { opportunity.close(); }
       if (signal.type !== 'bound-rollout-state-change') {
         return { status: 'OWNED', reason: 'late-confirmation-observation-unavailable', results };
-      }
-      continue;
-    }
-    if (results.some((result) => result.classification === 'busy')) {
-      let signal;
-      try { signal = await opportunity.wait(); } finally { opportunity.close(); }
-      if (signal.type !== 'bound-rollout-state-change') {
-        return { status: 'OWNED', reason: 'bound-rollout-observation-unavailable', results };
       }
       continue;
     }

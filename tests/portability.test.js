@@ -352,17 +352,26 @@ test('version output is repository-independent and includes available source pro
   }
 });
 
-test('Context Firewall policy can be explicitly disabled and re-enabled', () => {
+test('Context Firewall policy rejects disabling without durable mutation', () => {
   const root = repository();
   try {
     initialize(root, { actor: 'firewall-policy' });
+    const policyBefore = readFileSync(paths(root).policy);
+    const eventsBefore = readFileSync(paths(root).eventsLog);
     const disabled = runCli(root, ['policy', 'context-firewall', 'disable']);
-    assert.equal(disabled.status, 0, disabled.stderr);
-    assert.equal(readJson(paths(root).policy).context_firewall.enabled, false);
-    assert.match(runCli(root, ['policy', 'status']).stdout, /Context Firewall disabled/);
+    assert.equal(disabled.status, 1);
+    assert.match(disabled.stderr, /Context Firewall is mandatory and cannot be disabled/);
+    assert.deepEqual(readFileSync(paths(root).policy), policyBefore);
+    assert.deepEqual(readFileSync(paths(root).eventsLog), eventsBefore);
     const enabled = runCli(root, ['policy', 'context-firewall', 'enable']);
     assert.equal(enabled.status, 0, enabled.stderr);
     assert.equal(readJson(paths(root).policy).context_firewall.enabled, true);
+
+    const policy = readJson(paths(root).policy);
+    policy.context_firewall.enabled = false;
+    writeJson(paths(root).policy, policy);
+    assert.equal(validateDurableState(root).valid, false);
+    assert.ok(validateDurableState(root).errors.includes('Context Firewall is mandatory'));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

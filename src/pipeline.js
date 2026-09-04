@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { basename, join, relative, resolve } from 'node:path';
 import {
   atomicCompareAndSwapJson,
+  canonicalJson,
   id,
   now,
   readJson,
@@ -11,6 +12,7 @@ import {
 } from './io.js';
 import {
   emit,
+  effectiveRequirementMatrix,
   gitMetadata,
   paths,
   policyWithDefaults,
@@ -123,8 +125,13 @@ export function createTask(root, input) {
   const p = paths(root);
   const objective = readJson(p.objective);
   if (objective.current_revision === 0) throw new Error('set the repository objective before creating work');
-  if (!existsSync(p.requirements) && input.requirement_ids.length > 0) {
+  const requirements = effectiveRequirementMatrix(root);
+  if (!requirements && input.requirement_ids.length > 0) {
     throw new Error('objective-driven repository task cannot claim requirement IDs without a matrix');
+  }
+  const effectiveIds = new Set(requirements?.requirements?.map((item) => item.id) ?? []);
+  for (const requirementId of input.requirement_ids) {
+    if (!effectiveIds.has(requirementId)) throw new Error(`unknown effective requirement: ${requirementId}`);
   }
   const supervisor = readJson(p.supervisor);
   const taskId = input.task_id ?? id('task');
@@ -180,6 +187,9 @@ export function routeTask(root, task) {
   validateTaskCommands(task);
   const p = paths(root);
   const policy = policyWithDefaults(readJson(p.policy));
+  if (policy.context_firewall.enabled !== true) {
+    throw new Error('Context Firewall is mandatory for Runner execution');
+  }
   const discovery = discoverCapabilities(root);
   const permitted = filterCapabilities(discovery, policy);
   const considered = [];
@@ -303,15 +313,38 @@ function claimIndexSnapshot(indexPath) {
 }
 
 function exactIndexedClaim(indexed, claim) {
-  return indexed?.task_id === claim.task_id
+  return indexed?.schema === claim.schema
+    && indexed?.task_id === claim.task_id
+    && indexed?.attempt_id === claim.attempt_id
     && indexed?.claim_id === claim.claim_id
-    && indexed?.fence_generation === claim.fence_generation;
+    && indexed?.fence_generation === claim.fence_generation
+    && indexed?.owner_supervisor_id === claim.owner_supervisor_id
+    && indexed?.owner_generation === claim.owner_generation
+    && indexed?.status === claim.status;
+}
+
+function exactClaimIdentity(left, right) {
+  return left?.schema === 'opsle.durable-supervisor.claim/v1'
+    && right?.schema === left.schema
+    && right.claim_id === left.claim_id
+    && right.task_id === left.task_id
+    && right.attempt_id === left.attempt_id
+    && right.owner_supervisor_id === left.owner_supervisor_id
+    && right.owner_generation === left.owner_generation
+    && right.fence_generation === left.fence_generation;
 }
 
 export function acquireClaim(root, task, attemptId) {
   const p = paths(root);
   const indexPath = join(p.claims, 'index.json');
   const supervisor = readJson(p.supervisor);
+  const taskPath = join(p.tasks, `${task?.task_id}.json`);
+  if (typeof attemptId !== 'string' || !attemptId
+      || !existsSync(taskPath)
+      || canonicalJson(readJson(taskPath)) !== canonicalJson(task)
+      || task.supervisor_id !== supervisor.supervisor_id) {
+    throw new Error('claim acquisition task authority is ambiguous or stale');
+  }
   for (let attempt = 0; attempt < CLAIM_INDEX_CAS_ATTEMPTS; attempt += 1) {
     const snapshot = claimIndexSnapshot(indexPath);
     for (const name of Object.keys(snapshot.index).filter((key) => key.startsWith('task-'))) {
@@ -351,7 +384,7 @@ export function releaseClaim(root, claim, status = 'COMPLETED') {
   const p = paths(root);
   const path = join(p.claims, `${claim.claim_id}.json`);
   const current = readJson(path);
-  if (current.claim_id !== claim.claim_id || current.task_id !== claim.task_id) {
+  if (!exactClaimIdentity(current, { ...claim, fence_generation: current.fence_generation })) {
     throw new Error('claim identity is ambiguous');
   }
   if (current.fence_generation !== claim.fence_generation) throw new Error('stale claim fence');
@@ -389,6 +422,9 @@ export function createAttempt(root, task, gearbox, claimFactory = acquireClaim) 
   }
   const p = paths(root);
   const policy = policyWithDefaults(readJson(p.policy));
+  if (policy.context_firewall.enabled !== true) {
+    throw new Error('Context Firewall is mandatory for Runner execution');
+  }
   const selectedRoute = gearbox.selected_route_config;
   if (gearbox.schema !== 'opsle.durable-supervisor.gearbox-decision/v3'
       || selectedRoute?.schema !== 'opsle.durable-supervisor.exact-child-route/v2'

@@ -17,6 +17,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { profileCodexActivations } from '../src/activation-telemetry.js';
+import { createAttempt, createTask, routeTask } from '../src/pipeline.js';
+import { runAttempt } from '../src/runner.js';
 import {
   classifyCodexPane,
   consumeTerminalSession,
@@ -65,9 +67,12 @@ import {
   WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
   wakeQueueStatus,
 } from '../src/wakeup.js';
-import { sessionCommand } from '../src/cli.js';
+import { consumeEvent, evaluateTask, sessionCommand } from '../src/cli.js';
 import { resumeHelperResult } from '../bin/opsle-codex-resume.js';
 import { generateResumePacket, readResumePacket } from '../src/reconstruction.js';
+import { createReleaseFence } from '../src/runtime-release.js';
+import { readRegistry, registerRepository } from '../src/opsled-registry.js';
+import { dispatchRepositoryWakes } from '../src/opsled-wake.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 
@@ -122,6 +127,7 @@ function stageDispatcher(root, {
   status = 'LAUNCHED',
 } = {}) {
   const supervisor = readJson(paths(root).supervisor);
+  const process = { pid, start_time_ticks: startTime, executable: '/usr/bin/node' };
   const record = {
     schema: 'opsle.durable-supervisor.host-wake-dispatcher/v1',
     dispatcher_id: dispatcherId,
@@ -131,7 +137,8 @@ function stageDispatcher(root, {
     supervisor_generation: supervisor.generation,
     queue_generation: supervisor.generation,
     launch_nonce: `launch-${dispatcherGeneration}`,
-    process: { pid, start_time_ticks: startTime, executable: '/usr/bin/node' },
+    process,
+    release_fence: createReleaseFence('wake-delivery', process),
     status,
     launched_at: '2026-09-01T00:00:00.000Z',
     owned_at: status === 'OWNED' ? '2026-09-01T00:00:01.000Z' : null,
@@ -153,6 +160,7 @@ function stageCurrentDispatcher(root, overrides = {}) {
     ...overrides,
   });
   dispatcher.process.executable = owner.executable;
+  dispatcher.release_fence = createReleaseFence('wake-delivery', dispatcher.process);
   writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
   return dispatcher;
 }
@@ -868,7 +876,11 @@ test('plain resume cleanup never signals an exact frontend group containing the 
     const rolloutPath = join(root, 'rollout.jsonl');
     const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
     const message = 'OPSLE_WAKE v1 event=event-host-safety gen=3; read durable state.';
-    writeFileSync(rolloutPath, `${JSON.stringify({ ordinal: 1, type: 'session_meta' })}\n`);
+    writeFileSync(rolloutPath, `${JSON.stringify({ ordinal: 0, type: 'session_meta' })}\n${JSON.stringify({
+      ordinal: 1,
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'active-turn' },
+    })}\n`);
     const watcher = new EventEmitter();
     watcher.close = () => {};
     const child = new EventEmitter();
@@ -892,7 +904,7 @@ test('plain resume cleanup never signals an exact frontend group containing the 
       cleanupTimeoutMs: 0,
       spawnProcess: () => {
         spawned = true;
-        queueMicrotask(() => child.stderr.emit('data', Buffer.from('session already busy')));
+        queueMicrotask(() => child.stderr.emit('data', Buffer.from('session invalid')));
         return child;
       },
       watchFactory: () => watcher,
@@ -910,7 +922,7 @@ test('plain resume cleanup never signals an exact frontend group containing the 
       authoritativeHostProcess: host,
       inspectHostProcess: () => host,
     });
-    assert.equal(result.classification, 'busy');
+    assert.equal(result.classification, 'rejected');
     assert.equal(result.cleanup_proven, false);
     assert.equal(result.authoritative_host_continuity_proven, true);
     assert.equal(result.authoritative_host_signaled, false);
@@ -922,20 +934,59 @@ test('plain resume cleanup never signals an exact frontend group containing the 
   }
 });
 
-test('plain resume refuses to spawn beside a preexisting exact-message frontend', async () => {
+test('preexisting frontend observation does not gate a new fenced submission', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-resume-preexisting-'));
   try {
     const rolloutPath = join(root, 'rollout.jsonl');
     const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
     const message = 'OPSLE_WAKE v1 event=event-preexisting gen=3; read durable state.';
     writeFileSync(rolloutPath, `${JSON.stringify({ ordinal: 1, type: 'session_meta' })}\n`);
+    const watcher = new EventEmitter();
+    watcher.close = () => {};
+    const child = new EventEmitter();
+    child.pid = 9260;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let observeRollout;
     let spawnCalls = 0;
     const checkpoints = [];
     const result = await runCodexResumeTransport({
       sessionId,
       message,
       rolloutPath,
-      spawnProcess: () => { spawnCalls += 1; },
+      spawnProcess: () => {
+        spawnCalls += 1;
+        queueMicrotask(() => {
+          const additions = [{
+            ordinal: 2,
+            type: 'response_item',
+            payload: {
+              type: 'message', role: 'user', content: [{ type: 'input_text', text: message }],
+              internal_chat_message_metadata_passthrough: { turn_id: 'turn-preexisting' },
+            },
+          }, {
+            ordinal: 3,
+            type: 'event_msg',
+            payload: {
+              type: 'item_completed', thread_id: sessionId, turn_id: 'turn-preexisting',
+              item: { type: 'UserMessage', content: [{ type: 'text', text: message }] },
+              started_at_ms: 1,
+            },
+          }];
+          writeFileSync(
+            rolloutPath,
+            `${readFileSync(rolloutPath, 'utf8')}${additions.map(JSON.stringify).join('\n')}\n`,
+          );
+          observeRollout();
+        });
+        return child;
+      },
+      watchFactory: (_path, callback) => {
+        observeRollout = callback;
+        return watcher;
+      },
       inspectExecutable: () => ({
         requested: 'codex', resolved: '/opt/codex', version: 'codex-cli 0.152.1', version_error: null,
       }),
@@ -946,15 +997,21 @@ test('plain resume refuses to spawn beside a preexisting exact-message frontend'
         executable: '/opt/codex',
         command_line: ['codex', 'resume', sessionId, message],
       }],
+      inspectProcessGroup: () => [],
+      killProcess: () => {
+        child.signalCode = 'SIGTERM';
+        child.emit('exit', null, 'SIGTERM');
+      },
       checkpointEvidence: (evidence) => checkpoints.push(evidence),
     });
-    assert.equal(result.classification, 'busy');
-    assert.equal(result.reason, 'matching-resume-frontend-already-exists-before-spawn');
-    assert.equal(result.spawned, false);
+    assert.equal(result.classification, 'confirmed');
+    assert.equal(result.spawned, true);
     assert.equal(result.duplicate_frontend_count, 1);
-    assert.equal(spawnCalls, 0);
-    assert.equal(checkpoints.at(-1).status, 'KNOWN_BUSY_BEFORE_SPAWN');
-    assert.equal(checkpoints.at(-1).process.frontends[0].start_time_ticks, '925000');
+    assert.equal(result.cleanup_proven, false);
+    assert.equal(spawnCalls, 1);
+    assert.ok(checkpoints.some((entry) => (
+      entry.checkpoints.at(-1).stage === 'preexisting-matching-frontend-observed'
+    )));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1137,7 +1194,10 @@ test('deadline expiry stays uncertain and helper covers both cleanup phases', as
       rolloutPath,
       watchFactory: () => watcher,
       spawnProcess: () => {
-        queueMicrotask(() => expireConfirmation());
+        queueMicrotask(() => {
+          child.exitCode = 1;
+          expireConfirmation();
+        });
         return child;
       },
       scheduleTimeout: (callback, milliseconds) => {
@@ -1156,7 +1216,7 @@ test('deadline expiry stays uncertain and helper covers both cleanup phases', as
     });
     assert.equal(scheduledBound, CODEX_RESUME_CONFIRMATION_TIMEOUT_MS);
     assert.equal(result.classification, 'uncertain');
-    assert.equal(result.reason, 'rollout-confirmation-deadline-reached-after-spawn');
+    assert.equal(result.reason, 'rollout-confirmation-deadline-reached-after-frontend-exit');
 
     let helperTimeout;
     const helperEvidencePath = join(root, 'helper-evidence.json');
@@ -1184,26 +1244,25 @@ test('deadline expiry stays uncertain and helper covers both cleanup phases', as
       CODEX_RESUME_WORST_CASE_CLEANUP_TIMEOUT_MS,
       CODEX_RESUME_CLEANUP_TIMEOUT_MS * 2,
     );
-    assert.equal(CODEX_RESUME_HELPER_TIMEOUT_MS, 135_000);
+    assert.equal(CODEX_RESUME_HELPER_TIMEOUT_MS, null);
     assert.equal(ACTIVATION_LEASE_TTL_MS, 180_000);
-    assert.ok(ACTIVATION_LEASE_TTL_MS > CODEX_RESUME_HELPER_TIMEOUT_MS);
-    assert.equal(helperTimeout, CODEX_RESUME_HELPER_TIMEOUT_MS);
-    assert.ok(helperTimeout > (
-      CODEX_RESUME_CONFIRMATION_TIMEOUT_MS
-      + CODEX_RESUME_WORST_CASE_CLEANUP_TIMEOUT_MS
-    ));
+    assert.equal(helperTimeout, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('plain resume transport classifies live busy output while the stdin keeper remains alive', async () => {
+test('busy session output does not gate queued plain resume delivery', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-resume-busy-'));
   try {
     const rolloutPath = join(root, 'rollout.jsonl');
     const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
     const message = 'OPSLE_WAKE v1 event=event-busy gen=3; read durable state.';
-    writeFileSync(rolloutPath, `${JSON.stringify({ ordinal: 1, type: 'session_meta' })}\n`);
+    writeFileSync(rolloutPath, `${JSON.stringify({ ordinal: 0, type: 'session_meta' })}\n${JSON.stringify({
+      ordinal: 1,
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'active-turn' },
+    })}\n`);
     const watcher = new EventEmitter();
     watcher.close = () => {};
     const child = new EventEmitter();
@@ -1212,6 +1271,8 @@ test('plain resume transport classifies live busy output while the stdin keeper 
     child.signalCode = null;
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
+    let observeRollout;
+    const order = ['active-turn-started'];
     let exitedBeforeCleanup = false;
     let confirmationTimerCalled = false;
     let confirmationTimerCancelled = false;
@@ -1221,12 +1282,40 @@ test('plain resume transport classifies live busy output while the stdin keeper 
       rolloutPath,
       spawnProcess: () => {
         queueMicrotask(() => {
+          order.push('opsled-submitted');
           child.stdout.emit('data', Buffer.from('Session is bu'));
           child.stdout.emit('data', Buffer.from('sy; try again later'));
+          order.push('codex-queued');
+          const additions = [{
+            ordinal: 2,
+            type: 'response_item',
+            payload: {
+              type: 'message', role: 'user', content: [{ type: 'input_text', text: message }],
+              internal_chat_message_metadata_passthrough: { turn_id: 'turn-busy-queued' },
+            },
+          }, {
+            ordinal: 3,
+            type: 'event_msg',
+            payload: {
+              type: 'item_completed', thread_id: sessionId, turn_id: 'turn-busy-queued',
+              item: { type: 'UserMessage', content: [{ type: 'text', text: message }] },
+              started_at_ms: 2,
+            },
+          }];
+          order.push('active-turn-finished');
+          writeFileSync(
+            rolloutPath,
+            `${readFileSync(rolloutPath, 'utf8')}${additions.map(JSON.stringify).join('\n')}\n`,
+          );
+          order.push('original-herdr-tui-processed');
+          observeRollout();
         });
         return child;
       },
-      watchFactory: () => watcher,
+      watchFactory: (_path, callback) => {
+        observeRollout = callback;
+        return watcher;
+      },
       scheduleTimeout: (callback) => {
         return {
           callback: () => {
@@ -1246,14 +1335,130 @@ test('plain resume transport classifies live busy output while the stdin keeper 
       inspectFrontends: () => [],
       inspectProcessGroup: () => [],
     });
-    assert.equal(result.classification, 'busy');
-    assert.equal(result.reason, 'codex-resume-busy-before-acceptance');
+    assert.equal(result.classification, 'confirmed');
+    assert.equal(result.turn_id, 'turn-busy-queued');
+    assert.deepEqual(order, [
+      'active-turn-started',
+      'opsled-submitted',
+      'codex-queued',
+      'active-turn-finished',
+      'original-herdr-tui-processed',
+    ]);
     assert.equal(exitedBeforeCleanup, false);
     assert.equal(confirmationTimerCalled, false);
     assert.equal(confirmationTimerCancelled, true);
     assert.equal(result.cleanup_proven, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('opsled submits into a busy Codex queue and consumes and evaluates exactly once', async () => {
+  const root = fixture();
+  const hostRoot = mkdtempSync(join(tmpdir(), 'opsled-busy-queue-host-'));
+  try {
+    const task = createTask(root, {
+      task_id: 'task-opsled-busy-queue',
+      title: 'Prove opsled busy queue delivery',
+      objective: 'Complete one deterministic child and deliver its wake.',
+      scope: ['busy-queue-result.txt'],
+      authorization: {
+        may: ['run deterministic fixture'],
+        may_modify: ['busy-queue-result.txt'],
+        may_not: ['deploy', 'modify sibling repositories'],
+      },
+      required_inputs: [],
+      relevant_context: [],
+      expected_deliverable: 'busy-queue-result.txt',
+      expected_evidence: ['terminal completion', 'wake delivery'],
+      acceptance_criteria: ['exit code 0'],
+      prohibited_actions: ['deployment'],
+      requirement_ids: [],
+      route_hint: 'deterministic',
+      deterministic_command: [
+        process.execPath,
+        '-e',
+        "require('fs').writeFileSync('busy-queue-result.txt','done\\n')",
+      ],
+      verification_command: null,
+    });
+    const route = routeTask(root, task);
+    const { attempt, claim } = createAttempt(root, task, route);
+    const completed = await runAttempt(root, task, attempt, claim);
+    const eventId = completed.completion_event.event_id;
+    enqueueTerminalWake(root, completed.completion_event);
+    const bound = bindingFixture(root);
+    writeFileSync(bound.rolloutPath, `${readFileSync(bound.rolloutPath, 'utf8')}${JSON.stringify({
+      ordinal: 1,
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'active-turn-before-wake' },
+    })}\n`);
+
+    registerRepository(hostRoot, root);
+    const mapping = Object.values(readRegistry(hostRoot).repositories)[0];
+    const owner = processIdentity(process.pid);
+    const releaseFence = createReleaseFence('opsled-worker', owner);
+    const order = ['supervisor-busy'];
+    let submissions = 0;
+    const dispatched = dispatchRepositoryWakes(mapping, {
+      releaseFence,
+      processIdentity: owner,
+      serviceIdentity: { service_id: 'opsled-busy-queue', generation: 1 },
+      bindingDependencies: bound.dependencies,
+      nativeTransport: {
+        kind: 'plain-codex-resume',
+        resume(request) {
+          submissions += 1;
+          order.push('opsled-submitted-immediately', 'codex-queued');
+          assert.equal(request.session_id, bound.sessionId);
+          order.push('active-turn-finished');
+          appendWakeConfirmation(
+            bound.rolloutPath,
+            request.session_id,
+            request.message,
+          );
+          order.push('original-herdr-tui-processed');
+          return confirmedResumeResult(request.session_id, request.message, 9750);
+        },
+      },
+    });
+    assert.equal(dispatched.delivered, 1, JSON.stringify(dispatched));
+    assert.equal(submissions, 1);
+    assert.deepEqual(order, [
+      'supervisor-busy',
+      'opsled-submitted-immediately',
+      'codex-queued',
+      'active-turn-finished',
+      'original-herdr-tui-processed',
+    ]);
+    const delivered = dispatched.results[0].receipt;
+    assert.equal(delivered.dispatcher_id, null);
+    assert.equal(delivered.wake_owner.kind, 'opsled');
+
+    const generation = readJson(paths(root).supervisor).generation;
+    const firstConsumption = consumeEvent(root, eventId, {
+      deliveryId: delivered.delivery_id,
+      generation,
+    });
+    const duplicateConsumption = consumeEvent(root, eventId, {
+      deliveryId: delivered.delivery_id,
+      generation,
+    });
+    assert.equal(firstConsumption.duplicate, false);
+    assert.equal(duplicateConsumption.duplicate, true);
+    const firstEvaluation = evaluateTask(root, task.task_id, true, 'busy queue proof complete');
+    const duplicateEvaluation = evaluateTask(root, task.task_id, true, 'duplicate is idempotent');
+    assert.equal(firstEvaluation.decision.decision, 'ACCEPT');
+    assert.equal(duplicateEvaluation.idempotent, true);
+    assert.equal(events(root).filter((entry) => (
+      entry.type === 'EVENT_CONSUMED' && entry.source_event_id === eventId
+    )).length, 1);
+    assert.equal(events(root).filter((entry) => (
+      entry.type === 'SUPERVISOR_DECISION' && entry.task_id === task.task_id
+    )).length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(hostRoot, { recursive: true, force: true });
   }
 });
 
@@ -2250,7 +2455,11 @@ test('unchanged delivery fences preserve canonical plain Codex resume exactly on
       bindingDependencies: bound.dependencies,
       dispatcher,
     });
+    assert.throws(() => consumeWakeDelivery(root, secondEvent.event_id, {
+      generation,
+    }), /requires exact delivery identity/);
     assert.equal(consumeWakeDelivery(root, secondEvent.event_id, {
+      deliveryId: secondDelivered.receipt.delivery_id,
       generation,
     }).consumption.delivery_id, secondDelivered.receipt.delivery_id);
   } finally {
@@ -2430,72 +2639,6 @@ for (const regression of [
     }
   });
 }
-
-test('busy-before-acceptance remains queued and dispatcher retry follows an observed state change', async () => {
-  const root = fixture();
-  try {
-    const bound = bindingFixture(root);
-    const event = terminalEvent(root, 'busy-retry');
-    enqueueTerminalWake(root, event);
-    const dispatcherOwner = processIdentity(process.pid);
-    const dispatcher = stageDispatcher(root, {
-      pid: dispatcherOwner.pid,
-      startTime: dispatcherOwner.start_time_ticks,
-    });
-    dispatcher.process.executable = dispatcherOwner.executable;
-    writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
-    let calls = 0;
-    let opportunityWaits = 0;
-    let opportunityRegistrations = 0;
-    let delayCalls = 0;
-    const transport = {
-      kind: 'plain-codex-resume',
-      resume: (request) => {
-        calls += 1;
-        if (calls === 1) {
-          return { classification: 'busy', reason: 'codex-resume-busy-before-acceptance' };
-        }
-        return confirmedResumeResult(request.session_id, request.message, 9200, {
-          accepted_ordinal: 20, accepted_record_sha256: 'c'.repeat(64),
-          turn_began_ordinal: 21, turn_began_record_sha256: 'd'.repeat(64),
-          turn_id: 'turn-busy-retry', turn_started_at_ms: 2,
-        });
-      },
-    };
-    const result = await runWakeDispatcher(root, {
-      dispatcherId: dispatcher.dispatcher_id,
-      dispatcherGeneration: dispatcher.dispatcher_generation,
-      launchNonce: dispatcher.launch_nonce,
-      pid: dispatcher.process.pid,
-      getProcessIdentity: () => dispatcher.process,
-      nativeTransport: transport,
-      bindingDependencies: bound.dependencies,
-      observeBoundRollout: (_fixtureRoot, baseline) => {
-        opportunityRegistrations += 1;
-        assert.equal(baseline.path, realpathSync(bound.rolloutPath));
-        return {
-        close() {},
-        wait: async () => {
-          opportunityWaits += 1;
-          return { type: 'bound-rollout-state-change', path: bound.rolloutPath };
-        },
-        };
-      },
-      delay: async () => { delayCalls += 1; },
-      maxCycles: 2,
-    });
-    assert.equal(opportunityWaits, 1);
-    assert.equal(opportunityRegistrations, 2);
-    assert.equal(delayCalls, 0);
-    assert.equal(calls, 2, JSON.stringify(result));
-    assert.equal(result.results[0].classification, 'native-delivered');
-    const decision = readJson(join(root, '.opsle', 'wake', 'activation-decisions', `${event.event_id}.json`));
-    assert.equal(decision.status, 'DELIVERED');
-    assert.equal(decision.prior_attempts[0].status, 'BUSY');
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 test('dispatcher rechecks the queue after replacing its post-drain observation', async () => {
   const root = fixture();
@@ -2737,7 +2880,7 @@ test('late exact confirmation reconciles one uncertain attempt without transport
   }
 });
 
-test('known busy bound rollout is durably deferred before transport and retries after exact rollout change', () => {
+test('known busy bound rollout submits immediately and does not replay after delivery', () => {
   const root = fixture();
   try {
     const bound = bindingFixture(root);
@@ -2757,23 +2900,6 @@ test('known busy bound rollout is durably deferred before transport and retries 
         return confirmedResumeResult(request.session_id, request.message, 9600);
       },
     };
-    const busy = deliverWake(root, event.event_id, {
-      nativeTransport: transport,
-      bindingDependencies: bound.dependencies,
-      dispatcher,
-    });
-    assert.equal(busy.classification, 'busy');
-    assert.equal(busy.reason, 'bound-rollout-known-busy-before-transport');
-    assert.equal(calls, 0);
-    const decisionPath = join(root, '.opsle', 'wake', 'activation-decisions', `${event.event_id}.json`);
-    assert.equal(readJson(decisionPath).status, 'BUSY');
-    assert.equal(readdirSync(join(root, '.opsle', 'wake', 'transport-attempts')).length, 0);
-
-    writeFileSync(bound.rolloutPath, `${readFileSync(bound.rolloutPath, 'utf8')}${JSON.stringify({
-      ordinal: 2,
-      type: 'event_msg',
-      payload: { type: 'task_complete', turn_id: 'turn-already-running' },
-    })}\n`);
     const delivered = deliverWake(root, event.event_id, {
       nativeTransport: transport,
       bindingDependencies: bound.dependencies,
@@ -2781,7 +2907,22 @@ test('known busy bound rollout is durably deferred before transport and retries 
     });
     assert.equal(delivered.classification, 'native-delivered');
     assert.equal(calls, 1);
-    assert.equal(readJson(decisionPath).prior_attempts[0].status, 'BUSY');
+    const decisionPath = join(root, '.opsle', 'wake', 'activation-decisions', `${event.event_id}.json`);
+    assert.equal(readJson(decisionPath).status, 'DELIVERED');
+    assert.equal(readdirSync(join(root, '.opsle', 'wake', 'transport-attempts')).length, 1);
+
+    writeFileSync(bound.rolloutPath, `${readFileSync(bound.rolloutPath, 'utf8')}${JSON.stringify({
+      ordinal: 2,
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'turn-already-running' },
+    })}\n`);
+    const duplicate = deliverWake(root, event.event_id, {
+      nativeTransport: transport,
+      bindingDependencies: bound.dependencies,
+      dispatcher,
+    });
+    assert.equal(duplicate.classification, 'duplicate');
+    assert.equal(calls, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

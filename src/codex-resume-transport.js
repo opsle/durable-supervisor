@@ -11,7 +11,6 @@ import {
 import { delimiter, join, resolve } from 'node:path';
 import { canonicalJson, sha256 } from './io.js';
 
-const BUSY_PATTERN = /already.*(?:running|busy)|active turn|turn.*in progress|session.*busy/i;
 const REJECTION_PATTERN = /session.*(?:not found|invalid|rejected)|(?:invalid|unknown).*session/i;
 const rolloutLineHashes = new WeakMap();
 const MAX_CAPTURE_BYTES = 64 * 1024;
@@ -388,30 +387,9 @@ export async function runCodexResumeTransport({
   };
   checkpoint('initialized-before-spawn');
   if (before.length > 0) {
-    evidence.status = 'KNOWN_BUSY_BEFORE_SPAWN';
     evidence.process.frontends = before.map(publicProcessIdentity).filter(Boolean);
-    evidence.outcome = {
-      classification: 'busy',
-      reason: 'matching-resume-frontend-already-exists-before-spawn',
-    };
-    evidence.confirmation_absence = evidence.outcome.reason;
-    evidence.timestamps.outcome_at = new Date(nowMs()).toISOString();
-    evidence.timestamps.cleanup_completed_at = evidence.timestamps.outcome_at;
-    evidence.cleanup = {
-      required: false,
-      cleanup_proven: false,
-      duplicate_frontend_count: before.length,
-      reason: 'preexisting-matching-frontend-is-not-owned-by-this-attempt',
-    };
-    checkpoint('known-busy-before-spawn');
-    return {
-      ...evidence.outcome,
-      argv,
-      spawned: false,
-      duplicate_frontend_count: before.length,
-      cleanup_proven: false,
-      transport_attempt_id: evidence.transport_attempt_id ?? null,
-    };
+    evidence.process.frontend_identity_absence = null;
+    checkpoint('preexisting-matching-frontend-observed');
   }
   let watcher;
   let timer;
@@ -526,16 +504,12 @@ export async function runCodexResumeTransport({
       : 'launcher-process-exited-before-proc-identity-scan';
     checkpoint('spawned');
     const inspectOutput = () => {
-      // The rollout remains authoritative when its exact acceptance records
-      // are already durable, even if frontend output also contains busy text.
+      // The rollout is authoritative. Codex may report that a turn is active
+      // while still accepting this message into its own session queue.
       inspect();
       if (settled) return;
       const output = `${stdout.toString('utf8')}\n${stderr.toString('utf8')}`;
-      if (BUSY_PATTERN.test(output)) finish({
-        classification: 'busy',
-        reason: 'codex-resume-busy-before-acceptance',
-      });
-      else if (REJECTION_PATTERN.test(output)) finish({
+      if (REJECTION_PATTERN.test(output)) finish({
         classification: 'rejected',
         reason: 'codex-session-rejected-before-acceptance',
       });
@@ -574,29 +548,29 @@ export async function runCodexResumeTransport({
       inspect();
       if (settled) return;
       const output = `${stdout.toString('utf8')}\n${stderr.toString('utf8')}`;
-      finish(BUSY_PATTERN.test(output)
+      finish(REJECTION_PATTERN.test(output)
         ? {
-          classification: 'busy',
-          reason: 'codex-resume-busy-before-acceptance',
+          classification: 'rejected',
+          reason: 'codex-session-rejected-before-acceptance',
         }
-        : (REJECTION_PATTERN.test(output)
-          ? {
-            classification: 'rejected',
-            reason: 'codex-session-rejected-before-acceptance',
-          }
-          : {
-            classification: 'uncertain',
-            reason: 'codex-resume-exited-without-rollout-acceptance-proof',
-          }));
+        : {
+          classification: 'uncertain',
+          reason: 'codex-resume-exited-without-rollout-acceptance-proof',
+        });
     });
     timer = scheduleTimeout(() => {
       // fs.watch notifications may be coalesced before both records are
       // complete. Re-read exact file state at the already-bounded deadline so
       // durable acceptance evidence cannot be hidden by a lost later callback.
       inspect();
+      if (!settled && child?.exitCode == null && child?.signalCode == null) {
+        evidence.confirmation_absence = 'queued-submission-awaiting-authoritative-rollout';
+        checkpoint('live-queued-submission-preserved');
+        return;
+      }
       if (!settled) finish({
         classification: 'uncertain',
-        reason: 'rollout-confirmation-deadline-reached-after-spawn',
+        reason: 'rollout-confirmation-deadline-reached-after-frontend-exit',
       });
     }, confirmationTimeoutMs);
     inspect();

@@ -20,10 +20,15 @@ import { releaseClaim, validateTaskCommands } from './pipeline.js';
 import {
   applyWakeEvent,
   enqueueTerminalWake,
-  ensureWakeDispatcher,
   registerWait,
   terminalWakeType,
 } from './wakeup.js';
+import {
+  assertReleaseFence,
+  createReleaseFence,
+  processStartIdentity,
+  releaseIdentity,
+} from './runtime-release.js';
 
 const CONTEXT_PACKET_SCHEMA = 'opsle.durable-supervisor.context-firewall-packet/v2';
 const BYTE_MEASUREMENT = Object.freeze({
@@ -266,6 +271,9 @@ export function codexLaunchSpec(root, task, attempt, {
   lastMessagePath,
   inheritedEnvironment = process.env,
 } = {}) {
+  if (attempt.policy_snapshot?.context_firewall_enabled !== true) {
+    throw new Error('Context Firewall is mandatory for Runner execution');
+  }
   const route = attempt.policy_snapshot.selected_route;
   assertIsolatedCodexRoute(route);
   const decision = attempt.policy_snapshot.gearbox_decision;
@@ -679,6 +687,8 @@ export async function launchDetachedAttempt(root, task, attempt, claim, {
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
     launch_nonce: launchNonce,
+    expected_release: releaseIdentity('runner-worker'),
+    release_fence: null,
     launcher_pid: process.pid,
     worker_pid: null,
     status: 'SPAWNING',
@@ -698,6 +708,9 @@ export async function launchDetachedAttempt(root, task, attempt, claim, {
     ], { cwd: root, detached: true, stdio: 'ignore' });
     if (!Number.isInteger(worker.pid)) throw new Error('detached Runner did not receive a worker PID');
     record.worker_pid = worker.pid;
+    const workerIdentity = processStartIdentity(worker.pid);
+    if (!workerIdentity) throw new Error('detached Runner process-start identity was unavailable');
+    record.release_fence = createReleaseFence('runner-worker', workerIdentity);
     record.status = 'LAUNCHED';
     writeJson(recordPath, record);
     worker.unref();
@@ -763,6 +776,7 @@ export async function runDetachedWorker(root, attemptId, launchNonce, {
       'detached Runner launch identity did not match durable record',
     );
   }
+  assertReleaseFence(record.release_fence, { role: 'runner-worker' });
   const supervisor = readJson(p.supervisor);
   if (record.supervisor_id !== supervisor.supervisor_id
       || record.supervisor_generation !== supervisor.generation) {
@@ -829,6 +843,9 @@ export async function runAttempt(root, task, attempt, claim, {
   const p = paths(root);
   const attemptPath = join(p.attempts, `${attempt.attempt_id}.json`);
   validateTaskCommands(task);
+  if (attempt.policy_snapshot?.context_firewall_enabled !== true) {
+    throw new Error('Context Firewall is mandatory for Runner execution');
+  }
   if (!prepared) prepareAttemptLaunch(root, task, attempt, detached ? 'detached-worker' : 'foreground-wait');
   const rawDirectory = join(p.raw, attempt.attempt_id);
   mkdirSync(rawDirectory, { recursive: true, mode: 0o700 });
@@ -1087,11 +1104,7 @@ export async function runAttempt(root, task, attempt, claim, {
   let wakeDispatcher = null;
   if (detached) {
     wakeRequest = enqueueTerminalWake(root, completionEvent);
-    try {
-      wakeDispatcher = ensureWakeDispatcher(root);
-    } catch (error) {
-      wakeDispatcher = { started: false, reason: 'dispatcher-start-error', error: error.message };
-    }
+    wakeDispatcher = { started: false, reason: 'opsled-owns-persistent-wake-dispatch' };
   } else {
     emit(root, 'SUPERVISOR_ACTIVATION', {
       classification: 'terminal-event',

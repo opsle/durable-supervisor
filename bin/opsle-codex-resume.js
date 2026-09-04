@@ -7,6 +7,14 @@ import {
   commitConfirmedWakeReceipt,
   updateCommittedWakeCleanup,
 } from '../src/wakeup.js';
+import {
+  assertReleaseFence,
+  compatibilityPreflight,
+  createReleaseFence,
+  loadRuntimeRelease,
+  releaseIdentity,
+  sameReleaseIdentity,
+} from '../src/runtime-release.js';
 
 function valueAfter(args, flag) {
   const index = args.indexOf(flag);
@@ -38,6 +46,17 @@ export async function resumeHelperResult(args, {
   try {
     const attemptEvidence = evidencePath ? readEvidence(evidencePath) : null;
     const repositoryRoot = attemptEvidence?.repository_realpath ?? null;
+    loadRuntimeRelease();
+    if (repositoryRoot) compatibilityPreflight(repositoryRoot, { operation: 'read' });
+    if (attemptEvidence?.helper?.expected_release) {
+      const expected = releaseIdentity('codex-resume');
+      if (!sameReleaseIdentity(attemptEvidence.helper.expected_release, expected)) {
+        throw new Error('runtime release fence mismatch');
+      }
+      attemptEvidence.helper.release_fence = createReleaseFence('codex-resume');
+      assertReleaseFence(attemptEvidence.helper.release_fence, { role: 'codex-resume' });
+      writeEvidence(evidencePath, attemptEvidence);
+    }
     const result = await runTransport({
       sessionId,
       message,

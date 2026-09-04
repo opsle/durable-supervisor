@@ -498,6 +498,9 @@ export function renderWakeStatus(value, { verbose = false, referenceTime = Date.
     lines.push(`Session reasons: ${(value.session_binding?.reasons ?? []).join(', ') || 'none'}`);
     lines.push(`Dispatcher ID: ${value.dispatcher?.dispatcher_id ?? 'none'}`);
     lines.push(`Dispatcher status: ${value.dispatcher?.status ?? 'not-started'}`);
+    lines.push(`Dispatcher implementation current: ${value.dispatcher?.implementation_fence?.current === true ? 'yes' : 'no'}`);
+    lines.push(`Dispatcher implementation expected: ${value.dispatcher?.implementation_fence?.expected_sha256 ?? 'unknown'}`);
+    lines.push(`Dispatcher implementation observed: ${value.dispatcher?.implementation_fence?.observed_sha256 ?? 'unknown'}`);
   }
   return lines.join('\n');
 }

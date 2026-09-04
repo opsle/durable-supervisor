@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { runDetachedWorker } from '../src/runner.js';
+import { compatibilityPreflight, loadRuntimeRelease } from '../src/runtime-release.js';
 
 function valueAfter(args, flag) {
   const index = args.indexOf(flag);
@@ -16,6 +17,8 @@ if (!root || !attemptId || !launchNonce) {
   process.stderr.write('detached Runner requires --root, --attempt, and --launch-nonce\n');
   process.exitCode = 1;
 } else {
+  loadRuntimeRelease();
+  compatibilityPreflight(root, { operation: 'read' });
   runDetachedWorker(root, attemptId, launchNonce).catch((error) => {
     process.stderr.write(`detached Runner: ${error.message}\n`);
     process.exitCode = 1;
