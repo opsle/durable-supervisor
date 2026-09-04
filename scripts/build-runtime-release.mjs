@@ -75,8 +75,10 @@ const releaseContentRevision = releaseContent.digest('hex');
 const helpers = [
   ['bin/opsle-codex-resume.js', 'codex-resume'],
   ['bin/opsle-runner-worker.js', 'runner-worker'],
-  ['bin/opsle-wake-delivery.js', 'wake-delivery'],
   ['bin/opsle.js', 'cli'],
+  ['bin/opsled-wake-worker.js', 'opsled-wake-worker'],
+  ['bin/opsled-worker.js', 'opsled-worker'],
+  ['bin/opsled.js', 'opsled'],
 ].map(([path, role]) => ({ path, role, sha256: sha256(readFileSync(join(root, path))) }));
 
 // The manifest mode is part of the logical package digest. Normalize it before

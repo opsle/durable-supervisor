@@ -175,14 +175,11 @@ export function deriveDisplayState({
       const detachedOwned = exactRunnerOwnership({
         attempt, claim, runner, supervisor, processIsAlive,
       });
-      const foregroundOwned = !runner
-        && Number.isInteger(attempt.pid)
-        && processIsAlive(attempt.pid);
-      child = detachedOwned || foregroundOwned
+      child = detachedOwned
         ? { label: attempt.child_state, reason: null, attention: false }
         : {
           label: 'UNKNOWN',
-          reason: 'running state lacks current exact Runner or foreground process ownership',
+          reason: 'running state lacks current exact Runner ownership',
           attention: true,
         };
     } else if (TERMINAL_CHILD_STATES.has(attempt.child_state)) {
@@ -229,15 +226,12 @@ export function deriveDisplayState({
   };
 }
 
-export function deriveSupervisorLiveness({ authorityStatus, herdr, tmuxAlive = false }) {
+export function deriveSupervisorLiveness({ authorityStatus, herdr }) {
   if (authorityStatus !== 'AUTHORITATIVE') {
     return { classification: 'unknown', authority: null, reason: 'supervisor-authority-not-current' };
   }
   if (herdr?.valid === true && herdr.classification === 'bound-authoritative-herdr') {
     return { classification: 'alive', authority: 'herdr', reason: null };
-  }
-  if (tmuxAlive && !herdr?.reasons?.some((reason) => reason.includes('concurrent live tmux'))) {
-    return { classification: 'alive', authority: 'tmux-fallback', reason: null };
   }
   return {
     classification: 'unknown',
@@ -407,7 +401,6 @@ export function renderSupervisorStatus(value, {
     lines.push(`Herdr classification: ${value.session_binding.classification}`);
     lines.push(`Herdr session ID: ${value.session_binding.binding?.codex_session_uuid ?? 'none'}`);
     lines.push(`Herdr reasons: ${(value.session_binding.reasons ?? []).join(', ') || 'none'}`);
-    lines.push(`Tmux fallback: ${value.supervisor.tmux_session ?? 'not configured'} (${value.supervisor.tmux_alive ? 'available' : 'unavailable'})`);
     lines.push(`Objective: ${value.objective?.objective ?? 'unknown'}`);
     if (active) {
       lines.push('');
@@ -474,7 +467,6 @@ export function renderWakeStatus(value, { verbose = false, referenceTime = Date.
   }
   lines.push(`Queue: ${selected.actionable_count} actionable; ${(value.requests ?? []).length} total`);
   lines.push(`Herdr: ${value.session_binding?.valid === true ? 'current' : words(value.session_binding?.classification)}`);
-  lines.push(`Dispatcher: ${value.dispatcher?.current === true ? 'current' : (value.dispatcher ? 'not current' : 'not started')}`);
   if (verbose) {
     lines.push('');
     lines.push('WAKE DIAGNOSTICS');
@@ -490,11 +482,6 @@ export function renderWakeStatus(value, { verbose = false, referenceTime = Date.
     }
     lines.push(`Session classification: ${value.session_binding?.classification ?? 'unknown'}`);
     lines.push(`Session reasons: ${(value.session_binding?.reasons ?? []).join(', ') || 'none'}`);
-    lines.push(`Dispatcher ID: ${value.dispatcher?.dispatcher_id ?? 'none'}`);
-    lines.push(`Dispatcher status: ${value.dispatcher?.status ?? 'not-started'}`);
-    lines.push(`Dispatcher implementation current: ${value.dispatcher?.implementation_fence?.current === true ? 'yes' : 'no'}`);
-    lines.push(`Dispatcher implementation expected: ${value.dispatcher?.implementation_fence?.expected_sha256 ?? 'unknown'}`);
-    lines.push(`Dispatcher implementation observed: ${value.dispatcher?.implementation_fence?.observed_sha256 ?? 'unknown'}`);
   }
   return lines.join('\n');
 }

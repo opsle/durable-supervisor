@@ -840,7 +840,7 @@ export async function runAttempt(root, task, attempt, claim, {
   const p = paths(root);
   const attemptPath = join(p.attempts, `${attempt.attempt_id}.json`);
   validateTaskCommands(task);
-  if (!prepared) prepareAttemptLaunch(root, task, attempt, detached ? 'detached-worker' : 'foreground-wait');
+  if (!prepared) prepareAttemptLaunch(root, task, attempt, detached ? 'detached-worker' : 'runner-worker');
   const rawDirectory = join(p.raw, attempt.attempt_id);
   mkdirSync(rawDirectory, { recursive: true, mode: 0o700 });
   const stdoutPath = join(rawDirectory, 'stdout.jsonl');
@@ -1072,9 +1072,7 @@ export async function runAttempt(root, task, attempt, claim, {
     terminal_type: wakeType,
     model_turns_used_for_polling: null,
     activation_counts: attempt.telemetry.activation_counts,
-    wait_mechanism: detached
-      ? 'detached Runner worker OS close event; no initiating supervisor wait cell'
-      : 'foreground compatibility Runner OS close event with registered terminal wake',
+    wait_mechanism: 'detached Runner worker OS close event; no initiating supervisor wait cell',
   });
   attempt.wait_registration = applyWakeEvent(attempt.wait_registration, {
     event_id: completionEvent.event_id,
@@ -1095,10 +1093,8 @@ export async function runAttempt(root, task, attempt, claim, {
     pause: currentState.pause,
   });
   let wakeRequest = null;
-  let wakeDispatcher = null;
   if (detached) {
     wakeRequest = enqueueTerminalWake(root, completionEvent);
-    wakeDispatcher = { started: false, reason: 'opsled-owns-persistent-wake-dispatch' };
   } else {
     emit(root, 'SUPERVISOR_ACTIVATION', {
       classification: 'terminal-event',
@@ -1122,6 +1118,5 @@ export async function runAttempt(root, task, attempt, claim, {
     completion,
     completion_event: completionEvent,
     wake_request: wakeRequest,
-    wake_dispatcher: wakeDispatcher,
   };
 }

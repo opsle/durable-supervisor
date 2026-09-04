@@ -43,7 +43,7 @@ test('immutable release manifest verifies the complete normalized package and ev
   assert.match(release.packaged_artifact_sha256, /^[a-f0-9]{64}$/);
   assert.deepEqual(release.helpers.map((entry) => entry.role).sort(), [
     'cli', 'codex-resume', 'opsled', 'opsled-wake-worker', 'opsled-worker',
-    'runner-worker', 'wake-delivery',
+    'runner-worker',
   ]);
   assert.ok(release.artifact.files.some((entry) => entry.path === 'release-manifest.json'));
   assert.ok(release.artifact.files.some((entry) => entry.path === 'package.json'));

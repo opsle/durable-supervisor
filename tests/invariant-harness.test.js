@@ -19,11 +19,11 @@ import {
   unsatisfiedRequirements, updateState, validateDurableState,
 } from '../src/state.js';
 import { recover } from '../src/cli.js';
-import { renderWakeStatus } from '../src/operator-display.js';
+import { createReleaseFence } from '../src/runtime-release.js';
 import {
   adoptCodexSessionBinding, applyWakeEvent, bindCodexSession, consumeWakeDelivery,
   deliverWake, enqueueTerminalWake, processIdentity, registerWait,
-  WAKE_DISPATCHER_IMPLEMENTATION_SHA256, wakeQueueStatus,
+  WAKE_WORKER_IMPLEMENTATION_SHA256,
 } from '../src/wakeup.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
@@ -241,7 +241,6 @@ function stageBinding(root, suffix = 'one') {
     processIdentity: (pid) => (pid === process.pid ? structuredClone(process) : null),
     codexVersion: () => 'codex-cli 0.152.0',
     uid: () => 1000,
-    legacyTmuxAuthority: () => false,
     environment: () => ({
       CODEX_SESSION_ID: sessionId,
       CODEX_THREAD_ID: sessionId,
@@ -294,22 +293,16 @@ function confirmedResume(sessionId, message) {
   };
 }
 
-function stageDispatcher(root) {
-  const supervisor = readJson(paths(root).supervisor);
+function stageWakeOwner() {
   const owner = processIdentity(process.pid);
-  const dispatcher = {
-    schema: 'opsle.durable-supervisor.host-wake-dispatcher/v1',
-    dispatcher_id: 'dispatcher-invariant',
-    dispatcher_generation: 1,
-    implementation_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-    supervisor_id: supervisor.supervisor_id,
-    supervisor_generation: supervisor.generation,
-    queue_generation: supervisor.generation,
+  return {
+    schema: 'opsle.durable-supervisor.opsled-wake-owner/v1',
+    kind: 'opsled-wake-worker',
+    service_id: 'opsled-invariant',
+    service_generation: 1,
+    release_fence: createReleaseFence('opsled-wake-worker', owner),
     process: owner,
-    status: 'OWNED',
   };
-  writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
-  return dispatcher;
 }
 
 function stageDeliveredWake(root) {
@@ -322,10 +315,10 @@ function stageDeliveredWake(root) {
     terminal_type: 'child-completed',
   });
   const request = enqueueTerminalWake(root, event);
-  const dispatcher = stageDispatcher(root);
+  const activationOwner = stageWakeOwner();
   const delivered = deliverWake(root, event.event_id, {
     bindingDependencies: binding.dependencies,
-    dispatcher,
+    activationOwner,
     nativeTransport: {
       kind: 'plain-codex-resume',
       resume: ({ session_id: sessionId, message }) => confirmedResume(sessionId, message),
@@ -339,7 +332,7 @@ function stageDeliveredWake(root) {
   const bindingPath = join(root, '.opsle', 'wake', 'codex-session-binding.json');
   return {
     root, event, request, receipt, requestPath, receiptPath, decisionPath,
-    bindingPath, supervisor, binding, dispatcher,
+    bindingPath, supervisor, binding, activationOwner,
   };
 }
 
@@ -508,12 +501,12 @@ test('ownership-vector harness fences wake consumption dimensions and multi-stal
       const binding = readJson(value.bindingPath); binding.host.terminal_id = 'terminal-replaced'; writeJson(value.bindingPath, binding);
     }],
     ['implementation hash', (value) => {
-      value.receipt.dispatcher_implementation_sha256 = '0'.repeat(64); writeJson(value.receiptPath, value.receipt);
+      value.receipt.wake_worker_implementation_sha256 = '0'.repeat(64); writeJson(value.receiptPath, value.receipt);
     }],
     ['multi-stale identity generation session and implementation', (value) => {
       value.request.target.supervisor_id = 'supervisor-foreign';
       value.receipt.supervisor_generation += 1;
-      value.receipt.dispatcher_implementation_sha256 = '0'.repeat(64);
+      value.receipt.wake_worker_implementation_sha256 = '0'.repeat(64);
       writeJson(value.requestPath, value.request);
       writeJson(value.receiptPath, value.receipt);
       const binding = readJson(value.bindingPath); binding.binding_revision += 1; writeJson(value.bindingPath, binding);
@@ -608,13 +601,6 @@ test('ownership-vector harness fences final delivery commitment after transport 
           writeJson(paths(value.root).supervisor, supervisor);
         };
       }],
-      ['dispatcher implementation replacement', (value) => {
-        value.duringTransport = () => {
-          const dispatcher = readJson(value.dispatcherPath);
-          dispatcher.implementation_sha256 = '0'.repeat(64);
-          writeJson(value.dispatcherPath, dispatcher);
-        };
-      }],
       ['session host replacement', (value) => {
         value.duringTransport = () => {
           const binding = readJson(value.bindingPath);
@@ -633,25 +619,24 @@ test('ownership-vector harness fences final delivery commitment after transport 
     setup: () => {
       const root = repository();
       const binding = stageBinding(root);
-      const dispatcher = stageDispatcher(root);
+      const activationOwner = stageWakeOwner();
       const event = emit(root, 'CHILD_COMPLETION', {
         task_id: 'task-delivery-vector', attempt_id: 'attempt-delivery-vector',
         wait_id: 'attempt-delivery-vector', terminal_type: 'child-completed',
       });
       enqueueTerminalWake(root, event);
       return {
-        root, binding, dispatcher, event,
+        root, binding, activationOwner, event,
         requestPath: join(root, '.opsle', 'wake', 'requests', `${event.event_id}.json`),
         receiptPath: join(root, '.opsle', 'wake', 'deliveries', `${event.event_id}.json`),
         decisionPath: join(root, '.opsle', 'wake', 'activation-decisions', `${event.event_id}.json`),
-        dispatcherPath: join(root, '.opsle', 'wake', 'dispatcher.json'),
         bindingPath: join(root, '.opsle', 'wake', 'codex-session-binding.json'),
         duringTransport: () => {},
       };
     },
     invoke: (value) => deliverWake(value.root, value.event.event_id, {
       bindingDependencies: value.binding.dependencies,
-      dispatcher: value.dispatcher,
+      activationOwner: value.activationOwner,
       nativeTransport: {
         kind: 'plain-codex-resume',
         resume: ({ session_id: sessionId, message }) => {
@@ -872,10 +857,10 @@ test('bounded durable state machine preserves global invariants after every auth
       terminal_type: 'child-completed',
     });
     enqueueTerminalWake(root, event);
-    const dispatcher = stageDispatcher(root);
+    const activationOwner = stageWakeOwner();
     const delivered = deliverWake(root, event.event_id, {
       bindingDependencies: secondBinding.dependencies,
-      dispatcher,
+      activationOwner,
       nativeTransport: {
         kind: 'plain-codex-resume',
         resume: ({ session_id: sessionId, message }) => confirmedResume(sessionId, message),
@@ -1031,56 +1016,5 @@ test('historical semantic replays remain inert and byte-identical', () => {
     rmSync(claimRoot, { recursive: true, force: true });
     rmSync(wakeRoot, { recursive: true, force: true });
     rmSync(foreignRoot, { recursive: true, force: true });
-  }
-});
-
-test('dispatcher machine and verbose status expose implementation currentness', () => {
-  const root = repository();
-  try {
-    const supervisor = readJson(paths(root).supervisor);
-    const owner = processIdentity(process.pid);
-    const dispatcherPath = join(root, '.opsle', 'wake', 'dispatcher.json');
-    mkdirSync(join(root, '.opsle', 'wake'), { recursive: true });
-    const dispatcher = {
-      schema: 'opsle.durable-supervisor.host-wake-dispatcher/v1',
-      dispatcher_id: 'dispatcher-invariant',
-      dispatcher_generation: 1,
-      implementation_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-      supervisor_id: supervisor.supervisor_id,
-      supervisor_generation: supervisor.generation,
-      queue_generation: supervisor.generation,
-      process: owner,
-      status: 'OWNED',
-    };
-    writeJson(dispatcherPath, dispatcher);
-    const dependencies = {
-      environment: () => ({}), sessionsRoot: () => join(root, 'missing-codex-sessions'),
-    };
-    const current = wakeQueueStatus(root, {
-      bindingDependencies: dependencies, getProcessIdentity: () => owner,
-    });
-    assert.equal(current.dispatcher.current, true);
-    assert.deepEqual(current.dispatcher.implementation_fence, {
-      expected_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-      observed_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-      current: true,
-    });
-
-    dispatcher.implementation_sha256 = '0'.repeat(64);
-    writeJson(dispatcherPath, dispatcher);
-    const stale = wakeQueueStatus(root, {
-      bindingDependencies: dependencies, getProcessIdentity: () => owner,
-    });
-    assert.equal(stale.dispatcher.current, false);
-    assert.equal(stale.dispatcher.implementation_fence.current, false);
-    assert.equal(stale.dispatcher.implementation_fence.observed_sha256, '0'.repeat(64));
-    const concise = renderWakeStatus(stale);
-    const verbose = renderWakeStatus(stale, { verbose: true });
-    assert.doesNotMatch(concise, /implementation expected|implementation observed/i);
-    assert.match(verbose, /Dispatcher implementation current: no/);
-    assert.match(verbose, new RegExp(WAKE_DISPATCHER_IMPLEMENTATION_SHA256));
-    assert.match(verbose, /0{64}/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
   }
 });

@@ -42,7 +42,6 @@ export function discoverCapabilities(root) {
     rg: executable('rg'),
     codex: executable('codex'),
     claude: executable('claude'),
-    tmux: executable('tmux'),
   };
   const siblings = {};
   for (const name of [
@@ -67,7 +66,7 @@ export function discoverCapabilities(root) {
     schema: 'opsle.durable-supervisor.discovery/v1',
     discovered_at: now(),
     commands: Object.fromEntries(Object.entries(commands).map(([name, path]) => [name, {
-      available: Boolean(path), path, version: version(path, name === 'tmux' ? ['-V'] : ['--version']),
+      available: Boolean(path), path, version: version(path),
     }])),
     sibling_components: siblings,
   };

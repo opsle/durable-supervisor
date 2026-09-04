@@ -17,7 +17,6 @@ export const RUNTIME_HELPER_ROLES = Object.freeze({
   'bin/opsle.js': 'cli',
   'bin/opsle-codex-resume.js': 'codex-resume',
   'bin/opsle-runner-worker.js': 'runner-worker',
-  'bin/opsle-wake-delivery.js': 'wake-delivery',
   'bin/opsled.js': 'opsled',
   'bin/opsled-worker.js': 'opsled-worker',
   'bin/opsled-wake-worker.js': 'opsled-wake-worker',

@@ -6,8 +6,8 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
-  readdirSync,
   realpathSync,
+  readdirSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -19,12 +19,6 @@ import test from 'node:test';
 import { profileCodexActivations } from '../src/activation-telemetry.js';
 import { createAttempt, createTask, routeTask } from '../src/pipeline.js';
 import { runAttempt } from '../src/runner.js';
-import {
-  classifyCodexPane,
-  consumeTerminalSession,
-  createTmuxHost,
-  registerAtomicReplaceWait,
-} from '../src/host-terminal.js';
 import { readJson, sha256, writeJson } from '../src/io.js';
 import { emit, initialize, paths, validateDurableState } from '../src/state.js';
 import {
@@ -40,10 +34,8 @@ import {
   acquireActivationLease,
   ACTIVATION_LEASE_TTL_MS,
   adoptCodexSessionBinding,
-  adoptQueuedWakes,
   applyWakeEvent,
   bindCodexSession,
-  classifyWakeDelivery,
   classifyQueuedWake,
   commitConfirmedWakeReceipt,
   codexSessionBindingStatus,
@@ -51,20 +43,16 @@ import {
   consumeWakeDelivery,
   deliverWake,
   decisionFenceCurrent,
-  drainWakeQueue,
   enqueueTerminalWake,
-  ensureWakeDispatcher,
   CODEX_RESUME_HELPER_TIMEOUT_MS,
   plainCodexResumeTransport,
   processIdentity,
   refreshCodexSessionBinding,
-  registerBoundRolloutOpportunity,
   registerWait,
   releaseActivationLease,
-  runWakeDispatcher,
   updateCommittedWakeCleanup,
   wakeDeliveryConsumptionStatus,
-  WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+  WAKE_WORKER_IMPLEMENTATION_SHA256,
   wakeQueueStatus,
 } from '../src/wakeup.js';
 import { consumeEvent, evaluateTask, sessionCommand } from '../src/cli.js';
@@ -93,76 +81,17 @@ function fixture() {
   return root;
 }
 
-function hostEvidence(overrides = {}) {
-  return {
-    available: true,
-    session_alive: true,
-    session_name: 'opsle-wake-fixture',
-    pane_id: '%7',
-    pane_pid: 700,
-    pane_dead: false,
-    current_command: 'codex',
-    cursor: { x: 0, y: 40 },
-    capture_sha256: 'a'.repeat(64),
-    attached_clients: [],
-    codex_process: {
-      pid: 701,
-      start_time_ticks: '12345',
-      executable: '/opt/codex',
-    },
-    prompt_state: 'idle',
-    prompt_idle: true,
-    composer_empty: true,
-    composer_text: '',
-    reason: 'empty-codex-composer-at-cursor',
-    ...overrides,
-  };
-}
-
-function stageDispatcher(root, {
-  dispatcherId = 'wake-dispatcher-fixture',
-  dispatcherGeneration = 1,
-  pid = 8100,
-  startTime = '810000',
-  status = 'LAUNCHED',
-} = {}) {
-  const supervisor = readJson(paths(root).supervisor);
-  const process = { pid, start_time_ticks: startTime, executable: '/usr/bin/node' };
-  const record = {
-    schema: 'opsle.durable-supervisor.host-wake-dispatcher/v1',
-    dispatcher_id: dispatcherId,
-    dispatcher_generation: dispatcherGeneration,
-    implementation_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-    supervisor_id: supervisor.supervisor_id,
-    supervisor_generation: supervisor.generation,
-    queue_generation: supervisor.generation,
-    launch_nonce: `launch-${dispatcherGeneration}`,
-    process,
-    release_fence: createReleaseFence('wake-delivery', process),
-    status,
-    launched_at: '2026-09-01T00:00:00.000Z',
-    owned_at: status === 'OWNED' ? '2026-09-01T00:00:01.000Z' : null,
-    last_observed_at: null,
-    last_result: null,
-    failure: null,
-  };
-  mkdirSync(join(root, '.opsle', 'wake'), { recursive: true });
-  writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), record);
-  return record;
-}
-
-function stageCurrentDispatcher(root, overrides = {}) {
+function currentWakeOwner(overrides = {}) {
   const owner = processIdentity(process.pid);
-  const dispatcher = stageDispatcher(root, {
-    status: 'OWNED',
-    pid: owner.pid,
-    startTime: owner.start_time_ticks,
+  return {
+    schema: 'opsle.durable-supervisor.opsled-wake-owner/v1',
+    kind: 'opsled-wake-worker',
+    service_id: 'opsled-fixture',
+    service_generation: 1,
+    release_fence: createReleaseFence('opsled-wake-worker', owner),
+    process: owner,
     ...overrides,
-  });
-  dispatcher.process.executable = owner.executable;
-  dispatcher.release_fence = createReleaseFence('wake-delivery', dispatcher.process);
-  writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
-  return dispatcher;
+  };
 }
 
 function confirmedResumeResult(sessionId, message, processGroup, overrides = {}) {
@@ -203,7 +132,7 @@ function terminalEvent(root, suffix = 'one') {
   });
 }
 
-function bindingFixture(root, { duplicate = false, bind = true, legacyTmuxSession = null } = {}) {
+function bindingFixture(root, { duplicate = false, bind = true } = {}) {
   const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
   const sessionsRoot = join(root, 'codex-sessions');
   mkdirSync(sessionsRoot, { recursive: true });
@@ -263,7 +192,6 @@ function bindingFixture(root, { duplicate = false, bind = true, legacyTmuxSessio
     processIdentity: (pid) => structuredClone(processes.get(pid) ?? null),
     codexVersion: () => 'codex-cli 0.152.0',
     uid: () => 1000,
-    legacyTmuxAuthority: () => false,
     environment: () => ({
       CODEX_SESSION_ID: sessionId,
       CODEX_THREAD_ID: sessionId,
@@ -290,7 +218,6 @@ function bindingFixture(root, { duplicate = false, bind = true, legacyTmuxSessio
       workspaceCwd: host.workspace_cwd,
       paneId: host.pane_id,
       terminalId: host.terminal_id,
-      legacyTmuxSession,
     }, { dependencies });
   }
   return { sessionId, sessionsRoot, rolloutPath, processes, host, dependencies };
@@ -660,7 +587,7 @@ test('confirmed receipt is committed before signaling and cleanup failure remain
     const bound = bindingFixture(root);
     const event = terminalEvent(root, 'receipt-before-cleanup');
     enqueueTerminalWake(root, event);
-    const dispatcher = stageCurrentDispatcher(root);
+    const activationOwner = currentWakeOwner();
     const ordering = [];
     let calls = 0;
     const transport = {
@@ -742,7 +669,7 @@ test('confirmed receipt is committed before signaling and cleanup failure remain
     const delivered = deliverWake(root, event.event_id, {
       nativeTransport: transport,
       bindingDependencies: bound.dependencies,
-      dispatcher,
+      activationOwner,
     });
     assert.equal(delivered.classification, 'native-delivered');
     assert.equal(delivered.delivered, true);
@@ -752,7 +679,7 @@ test('confirmed receipt is committed before signaling and cleanup failure remain
     assert.equal(deliverWake(root, event.event_id, {
       nativeTransport: transport,
       bindingDependencies: bound.dependencies,
-      dispatcher,
+      activationOwner,
     }).classification, 'duplicate');
     assert.equal(calls, 1);
     assert.equal(events(root).filter((entry) => (
@@ -769,12 +696,6 @@ test('fenced receipt rejects stale repository authorities and mismatched confirm
       const value = readJson(paths(root).supervisor);
       value.generation += 1;
       writeJson(paths(root).supervisor, value);
-    }],
-    ['dispatcher-generation', (root) => {
-      const path = join(root, '.opsle', 'wake', 'dispatcher.json');
-      const value = readJson(path);
-      value.dispatcher_generation += 1;
-      writeJson(path, value);
     }],
     ['request', (root, eventId) => {
       const path = join(root, '.opsle', 'wake', 'requests', `${eventId}.json`);
@@ -808,9 +729,9 @@ test('fenced receipt rejects stale repository authorities and mismatched confirm
       const bound = bindingFixture(root);
       const event = terminalEvent(root, `receipt-fence-${name}`);
       enqueueTerminalWake(root, event);
-      const dispatcher = stageCurrentDispatcher(root);
+      const activationOwner = currentWakeOwner();
       const result = deliverWake(root, event.event_id, {
-        dispatcher,
+        activationOwner,
         bindingDependencies: bound.dependencies,
         nativeTransport: {
           kind: 'plain-codex-resume',
@@ -1432,7 +1353,7 @@ test('opsled submits into a busy Codex queue and consumes and evaluates exactly 
       'original-herdr-tui-processed',
     ]);
     const delivered = dispatched.results[0].receipt;
-    assert.equal(delivered.dispatcher_id, null);
+    assert.equal(delivered.wake_worker_implementation_sha256, WAKE_WORKER_IMPLEMENTATION_SHA256);
     assert.equal(delivered.wake_owner.kind, 'opsled');
 
     const generation = readJson(paths(root).supervisor).generation;
@@ -1640,39 +1561,6 @@ test('transport journal distinguishes spawn failure, session rejection, and earl
   }
 });
 
-test('bound rollout opportunity closes registration races exactly once', async () => {
-  const root = fixture();
-  try {
-    const bound = bindingFixture(root);
-    const stats = statSync(bound.rolloutPath);
-    const baseline = {
-      path: realpathSync(bound.rolloutPath),
-      device: stats.dev,
-      inode: stats.ino,
-      size_bytes: stats.size,
-    };
-    const watcher = new EventEmitter();
-    let closes = 0;
-    watcher.close = () => { closes += 1; };
-    const observation = registerBoundRolloutOpportunity(root, baseline, {
-      watchFactory: (directory) => {
-        assert.equal(directory, resolve(bound.rolloutPath, '..'));
-        writeFileSync(bound.rolloutPath, `${readFileSync(bound.rolloutPath, 'utf8')}${JSON.stringify({
-          ordinal: 2, type: 'event_msg', payload: { type: 'turn_complete' },
-        })}\n`);
-        return watcher;
-      },
-    });
-    const first = await observation.wait();
-    const second = await observation.wait();
-    assert.equal(first.type, 'bound-rollout-state-change');
-    assert.deepEqual(second, first);
-    assert.equal(closes, 1);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test('nonterminal wrapper returns and heartbeat cannot make a wait model-ready', () => {
   let current = wait();
   for (const [index, type] of [
@@ -1691,7 +1579,7 @@ test('nonterminal wrapper returns and heartbeat cannot make a wait model-ready',
   }
 });
 
-test('heartbeat and nonterminal progress cannot enter the dispatcher queue', () => {
+test('heartbeat and nonterminal progress cannot enter the wake queue', () => {
   const root = fixture();
   try {
     for (const type of ['HEARTBEAT', 'CHILD_PROGRESS']) {
@@ -1733,87 +1621,6 @@ test('terminal and human wakes are distinct and duplicate terminal wake is idemp
   }]);
 });
 
-test('host adapter mechanically consumes nonterminal returns inside one bounded wait', async () => {
-  const results = [
-    { session_id: 7 },
-    { session_id: 7 },
-    { exit_code: 0, output: 'done' },
-  ];
-  const consumed = await consumeTerminalSession({
-    start: async () => results.shift(),
-    resume: async () => results.shift(),
-    deadlineMs: 100,
-    nowMs: () => 0,
-  });
-  assert.equal(consumed.result.exit_code, 0);
-  assert.equal(consumed.nonterminal_returns_consumed, 2);
-  assert.equal(results.length, 0);
-});
-
-test('host adapter fails closed when its explicit deadline expires', async () => {
-  await assert.rejects(
-    consumeTerminalSession({
-      start: async () => ({ session_id: 9 }),
-      resume: async () => new Promise(() => {}),
-      deadlineMs: Date.now() + 10,
-    }),
-    (error) => error.code === 'TERMINAL_WAIT_DEADLINE',
-  );
-});
-
-test('visible Codex pane classification distinguishes idle, busy, composed, and ambiguous states', () => {
-  assert.equal(classifyCodexPane('header\n› \nfooter\n', { x: 2, y: 1 }).prompt_state, 'idle');
-  assert.equal(classifyCodexPane('header\n• Working (2s • esc to interrupt)\n', { x: 3, y: 1 }).prompt_state, 'busy');
-  assert.equal(classifyCodexPane('header\n› do not submit this\n', { x: 20, y: 1 }).prompt_state, 'human-composer');
-  assert.equal(classifyCodexPane('header\nno prompt\n', { x: 0, y: 1 }).prompt_state, 'ambiguous');
-});
-
-test('tmux commit uses one server-side predicate sequence for literal paste and Enter', () => {
-  for (const changedAtBoundary of [false, true]) {
-    const calls = [];
-    const deliveryId = changedAtBoundary ? 'delivery-rejected' : 'delivery-submitted';
-    const marker = `${changedAtBoundary ? 'rejected' : 'submitted'}-${deliveryId}`;
-    const host = createTmuxHost({
-      run(command, args) {
-        calls.push({ command, args });
-        if (args[0] === 'show-options') return { status: 0, stdout: `${marker}\n`, stderr: '' };
-        return { status: 0, stdout: '', stderr: '' };
-      },
-    });
-    const result = host.commit({
-      expected: {
-        session_name: 'opsle-wake-fixture',
-        pane_id: '%7',
-        pane_pid: 700,
-        current_command: 'codex',
-        cursor: { x: 0, y: 40 },
-        capture_sha256: 'a'.repeat(64),
-        codex_process: hostEvidence().codex_process,
-        durable_files: [
-          { path: '/tmp/supervisor.json', sha256: 'b'.repeat(64) },
-          { path: '/tmp/request.json', sha256: 'c'.repeat(64) },
-          { path: '/tmp/receipt.json', sha256: 'd'.repeat(64) },
-        ],
-      },
-      prompt: 'literal prompt; no shell interpretation',
-      deliveryId,
-    });
-    assert.equal(result.submitted, !changedAtBoundary);
-    const commitCall = calls.find((call) => call.args[0] === 'if-shell');
-    assert.ok(commitCall);
-    assert.match(commitCall.args[4], /session_attached/);
-    assert.match(commitCall.args[4], /cursor_x/);
-    assert.match(commitCall.args[4], /pane_current_command/);
-    assert.match(commitCall.args[5], /paste-buffer .* ; send-keys .* Enter ; set-option/);
-    assert.match(commitCall.args[5], /capture-pane/);
-    assert.match(commitCall.args[5], /\/proc\/701\/stat/);
-    assert.match(commitCall.args[5], /supervisor\.json/);
-    assert.equal(calls.filter((call) => call.args[0] === 'send-keys').length, 0);
-    assert.equal(calls[0].args[0], 'set-buffer');
-    assert.equal(calls[0].args.at(-1), 'literal prompt; no shell interpretation');
-  }
-});
-
 test('trajectory evidence classifies terminal, human, and wait-induced activations', () => {
   const output = (timestamp, value) => ({
     timestamp,
@@ -1853,88 +1660,6 @@ test('trajectory evidence classifies terminal, human, and wait-induced activatio
   });
 });
 
-test('delivery classification uses current host evidence and fails closed for unsafe states', () => {
-  const supervisor = { supervisor_id: 'supervisor-1', generation: 3 };
-  const request = {
-    schema: 'opsle.durable-supervisor.host-wake-request/v1',
-    target: { supervisor_id: 'supervisor-1', supervisor_generation: 3, tmux_session: 'opsle-wake-fixture' },
-    queue_version: 1,
-  };
-  const classify = (values = {}) => classifyWakeDelivery({
-    request,
-    supervisor,
-    busy: null,
-    evidence: hostEvidence(),
-    ...values,
-  }).classification;
-  assert.equal(classify(), 'prompt-idle');
-  assert.equal(classify({ busy: { event_id: 'busy' } }), 'busy');
-  assert.equal(classify({ evidence: hostEvidence({ attached_clients: ['/dev/pts/9'] }) }), 'human-interacting');
-  assert.equal(classify({ evidence: { available: false } }), 'unavailable');
-  assert.equal(classify({ supervisor: { ...supervisor, generation: 4 } }), 'stale-generation');
-  assert.equal(classify({ evidence: hostEvidence({ prompt_state: 'busy', prompt_idle: false }) }), 'busy');
-  assert.equal(classify({
-    evidence: hostEvidence({
-      prompt_state: 'human-composer',
-      prompt_idle: false,
-      composer_empty: false,
-      composer_text: 'human draft',
-    }),
-  }), 'human-interacting');
-  assert.equal(classify({
-    evidence: hostEvidence({ prompt_state: 'ambiguous', prompt_idle: false, composer_empty: false }),
-  }), 'ambiguous-composer');
-
-  const nativeRequest = {
-    ...request,
-    schema: 'opsle.durable-supervisor.native-wake-request/v2',
-  };
-  assert.equal(classifyWakeDelivery({
-    request: nativeRequest,
-    supervisor,
-    busy: { event_id: 'active-delivery' },
-    evidence: hostEvidence({ prompt_state: 'busy', prompt_idle: false }),
-  }).classification, 'native-ready');
-});
-
-test('duplicate dispatcher start is idempotent and exact process death advances dispatcher generation', () => {
-  const root = fixture();
-  try {
-    let nextPid = 8200;
-    const live = new Map();
-    const getProcessIdentity = (pid) => live.get(pid) ?? null;
-    const spawnProcess = () => {
-      const pid = nextPid;
-      nextPid += 1;
-      live.set(pid, { pid, start_time_ticks: String(pid * 10), executable: '/usr/bin/node' });
-      return { pid, unref() {} };
-    };
-    const first = ensureWakeDispatcher(root, { spawnProcess, getProcessIdentity });
-    const duplicate = ensureWakeDispatcher(root, { spawnProcess, getProcessIdentity });
-    assert.equal(first.started, true);
-    assert.equal(duplicate.started, false);
-    assert.equal(nextPid, 8201);
-    live.delete(first.dispatcher.process.pid);
-    const restarted = ensureWakeDispatcher(root, { spawnProcess, getProcessIdentity });
-    assert.equal(restarted.started, true);
-    assert.equal(restarted.dispatcher.dispatcher_generation, first.dispatcher.dispatcher_generation + 1);
-    assert.equal(nextPid, 8202);
-
-    restarted.dispatcher.implementation_sha256 = '0'.repeat(64);
-    writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), restarted.dispatcher);
-    const upgraded = ensureWakeDispatcher(root, { spawnProcess, getProcessIdentity });
-    assert.equal(upgraded.started, true);
-    assert.equal(upgraded.dispatcher.dispatcher_generation, restarted.dispatcher.dispatcher_generation + 1);
-    assert.equal(
-      upgraded.dispatcher.implementation_sha256,
-      WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-    );
-    assert.equal(nextPid, 8203);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test('authoritative Herdr Codex binding validates exact identity and rejects generation drift', () => {
   const root = fixture();
   try {
@@ -1960,8 +1685,7 @@ test('authoritative Herdr Codex binding validates exact identity and rejects gen
     assert.equal(status.binding.host.authority, 'authoritative');
     assert.equal(status.binding.host.process.uid, 1000);
     assert.equal(status.binding.native_wake.transport, 'plain-codex-resume');
-    assert.equal(status.binding.authority_fence.legacy_tmux_session, null);
-    assert.equal(status.binding.authority_fence.legacy_tmux_fallback_configured, false);
+    assert.equal(status.binding.authority_fence, undefined);
     assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
 
     const supervisor = readJson(paths(root).supervisor);
@@ -2004,10 +1728,6 @@ test('session binding fails deterministically for duplicate and mismatched ident
       ...dependencies,
       processIdentity: (pid) => (pid === 700 ? null : dependencies.processIdentity(pid)),
     }), 'herdr-host-process-dead-or-reused'],
-    ['old tmux authority returned', ({ dependencies }) => ({
-      ...dependencies,
-      legacyTmuxAuthority: () => true,
-    }), 'old-tmux-authority-live'],
     ['installed CLI changed', ({ dependencies }) => ({
       ...dependencies,
       codexVersion: () => 'codex-cli 0.153.0',
@@ -2105,57 +1825,6 @@ test('session binding fails deterministically for duplicate and mismatched ident
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  }
-});
-
-test('authoritative Herdr binding rejects stale tmux authority before any transport call', async () => {
-  const root = fixture();
-  try {
-    const bound = bindingFixture(root, { legacyTmuxSession: 'opsle-wake-fixture' });
-    const event = terminalEvent(root, 'unsupported-writer');
-    enqueueTerminalWake(root, event);
-    let resumeCalls = 0;
-    bound.dependencies.legacyTmuxAuthority = () => true;
-    const nativeTransport = {
-      kind: 'plain-codex-resume',
-      resume: () => { resumeCalls += 1; return {
-        classification: 'confirmed', cleanup_proven: true,
-        authoritative_host_continuity_proven: true,
-      }; },
-    };
-    const result = deliverWake(root, event.event_id, {
-      nativeTransport,
-      bindingDependencies: bound.dependencies,
-    });
-    assert.equal(result.classification, 'queued');
-    assert.equal(result.reason, 'codex-session-binding-refresh-unproven');
-    assert.equal(result.delivered, false);
-    assert.equal(resumeCalls, 0);
-    assert.equal(existsSync(join(root, '.opsle', 'wake', 'requests', `${event.event_id}.json`)), true);
-    assert.equal(existsSync(join(root, '.opsle', 'wake', 'deliveries', `${event.event_id}.json`)), false);
-    assert.equal(existsSync(join(root, '.opsle', 'wake', 'activation-decisions', `${event.event_id}.json`)), false);
-
-    const owner = processIdentity(process.pid);
-    const dispatcher = stageDispatcher(root, {
-      pid: owner.pid,
-      startTime: owner.start_time_ticks,
-    });
-    dispatcher.process.executable = owner.executable;
-    writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
-    const dispatched = await runWakeDispatcher(root, {
-      dispatcherId: dispatcher.dispatcher_id,
-      dispatcherGeneration: dispatcher.dispatcher_generation,
-      launchNonce: dispatcher.launch_nonce,
-      pid: dispatcher.process.pid,
-      getProcessIdentity: () => dispatcher.process,
-      nativeTransport,
-      bindingDependencies: bound.dependencies,
-      maxCycles: 1,
-    });
-    assert.equal(dispatched.results[0].classification, 'queued');
-    assert.equal(resumeCalls, 0);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -2266,7 +1935,7 @@ test('current Herdr snapshot refreshes from the attached frontend environment wi
     assert.equal(refreshed.binding.codex_session_uuid, bound.sessionId);
     assert.equal(refreshed.binding.host.process.pid, 699);
 
-    const dispatcherRefresh = refreshCodexSessionBinding(root, {
+    const repeatedRefresh = refreshCodexSessionBinding(root, {
       dependencies: {
         ...dependencies,
         environment: () => ({
@@ -2277,8 +1946,8 @@ test('current Herdr snapshot refreshes from the attached frontend environment wi
       },
       allowEnvironmentMismatch: true,
     });
-    assert.equal(dispatcherRefresh.valid, true);
-    assert.equal(dispatcherRefresh.binding.binding_id, refreshed.binding.binding_id);
+    assert.equal(repeatedRefresh.valid, true);
+    assert.equal(repeatedRefresh.binding.binding_id, refreshed.binding.binding_id);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2344,7 +2013,6 @@ test('failed session refresh preserves the last valid binding pointer byte for b
         return snapshot;
       } };
     }],
-    ['dual tmux authority', () => ({ legacyTmuxAuthority: () => true })],
   ];
   for (const [label, mutate] of cases) {
     const root = fixture();
@@ -2357,7 +2025,7 @@ test('failed session refresh preserves the last valid binding pointer byte for b
       assert.equal(result.preserved_prior_binding, true, label);
       assert.equal(typeof result.refresh_error, 'string', label);
       assert.equal(readFileSync(bindingPath, 'utf8'), firstBytes, label);
-      assert.equal(result.valid, label !== 'dual tmux authority', label);
+      assert.equal(result.valid, true, label);
       const repeated = refreshCodexSessionBinding(root, { dependencies });
       assert.equal(readFileSync(bindingPath, 'utf8'), firstBytes, label);
       if (label !== 'frontend discovery race') assert.equal(repeated.preserved_prior_binding, true, label);
@@ -2427,12 +2095,12 @@ test('binding revision is shared by status and resume freshness invalidates on f
   }
 });
 
-test('dispatcher refreshes immediately before delivery and never resumes a superseded frontend', () => {
+test('wake worker refreshes immediately before delivery and never resumes a superseded frontend', () => {
   const root = fixture();
   try {
     const bound = bindingFixture(root);
     const nextSession = '01a05952-e1fa-71e2-adea-df7e3f7d99cf';
-    writeFileSync(join(bound.sessionsRoot, 'rollout-dispatcher-next.jsonl'), `${JSON.stringify({
+    writeFileSync(join(bound.sessionsRoot, 'rollout-worker-next.jsonl'), `${JSON.stringify({
       type: 'session_meta', payload: { id: nextSession, cwd: root },
     })}\n`);
     bound.processes.set(701, {
@@ -2469,12 +2137,12 @@ test('dispatcher refreshes immediately before delivery and never resumes a super
         },
       }),
     };
-    const event = terminalEvent(root, 'dispatcher-refresh');
+    const event = terminalEvent(root, 'worker-refresh');
     enqueueTerminalWake(root, event);
-    const dispatcher = stageCurrentDispatcher(root);
+    const activationOwner = currentWakeOwner();
     let resumes = 0;
     const result = deliverWake(root, event.event_id, {
-      dispatcher,
+      activationOwner,
       bindingDependencies: dependencies,
       nativeTransport: {
         kind: 'plain-codex-resume',
@@ -2498,7 +2166,7 @@ test('unchanged delivery fences preserve canonical plain Codex resume exactly on
     const bound = bindingFixture(root);
     const event = terminalEvent(root, 'native-supported');
     enqueueTerminalWake(root, event);
-    const dispatcher = stageCurrentDispatcher(root);
+    const activationOwner = currentWakeOwner();
     const calls = [];
     const nativeTransport = {
       kind: 'plain-codex-resume',
@@ -2510,7 +2178,7 @@ test('unchanged delivery fences preserve canonical plain Codex resume exactly on
     const delivered = deliverWake(root, event.event_id, {
       nativeTransport,
       bindingDependencies: bound.dependencies,
-      dispatcher,
+      activationOwner,
     });
     assert.equal(delivered.delivered, true);
     assert.equal(calls.length, 1);
@@ -2523,7 +2191,7 @@ test('unchanged delivery fences preserve canonical plain Codex resume exactly on
     assert.equal(deliverWake(root, event.event_id, {
       nativeTransport,
       bindingDependencies: bound.dependencies,
-      dispatcher,
+      activationOwner,
     }).classification, 'duplicate');
     assert.equal(calls.length, 1);
     assert.deepEqual(delivered.receipt.temporary_frontend.argv, [
@@ -2570,7 +2238,7 @@ test('unchanged delivery fences preserve canonical plain Codex resume exactly on
     const secondDelivered = deliverWake(root, secondEvent.event_id, {
       nativeTransport,
       bindingDependencies: bound.dependencies,
-      dispatcher,
+      activationOwner,
     });
     assert.throws(() => consumeWakeDelivery(root, secondEvent.event_id, {
       generation,
@@ -2601,26 +2269,6 @@ for (const regression of [
       const supervisor = readJson(paths(root).supervisor);
       supervisor.supervisor_id = 'supervisor-mid-transport-replacement';
       writeJson(paths(root).supervisor, supervisor);
-    },
-  },
-  {
-    name: 'dispatcher generation replacement',
-    reason: 'dispatcher-fence-no-longer-current-after-native-transport',
-    mutate(root) {
-      const path = join(root, '.opsle', 'wake', 'dispatcher.json');
-      const dispatcher = readJson(path);
-      dispatcher.dispatcher_generation += 1;
-      writeJson(path, dispatcher);
-    },
-  },
-  {
-    name: 'dispatcher process replacement',
-    reason: 'dispatcher-fence-no-longer-current-after-native-transport',
-    mutate(root) {
-      const path = join(root, '.opsle', 'wake', 'dispatcher.json');
-      const dispatcher = readJson(path);
-      dispatcher.process.start_time_ticks = 'replacement-start-time';
-      writeJson(path, dispatcher);
     },
   },
   {
@@ -2680,7 +2328,7 @@ for (const regression of [
       const bound = bindingFixture(root);
       const event = terminalEvent(root, `post-transport-${regression.name.replaceAll(' ', '-')}`);
       enqueueTerminalWake(root, event);
-      const dispatcher = stageCurrentDispatcher(root);
+      const activationOwner = currentWakeOwner();
       const attemptPath = join(paths(root).attempts, `${event.attempt_id}.json`);
       writeJson(attemptPath, {
         attempt_id: event.attempt_id,
@@ -2708,7 +2356,7 @@ for (const regression of [
       const result = deliverWake(root, event.event_id, {
         nativeTransport,
         bindingDependencies: bound.dependencies,
-        dispatcher,
+        activationOwner,
       });
       assert.equal(result.classification, 'uncertain');
       assert.equal(result.reason, regression.reason);
@@ -2748,7 +2396,7 @@ for (const regression of [
       deliverWake(root, event.event_id, {
         nativeTransport,
         bindingDependencies: bound.dependencies,
-        dispatcher,
+        activationOwner,
       });
       assert.equal(transportCalls, 1);
     } finally {
@@ -2757,119 +2405,13 @@ for (const regression of [
   });
 }
 
-test('dispatcher rechecks the queue after replacing its post-drain observation', async () => {
-  const root = fixture();
-  try {
-    const firstEvent = terminalEvent(root, 'drain-resubscribe-first');
-    enqueueTerminalWake(root, firstEvent);
-    const owner = processIdentity(process.pid);
-    const dispatcher = stageDispatcher(root, {
-      pid: owner.pid,
-      startTime: owner.start_time_ticks,
-    });
-    dispatcher.process.executable = owner.executable;
-    writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
-    let gapEvent;
-    let observationRegistrations = 0;
-    let observationWaits = 0;
-    let opportunityCloses = 0;
-    const result = await runWakeDispatcher(root, {
-      dispatcherId: dispatcher.dispatcher_id,
-      dispatcherGeneration: dispatcher.dispatcher_generation,
-      launchNonce: dispatcher.launch_nonce,
-      pid: dispatcher.process.pid,
-      getProcessIdentity: () => dispatcher.process,
-      registerObservation: () => {
-        observationRegistrations += 1;
-        return {
-          close() {},
-          wait: async () => {
-            observationWaits += 1;
-            throw new Error('dispatcher slept with receipt-free work queued');
-          },
-        };
-      },
-      observeBoundRollout: () => ({
-        close: () => {
-          opportunityCloses += 1;
-          if (opportunityCloses === 1) {
-            // Insert after the first batch drain and before its replacement
-            // queue observation is registered.
-            gapEvent = terminalEvent(root, 'drain-resubscribe-gap');
-            enqueueTerminalWake(root, gapEvent);
-          }
-        },
-        wait: async () => ({ type: 'bound-rollout-state-change' }),
-      }),
-      maxCycles: 2,
-    });
-    assert.equal(result.reason, 'test-cycle-limit');
-    assert.equal(observationRegistrations, 3);
-    assert.equal(observationWaits, 0);
-    assert.ok(gapEvent);
-    assert.ok(result.results.some((entry) => entry.event_id === gapEvent.event_id));
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('uncertain dispatcher delivery is not replayed while late confirmation gets one opportunity', async () => {
-  const root = fixture();
-  try {
-    const bound = bindingFixture(root);
-    const event = terminalEvent(root, 'uncertain-no-replay');
-    enqueueTerminalWake(root, event);
-    const owner = processIdentity(process.pid);
-    const dispatcher = stageDispatcher(root, {
-      pid: owner.pid,
-      startTime: owner.start_time_ticks,
-    });
-    dispatcher.process.executable = owner.executable;
-    writeJson(join(root, '.opsle', 'wake', 'dispatcher.json'), dispatcher);
-    let calls = 0;
-    let waits = 0;
-    let closes = 0;
-    const result = await runWakeDispatcher(root, {
-      dispatcherId: dispatcher.dispatcher_id,
-      dispatcherGeneration: dispatcher.dispatcher_generation,
-      launchNonce: dispatcher.launch_nonce,
-      pid: dispatcher.process.pid,
-      getProcessIdentity: () => dispatcher.process,
-      nativeTransport: {
-        kind: 'plain-codex-resume',
-        resume: () => {
-          calls += 1;
-          return { classification: 'uncertain', reason: 'fixture-uncertain' };
-        },
-      },
-      bindingDependencies: bound.dependencies,
-      observeBoundRollout: () => ({
-        close: () => { closes += 1; },
-        wait: async () => {
-          waits += 1;
-          return { type: 'bound-rollout-state-change' };
-        },
-      }),
-      maxCycles: 2,
-    });
-    assert.equal(result.reason, 'test-cycle-limit');
-    assert.equal(calls, 1);
-    assert.equal(waits, 1);
-    assert.equal(closes, 2);
-    const decision = readJson(join(root, '.opsle', 'wake', 'activation-decisions', `${event.event_id}.json`));
-    assert.equal(decision.status, 'UNCERTAIN');
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test('late exact confirmation reconciles one uncertain attempt without transport replay or duplicate activation', () => {
   const root = fixture();
   try {
     const bound = bindingFixture(root);
     const event = terminalEvent(root, 'late-confirmation');
     enqueueTerminalWake(root, event);
-    const dispatcher = stageCurrentDispatcher(root);
+    const activationOwner = currentWakeOwner();
     let calls = 0;
     const transport = {
       kind: 'plain-codex-resume',
@@ -2942,7 +2484,7 @@ test('late exact confirmation reconciles one uncertain attempt without transport
     const first = deliverWake(root, event.event_id, {
       nativeTransport: transport,
       bindingDependencies: bound.dependencies,
-      dispatcher,
+      activationOwner,
     });
     assert.equal(first.classification, 'uncertain');
     assert.equal(calls, 1);
@@ -2952,21 +2494,21 @@ test('late exact confirmation reconciles one uncertain attempt without transport
 
     const message = constructWakeMessage(event.event_id, readJson(paths(root).supervisor).generation);
     appendWakeConfirmation(bound.rolloutPath, bound.sessionId, message);
-    const staleDispatcher = structuredClone(dispatcher);
-    staleDispatcher.dispatcher_generation -= 1;
+    const staleOwner = structuredClone(activationOwner);
+    staleOwner.process.start_time_ticks = 'stale-start-time';
     const stale = deliverWake(root, event.event_id, {
       nativeTransport: transport,
       bindingDependencies: bound.dependencies,
-      dispatcher: staleDispatcher,
+      activationOwner: staleOwner,
     });
     assert.equal(stale.classification, 'stale-generation');
-    assert.equal(stale.reason, 'late-confirmation-dispatcher-fence-not-current');
+    assert.equal(stale.reason, 'late-confirmation-opsled-owner-fence-not-current');
     assert.equal(readJson(decisionPath).status, 'UNCERTAIN');
     assert.equal(calls, 1);
     const reconciled = deliverWake(root, event.event_id, {
       nativeTransport: transport,
       bindingDependencies: bound.dependencies,
-      dispatcher,
+      activationOwner,
     });
     assert.equal(reconciled.classification, 'native-delivered');
     assert.equal(reconciled.receipt.late_confirmation, true);
@@ -2985,7 +2527,7 @@ test('late exact confirmation reconciles one uncertain attempt without transport
     const duplicate = deliverWake(root, event.event_id, {
       nativeTransport: transport,
       bindingDependencies: bound.dependencies,
-      dispatcher,
+      activationOwner,
     });
     assert.equal(duplicate.classification, 'duplicate');
     assert.equal(calls, 1);
@@ -3003,7 +2545,7 @@ test('known busy bound rollout submits immediately and does not replay after del
     const bound = bindingFixture(root);
     const event = terminalEvent(root, 'known-busy-preflight');
     enqueueTerminalWake(root, event);
-    const dispatcher = stageCurrentDispatcher(root);
+    const activationOwner = currentWakeOwner();
     writeFileSync(bound.rolloutPath, `${readFileSync(bound.rolloutPath, 'utf8')}${JSON.stringify({
       ordinal: 1,
       type: 'event_msg',
@@ -3020,7 +2562,7 @@ test('known busy bound rollout submits immediately and does not replay after del
     const delivered = deliverWake(root, event.event_id, {
       nativeTransport: transport,
       bindingDependencies: bound.dependencies,
-      dispatcher,
+      activationOwner,
     });
     assert.equal(delivered.classification, 'native-delivered');
     assert.equal(calls, 1);
@@ -3036,7 +2578,7 @@ test('known busy bound rollout submits immediately and does not replay after del
     const duplicate = deliverWake(root, event.event_id, {
       nativeTransport: transport,
       bindingDependencies: bound.dependencies,
-      dispatcher,
+      activationOwner,
     });
     assert.equal(duplicate.classification, 'duplicate');
     assert.equal(calls, 1);
@@ -3048,8 +2590,9 @@ test('known busy bound rollout submits immediately and does not replay after del
 test('activation decision fence rejects malformed, expired, and boundary expiry', () => {
   const root = fixture();
   try {
+    const activationOwner = currentWakeOwner();
     const acquired = acquireActivationLease(root, 'event-fence-expiry', {
-      nowMs: 1_000,
+      activationOwner, nowMs: 1_000,
       ttlMs: 100,
     });
     assert.equal(acquired.acquired, true);
@@ -3077,7 +2620,7 @@ test('post-transport lease expiry without takeover is uncertain and non-replayab
     const bound = bindingFixture(root);
     const event = terminalEvent(root, 'post-transport-lease-expiry');
     enqueueTerminalWake(root, event);
-    const dispatcher = stageCurrentDispatcher(root);
+    const activationOwner = currentWakeOwner();
     const attemptPath = join(paths(root).attempts, `${event.attempt_id}.json`);
     writeJson(attemptPath, {
       attempt_id: event.attempt_id,
@@ -3107,7 +2650,7 @@ test('post-transport lease expiry without takeover is uncertain and non-replayab
     const deliveryOptions = {
       nativeTransport,
       bindingDependencies: bound.dependencies,
-      dispatcher,
+      activationOwner,
       getActivationNowMs: () => (
         transportCompleted
           ? acquiredAtMs + ACTIVATION_LEASE_TTL_MS + 1
@@ -3163,16 +2706,17 @@ test('post-transport lease expiry without takeover is uncertain and non-replayab
 test('activation lease serializes owners, fences generations, expires, and releases idempotently', () => {
   const root = fixture();
   try {
-    const first = acquireActivationLease(root, 'event-one', { nowMs: 1_000, ttlMs: 100 });
+    const activationOwner = currentWakeOwner();
+    const first = acquireActivationLease(root, 'event-one', { activationOwner, nowMs: 1_000, ttlMs: 100 });
     assert.equal(first.acquired, true);
     assert.equal(first.lease.fencing_token, 1);
-    const duplicate = acquireActivationLease(root, 'event-one', { nowMs: 1_010, ttlMs: 100 });
+    const duplicate = acquireActivationLease(root, 'event-one', { activationOwner, nowMs: 1_010, ttlMs: 100 });
     assert.equal(duplicate.acquired, true);
     assert.equal(duplicate.duplicate, true);
-    const simultaneous = acquireActivationLease(root, 'event-two', { nowMs: 1_020, ttlMs: 100 });
+    const simultaneous = acquireActivationLease(root, 'event-two', { activationOwner, nowMs: 1_020, ttlMs: 100 });
     assert.equal(simultaneous.acquired, false);
     assert.equal(simultaneous.classification, 'busy');
-    const takeover = acquireActivationLease(root, 'event-two', { nowMs: 1_101, ttlMs: 100 });
+    const takeover = acquireActivationLease(root, 'event-two', { activationOwner, nowMs: 1_101, ttlMs: 100 });
     assert.equal(takeover.acquired, true);
     assert.equal(takeover.takeover, true);
     assert.equal(takeover.lease.fencing_token, 2);
@@ -3180,20 +2724,20 @@ test('activation lease serializes owners, fences generations, expires, and relea
     assert.equal(releaseActivationLease(root, takeover.lease).released, true);
     assert.equal(releaseActivationLease(root, takeover.lease).duplicate, true);
 
-    const third = acquireActivationLease(root, 'event-three', { nowMs: 1_200, ttlMs: 100 });
+    const third = acquireActivationLease(root, 'event-three', { activationOwner, nowMs: 1_200, ttlMs: 100 });
     const supervisor = readJson(paths(root).supervisor);
     supervisor.generation += 1;
     writeJson(paths(root).supervisor, supervisor);
-    const generationTakeover = acquireActivationLease(root, 'event-four', { nowMs: 1_210, ttlMs: 100 });
+    const generationTakeover = acquireActivationLease(root, 'event-four', { activationOwner, nowMs: 1_210, ttlMs: 100 });
     assert.equal(generationTakeover.acquired, true);
     assert.equal(generationTakeover.lease.supervisor_generation, supervisor.generation);
     assert.ok(generationTakeover.lease.fencing_token > third.lease.fencing_token);
 
-    const currentDispatcher = stageDispatcher(root, { status: 'OWNED' });
-    const staleDispatcher = { ...currentDispatcher, dispatcher_generation: 0 };
-    const stale = acquireActivationLease(root, 'event-five', { dispatcher: staleDispatcher });
+    const staleOwner = structuredClone(activationOwner);
+    staleOwner.process.start_time_ticks = 'stale-start-time';
+    const stale = acquireActivationLease(root, 'event-five', { activationOwner: staleOwner });
     assert.equal(stale.acquired, false);
-    assert.equal(stale.classification, 'stale-dispatcher');
+    assert.equal(stale.classification, 'stale-owner');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -3205,6 +2749,7 @@ test('uncertain plain resume activation never crosses the decision boundary twic
     const bound = bindingFixture(root);
     const event = terminalEvent(root, 'native-crash');
     enqueueTerminalWake(root, event);
+    const activationOwner = currentWakeOwner();
     let calls = 0;
     const transport = {
       kind: 'plain-codex-resume',
@@ -3213,11 +2758,13 @@ test('uncertain plain resume activation never crosses the decision boundary twic
     const first = deliverWake(root, event.event_id, {
       nativeTransport: transport,
       bindingDependencies: bound.dependencies,
+      activationOwner,
     });
     assert.equal(first.reason, 'crash-uncertain-delivery');
     const second = deliverWake(root, event.event_id, {
       nativeTransport: transport,
       bindingDependencies: bound.dependencies,
+      activationOwner,
     });
     assert.equal(second.reason, 'activation-decision-uncertain');
     assert.equal(calls, 1);
@@ -3253,10 +2800,12 @@ test('stale and evaluated historical wake requests are inert and byte-identical'
       adoptions: [],
     })}\n`);
     writeFileSync(legacyPath, legacyBytes);
-    const stale = drainWakeQueue(root)[0];
+    const stale = classifyQueuedWake(
+      root,
+      readJson(legacyPath),
+    );
     assert.equal(stale.classification, 'obsolete');
     assert.equal(stale.reason, 'wake-target-generation-is-stale');
-    assert.deepEqual(adoptQueuedWakes(root), []);
     assert.deepEqual(readFileSync(legacyPath), legacyBytes);
 
     const event = terminalEvent(root, 'evaluated');
@@ -3272,24 +2821,6 @@ test('stale and evaluated historical wake requests are inert and byte-identical'
     assert.equal(classified.reason, 'task-already-terminal-and-evaluated');
     assert.equal(deliverWake(root, event.event_id).classification, 'obsolete');
     assert.deepEqual(readFileSync(requestPath), before);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('directory-based compatibility wait observes atomic replacement without model polling', async () => {
-  const root = fixture();
-  try {
-    const target = join(root, 'terminal-state.json');
-    writeJson(target, { state: 'RUNNING' });
-    const observation = registerAtomicReplaceWait(target, {
-      read: (path) => readJson(path),
-      ready: (value) => value.state === 'TERMINAL',
-    });
-    writeJson(target, { state: 'TERMINAL', exit_code: 0 });
-    const result = await observation.wait();
-    assert.equal(result.type, 'terminal-file-ready');
-    assert.equal(result.value.exit_code, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
