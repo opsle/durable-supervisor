@@ -32,9 +32,10 @@ import { processStartIdentity } from '../src/runtime-release.js';
 import { initialize } from '../src/state.js';
 
 const sourceRoot = resolve(dirname(new URL(import.meta.url).pathname), '..');
-const sep2Runtime = process.env.OPSLE_SEP2_RUNTIME
+const priorRuntime = process.env.OPSLE_PRIOR_RUNTIME
   ?? '/home/deploy/.npm-global/lib/node_modules/@opsle/durable-supervisor';
-const sep2WakeupSha256 = 'e4c6cdc6da82904c363b934b9be1e764555377b909fae7ccad5a2ccf410e511a';
+const priorWakeupSha256 = process.env.OPSLE_PRIOR_WAKEUP_SHA256
+  ?? 'e4c6cdc6da82904c363b934b9be1e764555377b909fae7ccad5a2ccf410e511a';
 
 async function waitFor(check, message, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
@@ -154,20 +155,20 @@ test('host runtime upgrade installs by digest, migrates managed repositories, an
   }
 });
 
-test('takeover retires an already-running managed Sep-2 helper before release B becomes current', {
-  skip: !existsSync(join(sep2Runtime, 'bin', 'opsle-wake-delivery.js')),
+test('takeover retires an already-running managed prior helper before release B becomes current', {
+  skip: !existsSync(join(priorRuntime, 'bin', 'opsle-wake-delivery.js')),
   timeout: 30000,
 }, async () => {
   const hostRoot = mkdtempSync(join(tmpdir(), 'opsle-runtime-prior-helper-'));
   const root = repository('prior-helper');
-  const installedWakeup = join(sep2Runtime, 'src', 'wakeup.js');
+  const installedWakeup = join(priorRuntime, 'src', 'wakeup.js');
   let priorIdentity = null;
   let targetStarted = null;
   let sawQuiescedLaunchGate = false;
   try {
-    assert.equal(fileSha256(installedWakeup), sep2WakeupSha256);
+    assert.equal(fileSha256(installedWakeup), priorWakeupSha256);
     const launched = spawnSync(process.execPath, [
-      join(sep2Runtime, 'bin', 'opsle.js'), 'wake', 'start',
+      join(priorRuntime, 'bin', 'opsle.js'), 'wake', 'start',
     ], { cwd: root, encoding: 'utf8' });
     assert.equal(launched.status, 0, launched.stderr);
     const dispatcherPath = join(root, '.opsle', 'wake', 'dispatcher.json');
@@ -213,7 +214,7 @@ test('takeover retires an already-running managed Sep-2 helper before release B 
         ? status
         : null;
     }, 'release B did not own normal repository operation');
-    assert.equal(fileSha256(installedWakeup), sep2WakeupSha256);
+    assert.equal(fileSha256(installedWakeup), priorWakeupSha256);
   } finally {
     await stopInstalledOpsled(targetStarted, hostRoot);
     if (priorIdentity && processStartIdentity(priorIdentity.pid)?.start_time_ticks
