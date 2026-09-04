@@ -27,7 +27,6 @@ import {
   emit,
   initialize,
   paths,
-  policyWithDefaults,
   repositoryRoot,
   setRequirements,
   updateState,
@@ -79,7 +78,6 @@ import {
   consumeReconciledTransportNotStarted,
 } from './wakeup.js';
 import {
-  compatibilityPreflight,
   loadRuntimeRelease,
 } from './runtime-release.js';
 
@@ -105,7 +103,6 @@ commands:
   policy status [--verbose|--json]
   policy enable PROVIDER
   policy disable PROVIDER
-  policy context-firewall enable|disable
   policy review MODE [--reviewer PROVIDER]
   models status [--verbose|--json]
   models enable|disable [PROVIDER]
@@ -252,8 +249,7 @@ function measuredElapsedMs(attempt) {
 
 function updatePolicy(root, mutate, actor = 'operator-cli') {
   const p = paths(root);
-  const policy = policyWithDefaults(readJson(p.policy));
-  delete policy.context_firewall.defaulted_for_compatibility;
+  const policy = readJson(p.policy);
   const before = JSON.parse(JSON.stringify(policy));
   mutate(policy);
   policy.version += 1;
@@ -399,7 +395,7 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
   const supervisor = readJson(p.supervisor);
   const state = readJson(p.state);
   const objective = readJson(p.objective);
-  const policy = policyWithDefaults(readJson(p.policy));
+  const policy = readJson(p.policy);
   const matrix = effectiveRequirementMatrix(root, { state });
   const task = state.active_task_id && existsSync(join(p.tasks, `${state.active_task_id}.json`))
     ? readJson(join(p.tasks, `${state.active_task_id}.json`)) : null;
@@ -508,8 +504,6 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
       reviewer: policy.review.reviewer,
       affected_verification: policy.affected_verification.authority,
       model_polling_permitted: policy.model_polling.permitted,
-      context_firewall_enabled: policy.context_firewall.enabled,
-      context_firewall_defaulted: policy.context_firewall.defaulted_for_compatibility === true,
     },
     progress: {
       requirements: counts,
@@ -1057,10 +1051,9 @@ export async function main(args) {
     const result = initialize(root, { objectiveText: valueAfter(args, '--objective') });
     print(args.includes('--json')
       ? result
-      : `Initialized Durable Supervisor for ${root} (${result.bootstrap.profile}); next: ${result.state.pending_next_action}`);
+      : `Initialized Durable Supervisor for ${root} (requirements ${result.bootstrap.requirements.mode}); next: ${result.state.pending_next_action}`);
     return;
   }
-  compatibilityPreflight(root, { operation: 'read' });
   if (!existsSync(paths(root).supervisor)) throw new Error('run opsle init first');
   if (command === 'status') {
     const mode = outputMode(args);
@@ -1119,7 +1112,6 @@ export async function main(args) {
       remaining_requirements: requirements.requirements.filter((item) => item.state !== 'VERIFIED').map((item) => item.id),
       rationale: 'The minimum end-to-end path is locally implemented and deterministically validated; remaining work can now be delegated safely.',
     });
-    setRequirements(root, ['DS-005', 'DS-090', 'DS-091'], 'IMPLEMENTED', [relative(root, join(p.events, `${event.event_id}.json`))]);
     print(event);
     return;
   }
@@ -1175,7 +1167,7 @@ export async function main(args) {
   if (command === 'policy') {
     if (subcommand === 'status') {
       const mode = outputMode(rest);
-      const policy = policyWithDefaults(readJson(paths(root).policy));
+      const policy = readJson(paths(root).policy);
       print(mode.json ? policy : renderPolicy(policy, mode));
     }
     else if (['enable', 'disable'].includes(subcommand)) {
@@ -1184,18 +1176,6 @@ export async function main(args) {
       const policy = readJson(paths(root).policy);
       if (!policy.providers[provider]) throw new Error(`unknown provider: ${provider}`);
       print(updatePolicy(root, (next) => { next.providers[provider].enabled = subcommand === 'enable'; }));
-    } else if (subcommand === 'context-firewall') {
-      const mode = rest[0];
-      if (!['enable', 'disable'].includes(mode)) {
-        throw new Error('policy context-firewall requires enable or disable');
-      }
-      if (mode === 'disable') {
-        throw new Error('Context Firewall is mandatory and cannot be disabled');
-      }
-      recordHumanActivation(root, 'policy-context-firewall');
-      print(updatePolicy(root, (next) => {
-        next.context_firewall = { enabled: true };
-      }));
     } else if (subcommand === 'review') {
       recordHumanActivation(root, 'policy-review');
       const mode = rest[0];

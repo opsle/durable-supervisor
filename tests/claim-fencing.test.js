@@ -54,7 +54,7 @@ function fixture() {
   mkdirSync(join(root, '.opsle'));
   cpSync(join(sourceRoot, '.opsle', 'specification.md'), join(root, '.opsle', 'specification.md'));
   cpSync(join(sourceRoot, '.opsle', 'requirements.json'), join(root, '.opsle', 'requirements.json'));
-  initialize(root, { actor: 'claim-fencing-test' });
+  initialize(root, { actor: 'claim-fencing-test', objectiveText: 'Exercise claim fencing.' });
   return root;
 }
 

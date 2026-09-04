@@ -56,7 +56,11 @@ function repository({ requirements = 'none', legacy = false } = {}) {
     }
   }
   initialize(root, { actor: 'invariant-test', objectiveText: 'Exercise invariant harnesses.' });
-  if (legacy) unlinkSync(paths(root).bootstrap);
+  if (legacy) {
+    const bootstrap = readJson(paths(root).bootstrap);
+    bootstrap.requirements = { mode: 'none', path: null, specification_path: null };
+    writeJson(paths(root).bootstrap, bootstrap);
+  }
   return root;
 }
 
@@ -357,10 +361,10 @@ function stageEvaluableTask(root, task) {
   updateState(root, { active_task_id: task.task_id, active_attempt_id: attemptId });
 }
 
-test('one effective requirement set drives all consumers across five authority profiles', () => {
+test('one effective requirement set drives all consumers across four authority profiles', () => {
   const profiles = [
     ['objective-no-matrix', { requirements: 'none' }, null, false],
-    ['foreign-inert-historical-ds-matrix', { requirements: 'durable-supervisor', legacy: true }, null, false],
+    ['explicit-none-with-historical-matrix', { requirements: 'durable-supervisor', legacy: true }, null, false],
     ['explicit-requirement-driven', { requirements: 'custom' }, 'FIXTURE-001', false],
     ['completed-requirements', { requirements: 'custom' }, 'FIXTURE-001', true],
   ];
@@ -427,6 +431,13 @@ test('one effective requirement set drives all consumers across five authority p
   try {
     const task = createTask(root, handoff('task-contradictory-malformed'));
     stageEvaluableTask(root, task);
+    const bootstrap = readJson(paths(root).bootstrap);
+    bootstrap.requirements = {
+      mode: 'matrix',
+      path: '.opsle/requirements.json',
+      specification_path: '.opsle/specification.md',
+    };
+    writeJson(paths(root).bootstrap, bootstrap);
     writeJson(paths(root).requirements, { schema: 'foreign.invalid/v1', requirements: 'not-an-array' });
     const before = fileBytes(join(root, '.opsle'));
     for (const invoke of [
@@ -449,7 +460,7 @@ test('one effective requirement set drives all consumers across five authority p
     }
     const validation = validateDurableState(root);
     assert.equal(validation.valid, false);
-    assert.ok(validation.errors.some((error) => /contradicts a requirements matrix|invalid requirements matrix/.test(error)));
+    assert.ok(validation.errors.some((error) => /contradicts a requirements matrix|malformed effective requirements matrix|invalid requirements matrix/.test(error)));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1020,51 +1031,6 @@ test('historical semantic replays remain inert and byte-identical', () => {
     rmSync(claimRoot, { recursive: true, force: true });
     rmSync(wakeRoot, { recursive: true, force: true });
     rmSync(foreignRoot, { recursive: true, force: true });
-  }
-});
-
-test('Context Firewall disabled policy and snapshots fail closed before Runner mutation', async () => {
-  const root = repository();
-  try {
-    const policyEffect = await assertPolicyEffect({
-      snapshot: () => fileBytes(join(root, '.opsle')),
-      toggle: () => {
-        const disabled = runCli(root, ['policy', 'context-firewall', 'disable']);
-        if (disabled.status !== 0) throw new Error(disabled.stderr);
-      },
-      probe: () => validateDurableState(root).valid,
-    });
-    assert.equal(policyEffect, 'unsupported-rejected');
-
-    const task = createTask(root, handoff('task-firewall-required'));
-    const route = routeTask(root, task);
-    const policy = readJson(paths(root).policy);
-    policy.context_firewall.enabled = false;
-    writeJson(paths(root).policy, policy);
-    const beforeAttempt = fileBytes(join(root, '.opsle'));
-    assert.throws(() => createAttempt(root, task, route), /Context Firewall is mandatory/);
-    assert.deepEqual(fileBytes(join(root, '.opsle')), beforeAttempt);
-
-    const attempt = {
-      attempt_id: 'attempt-disabled-firewall',
-      gearbox_route: 'deterministic',
-      policy_snapshot: { context_firewall_enabled: false },
-    };
-    const runnerBefore = fileBytes(join(root, '.opsle'));
-    await assert.rejects(
-      runAttempt(root, task, attempt, { claim_id: 'claim-disabled-firewall' }),
-      /Context Firewall is mandatory/,
-    );
-    assert.deepEqual(fileBytes(join(root, '.opsle')), runnerBefore);
-
-    const missingSnapshotBefore = fileBytes(join(root, '.opsle'));
-    await assert.rejects(
-      runAttempt(root, task, { attempt_id: 'attempt-missing-firewall', policy_snapshot: {} }, {}),
-      /Context Firewall is mandatory/,
-    );
-    assert.deepEqual(fileBytes(join(root, '.opsle')), missingSnapshotBefore);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
   }
 });
 

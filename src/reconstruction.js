@@ -15,7 +15,6 @@ import {
 } from './io.js';
 import {
   paths,
-  policyWithDefaults,
   SATISFIED_REQUIREMENT_STATES,
   effectiveRequirementMatrix,
 } from './state.js';
@@ -25,8 +24,6 @@ export const RESUME_PACKET_SCHEMA = 'opsle.durable-supervisor.resume-packet/v1';
 export const RECONSTRUCTION_TELEMETRY_SCHEMA = 'opsle.durable-supervisor.reconstruction-telemetry/v1';
 export const PACKET_BYTE_CEILING = 4_000;
 export const PACKET_CHARACTER_CEILING = 4_000;
-export const PACKET_TOKEN_BUDGET = 1_000;
-export const TOKEN_ESTIMATE_METHOD = 'estimated_tokens=ceil(UTF-8_bytes/4); no exact tokenizer available';
 export const EVIDENCE_OUTPUT_BYTE_CEILING = 16_384;
 export const RESUME_FRESHNESS_SCHEMA = 'opsle.durable-supervisor.resume-freshness/v1';
 
@@ -627,10 +624,8 @@ function measurePacket(packet) {
     const serialized = canonicalJson(packet);
     const bytes = Buffer.byteLength(serialized);
     const characters = [...serialized].length;
-    const estimatedTokens = Math.ceil(bytes / 4);
     packet.budget.packet_bytes = bytes;
     packet.budget.packet_characters = characters;
-    packet.budget.estimated_tokens = estimatedTokens;
     const next = canonicalJson(packet);
     if (next === prior || next === serialized) return next;
     prior = next;
@@ -655,7 +650,7 @@ export function generateResumePacket(root, {
   const state = reader.read(p.state);
   const objective = reader.read(p.objective);
   const rawPolicy = reader.read(p.policy);
-  const policy = rawPolicy ? policyWithDefaults(rawPolicy) : null;
+  const policy = rawPolicy;
   const bootstrap = reader.read(p.bootstrap, { required: false });
   const rawRequirements = reader.read(p.requirements, { required: false });
   const requirements = effectiveRequirementMatrix(root, {
@@ -810,7 +805,6 @@ export function generateResumePacket(root, {
       gearbox_required: policy.gearbox?.required ?? null,
       model_polling_permitted: policy.model_polling?.permitted ?? null,
       affected_verification: policy.affected_verification?.authority ?? null,
-      context_firewall_enabled: policy.context_firewall?.enabled ?? true,
     } : null,
     pause: state?.pause ?? null,
     active_work: active.activeWork,
@@ -833,14 +827,11 @@ export function generateResumePacket(root, {
     issues: issues.codes(),
     evidence: evidence.value(),
     budget: {
-      measurement: 'estimated',
-      method: TOKEN_ESTIMATE_METHOD,
+      measurement: 'exact serialized UTF-8 bytes and Unicode characters',
       byte_ceiling: PACKET_BYTE_CEILING,
       character_ceiling: PACKET_CHARACTER_CEILING,
-      token_budget: PACKET_TOKEN_BUDGET,
       packet_bytes: 0,
       packet_characters: 0,
-      estimated_tokens: 0,
     },
   };
   applyFreshness(packet, reader.authorityFingerprint(), {
@@ -849,10 +840,8 @@ export function generateResumePacket(root, {
   let serialized = measurePacket(packet);
   let packetBytes = Buffer.byteLength(serialized);
   let packetCharacters = [...serialized].length;
-  let estimatedTokens = Math.ceil(packetBytes / 4);
   if (packetBytes > PACKET_BYTE_CEILING
-      || packetCharacters > PACKET_CHARACTER_CEILING
-      || estimatedTokens > PACKET_TOKEN_BUDGET) {
+      || packetCharacters > PACKET_CHARACTER_CEILING) {
     const objectiveIssue = 'objective-text-requires-bounded-escalation';
     issues.add(objectiveIssue, 'requires_escalation');
     evidence.escalation(p.objective, 'current_objective', objectiveIssue);
@@ -885,12 +874,10 @@ export function generateResumePacket(root, {
     serialized = measurePacket(packet);
     packetBytes = Buffer.byteLength(serialized);
     packetCharacters = [...serialized].length;
-    estimatedTokens = Math.ceil(packetBytes / 4);
   }
   if (packetBytes > PACKET_BYTE_CEILING
-      || packetCharacters > PACKET_CHARACTER_CEILING
-      || estimatedTokens > PACKET_TOKEN_BUDGET) {
-    throw new Error(`resume packet exceeds deterministic ceiling (${packetBytes} bytes, ${packetCharacters} characters, ${estimatedTokens} estimated tokens)`);
+      || packetCharacters > PACKET_CHARACTER_CEILING) {
+    throw new Error(`resume packet exceeds deterministic ceiling (${packetBytes} bytes, ${packetCharacters} characters)`);
   }
   reader.verifyUnchanged();
   const durableStateBytes = [...reader.considered.values()].reduce((sum, item) => sum + item.bytes, 0);
@@ -905,9 +892,6 @@ export function generateResumePacket(root, {
     durable_source_files_considered: [...reader.considered.values()].map((item) => item.path).sort(),
     packet_bytes: packetBytes,
     packet_characters: packetCharacters,
-    token_measurement: 'estimated',
-    token_method: TOKEN_ESTIMATE_METHOD,
-    estimated_tokens: estimatedTokens,
     byte_suppression_ratio: durableStateBytes === 0
       ? 0
       : Number(Math.max(0, 1 - (packetBytes / durableStateBytes)).toFixed(6)),
@@ -986,9 +970,12 @@ export function readResumePacket(root, {
       bindingDependencies,
       sessionStatus,
       wakeStatus,
-    }).packet;
-    if (current.freshness.authority_sha256 !== packet.freshness.authority_sha256) {
-      throw new Error('complete resume packet is stale; regenerate it');
+    });
+    if (current.packet.freshness.authority_sha256 !== packet.freshness.authority_sha256) {
+      const p = paths(root);
+      writeJson(p.resumePacket, current.packet);
+      writeJson(p.reconstructionTelemetry, current.telemetry);
+      return current.packet;
     }
   }
   return packet;

@@ -9,7 +9,6 @@ import {
 } from '../src/wakeup.js';
 import {
   assertReleaseFence,
-  compatibilityPreflight,
   createReleaseFence,
   loadRuntimeRelease,
   releaseIdentity,
@@ -47,7 +46,6 @@ export async function resumeHelperResult(args, {
     const attemptEvidence = evidencePath ? readEvidence(evidencePath) : null;
     const repositoryRoot = attemptEvidence?.repository_realpath ?? null;
     loadRuntimeRelease();
-    if (repositoryRoot) compatibilityPreflight(repositoryRoot, { operation: 'read' });
     if (attemptEvidence?.helper?.expected_release) {
       const expected = releaseIdentity('codex-resume');
       if (!sameReleaseIdentity(attemptEvidence.helper.expected_release, expected)) {

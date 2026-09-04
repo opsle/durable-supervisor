@@ -9,13 +9,12 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
-  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { canonicalJson, now, sha256 } from './io.js';
-import { compatibilityPreflight } from './runtime-release.js';
+import { acquireHostLock } from './host-lock.js';
 
 export const OPSLED_REGISTRY_SCHEMA = 'opsle.durable-supervisor.opsled-registry/v1';
 export const OPSLED_REPOSITORY_SCHEMA = 'opsle.durable-supervisor.opsled-repository/v1';
@@ -84,6 +83,7 @@ export function registryPaths(hostRoot) {
     registryLock: join(root, 'registry.lock'),
     service: join(root, 'opsled.json'),
     serviceLock: join(root, 'opsled.lock'),
+    upgradeLock: join(root, 'runtime', 'upgrade.lock'),
     repositories: join(root, 'repositories'),
   };
 }
@@ -173,17 +173,6 @@ function durableReplace(path, bytes) {
   }
 }
 
-function acquireRegistryLock(path) {
-  try {
-    mkdirSync(path, { mode: 0o700 });
-  } catch (error) {
-    if (error.code === 'EEXIST') {
-      throw classifiedError('BUSY', 'opsled registry update is already in progress');
-    }
-    throw error;
-  }
-}
-
 export function readRegistry(hostRoot, { create = false } = {}) {
   const paths = ensureSafeHostRoot(hostRoot);
   if (!existsSync(paths.registry)) {
@@ -198,7 +187,7 @@ export function readRegistry(hostRoot, { create = false } = {}) {
 
 export function updateRegistry(hostRoot, mutate) {
   const paths = ensureSafeHostRoot(hostRoot);
-  acquireRegistryLock(paths.registryLock);
+  const lock = acquireHostLock(paths.registryLock);
   try {
     const beforeBytes = existsSync(paths.registry) ? readFileSync(paths.registry, 'utf8') : null;
     const before = beforeBytes == null ? emptyRegistry() : parseRegistry(beforeBytes, paths.registry);
@@ -215,13 +204,18 @@ export function updateRegistry(hostRoot, mutate) {
       result,
     };
   } finally {
-    rmdirSync(paths.registryLock);
+    lock.release();
   }
+}
+
+export function acquireUpgradeLock(hostRoot, options = {}) {
+  const paths = ensureSafeHostRoot(hostRoot);
+  mkdirSync(dirname(paths.upgradeLock), { recursive: true, mode: 0o700 });
+  return acquireHostLock(paths.upgradeLock, options);
 }
 
 export function registerRepository(hostRoot, repositoryPath) {
   const repositoryRealpath = realpathSync(resolve(repositoryPath));
-  compatibilityPreflight(repositoryRealpath, { operation: 'read' });
   const supervisorPath = join(repositoryRealpath, '.opsle', 'supervisor.json');
   if (!existsSync(supervisorPath)) throw new Error(`repository is not initialized for Opsle: ${repositoryRealpath}`);
   const repositoryId = repositoryOperationalId(repositoryRealpath);

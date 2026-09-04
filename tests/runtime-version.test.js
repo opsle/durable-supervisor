@@ -16,8 +16,6 @@ import test from 'node:test';
 import { canonicalJson, readJson, writeJson } from '../src/io.js';
 import {
   assertReleaseFence,
-  compatibilityHeader,
-  compatibilityPreflight,
   createReleaseFence,
   loadRuntimeRelease,
   processStartIdentity,
@@ -61,20 +59,12 @@ function assertBytesEqual(actual, expected) {
   for (const [path, bytes] of expected) assert.deepEqual(actual.get(path), bytes, path);
 }
 
-function assertUpgradeInvariant(classifier) {
-  const result = classifier({ schema: 'opsle.durable-supervisor.codex-session-binding/v3' });
-  assert.equal(result.classification, 'UPGRADE_REQUIRED');
-}
-
 test('immutable release manifest verifies the complete normalized package and every helper', () => {
   const release = loadRuntimeRelease({ refresh: true });
   assert.match(release.runtime_release_id, /^opsle-runtime-/);
   assert.match(release.version, /^\d+\.\d+\.\d+/);
   assert.ok(release.source_revision);
   assert.match(release.packaged_artifact_sha256, /^[a-f0-9]{64}$/);
-  assert.deepEqual(release.supported_reader_versions, [1, 2, 3]);
-  assert.deepEqual(release.supported_writer_versions, [1, 2, 3]);
-  assert.deepEqual(release.migration_versions, []);
   assert.deepEqual(release.helpers.map((entry) => entry.role).sort(), [
     'cli', 'codex-resume', 'opsled', 'opsled-worker', 'runner-worker', 'wake-delivery',
   ]);
@@ -129,28 +119,7 @@ test('artifact and manifest mismatches fail closed', () => {
   }
 });
 
-test('old v2 reader returns UPGRADE_REQUIRED for valid v3 binding without changing any state byte', () => {
-  const root = repository();
-  try {
-    const bindingPath = join(root, '.opsle', 'wake', 'codex-session-binding.json');
-    mkdirSync(join(root, '.opsle', 'wake'), { recursive: true });
-    writeJson(bindingPath, {
-      schema: 'opsle.durable-supervisor.codex-session-binding/v3',
-      state: 'CURRENT',
-      binding_revision: 1,
-    });
-    const before = operationalBytes(root);
-    assert.throws(
-      () => compatibilityPreflight(root, { readerVersions: [1, 2], operation: 'read' }),
-      (error) => error.classification === 'UPGRADE_REQUIRED' && error.state_version === 3,
-    );
-    assertBytesEqual(operationalBytes(root), before);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('malformed supported state is CORRUPT and never UPGRADE_REQUIRED', () => {
+test('malformed durable state is classified as CORRUPT', () => {
   const root = repository();
   try {
     const statePath = paths(root).state;
@@ -159,23 +128,9 @@ test('malformed supported state is CORRUPT and never UPGRADE_REQUIRED', () => {
       () => readJson(statePath),
       (error) => error.classification === 'CORRUPT' && error.classification !== 'UPGRADE_REQUIRED',
     );
-    writeFileSync(join(root, '.opsle', 'runtime-compatibility.json'), '{ malformed\n');
-    assert.throws(
-      () => readJson(paths(root).supervisor),
-      (error) => error.classification === 'CORRUPT',
-    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
-
-test('legacy invalid-classification mutant is killed by the upgrade invariant', () => {
-  const legacyMutant = () => ({ classification: 'INVALID', reason: 'unsupported binding schema' });
-  assert.throws(
-    () => assertUpgradeInvariant(legacyMutant),
-    /Expected values to be strictly equal/,
-  );
-  assert.doesNotThrow(() => assertUpgradeInvariant(() => ({ classification: 'UPGRADE_REQUIRED' })));
 });
 
 test('release fence rejects superseded artifact, role, epoch, and stale PID/start identities', () => {
@@ -184,6 +139,7 @@ test('release fence rejects superseded artifact, role, epoch, and stale PID/star
   assert.equal(assertReleaseFence(valid, { role: 'runner-worker', processIdentity: identity }), true);
   for (const mutation of [
     (fence) => { fence.runtime_release_id = 'opsle-runtime-0.0.0-deadbeefdeadbeef'; },
+    (fence) => { fence.release_root = '/different/runtime/root'; },
     (fence) => { fence.packaged_artifact_sha256 = '0'.repeat(64); },
     (fence) => { fence.runtime_epoch = 'superseded'; },
     (fence) => { fence.helper_role = 'wake-delivery'; },
@@ -205,12 +161,14 @@ test('release identity equality ignores object key ordering but rejects changed 
     helper_role: expected.helper_role,
     runtime_epoch: expected.runtime_epoch,
     packaged_artifact_sha256: expected.packaged_artifact_sha256,
+    release_root: expected.release_root,
     runtime_release_id: expected.runtime_release_id,
   };
   assert.equal(sameReleaseIdentity(reordered, expected), true);
 
   for (const [field, value] of [
     ['runtime_release_id', 'opsle-runtime-0.0.0-deadbeefdeadbeef'],
+    ['release_root', '/different/runtime/root'],
     ['packaged_artifact_sha256', '0'.repeat(64)],
     ['runtime_epoch', 'superseded-runtime-epoch'],
     ['helper_role', 'wake-delivery'],
@@ -270,22 +228,6 @@ test('superseded wake helper retires before ownership or delivery mutation', asy
       reason: 'dispatcher-runtime-release-fence-mismatch',
     });
     assertBytesEqual(operationalBytes(root), before);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('unknown compatibility metadata fails closed as CORRUPT without target-state reads', () => {
-  const root = repository();
-  try {
-    writeFileSync(
-      join(root, '.opsle', 'runtime-compatibility.json'),
-      canonicalJson({ ...compatibilityHeader(), future_selector: 4 }),
-    );
-    assert.throws(
-      () => compatibilityPreflight(root),
-      (error) => error.classification === 'CORRUPT',
-    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

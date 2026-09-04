@@ -96,7 +96,7 @@ test('initialization matrix A: ordinary Git repository gets a neutral objective-
     const readmeBefore = readFileSync(join(root, 'README.md'), 'utf8');
     const result = initialize(root, { actor: 'matrix-a' });
     assert.equal(result.bootstrap.schema, BOOTSTRAP_SCHEMA);
-    assert.equal(result.bootstrap.profile, 'objective_driven');
+    assert.equal(result.bootstrap.requirements.mode, 'none');
     assert.equal(result.objective.current_revision, 0);
     assert.equal(result.state.phase, 'INITIALIZED');
     assert.equal(existsSync(paths(root).specification), false);
@@ -167,16 +167,16 @@ test('initialization matrix D: Git metadata pointer repositories remain reposito
   }
 });
 
-test('initialization matrix E: the exact V0.1 self-host seed retains legacy bootstrap semantics', () => {
+test('initialization matrix E: any complete requirement seed uses generic matrix authority', () => {
   const root = repository();
   try {
     mkdirSync(join(root, '.opsle'));
     writeFileSync(join(root, '.opsle', 'specification.md'), readFileSync(join(sourceRoot, '.opsle', 'specification.md')));
     writeFileSync(join(root, '.opsle', 'requirements.json'), readFileSync(join(sourceRoot, '.opsle', 'requirements.json')));
     const result = initialize(root, { actor: 'matrix-e' });
-    assert.equal(result.bootstrap.profile, 'durable_supervisor_v0_1');
-    assert.equal(result.state.phase, 'BOOTSTRAP');
-    assert.match(result.objective.history[0].objective, /Durable Supervisor V0\.1/);
+    assert.equal(result.bootstrap.requirements.mode, 'matrix');
+    assert.equal(result.state.phase, 'INITIALIZED');
+    assert.equal(result.objective.current_revision, 0);
     assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -189,7 +189,7 @@ test('initialization matrix F: a foreign requirement matrix is preserved without
     seedGenericRequirements(root);
     const matrixBefore = readFileSync(paths(root).requirements, 'utf8');
     const result = initialize(root, { actor: 'matrix-f' });
-    assert.equal(result.bootstrap.profile, 'requirement_driven');
+    assert.equal(result.bootstrap.requirements.mode, 'matrix');
     assert.equal(result.objective.current_revision, 0);
     assert.equal(readFileSync(paths(root).requirements, 'utf8'), matrixBefore);
     assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
@@ -252,28 +252,26 @@ test('initialization matrix K: explicit retired authority may be replaced', () =
   }
 });
 
-test('initialization matrix L: historical requirement state and absent firewall policy load safely', () => {
+test('initialization matrix L: legacy bootstrap absence uses a real generic matrix', () => {
   const root = repository();
   try {
     seedGenericRequirements(root);
     initialize(root, { actor: 'matrix-l' });
     unlinkSync(paths(root).bootstrap);
-    const policy = readJson(paths(root).policy);
-    delete policy.context_firewall;
-    writeJson(paths(root).policy, policy);
     assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
-    const status = runCli(root, ['policy', 'status']);
-    assert.equal(status.status, 0, status.stderr);
-    assert.match(status.stdout, /Context Firewall enabled \(historical safe default\)/);
+    assert.equal(readJson(paths(root).requirements).requirements.length, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('historical foreign DS seed is preserved as inert evidence instead of current requirements', () => {
+test('explicit none authority keeps a later historical matrix inert without DS heuristics', () => {
   const root = repository();
   try {
-    mkdirSync(join(root, '.opsle'), { recursive: true });
+    initialize(root, {
+      actor: 'historical-foreign-seed',
+      objectiveText: 'Analyze this foreign repository only.',
+    });
     writeFileSync(
       paths(root).specification,
       readFileSync(join(sourceRoot, '.opsle', 'specification.md')),
@@ -282,19 +280,7 @@ test('historical foreign DS seed is preserved as inert evidence instead of curre
       paths(root).requirements,
       readFileSync(join(sourceRoot, '.opsle', 'requirements.json')),
     );
-    initialize(root, { actor: 'historical-foreign-seed' });
-    unlinkSync(paths(root).bootstrap);
-    const objective = readJson(paths(root).objective);
-    objective.current_revision = 2;
-    objective.history.push({
-      revision: 2,
-      objective: 'Analyze this foreign repository only.',
-      changed_by: 'pilot',
-      effective_at: '2026-09-02T00:00:00.000Z',
-    });
-    writeJson(paths(root).objective, objective);
     const state = readJson(paths(root).state);
-    state.phase = 'BOOTSTRAP';
     state.supervisor_state = 'PAUSED';
     state.pause = {
       active: true,
@@ -332,7 +318,7 @@ test('initialization matrix M: CLI init is human-readable and JSON remains expli
     const machine = runCli(jsonRoot, ['init', '--json']);
     assert.equal(machine.status, 0, machine.stderr);
     const value = JSON.parse(machine.stdout);
-    assert.equal(value.bootstrap.profile, 'objective_driven');
+    assert.equal(value.bootstrap.requirements.mode, 'none');
   } finally {
     rmSync(humanRoot, { recursive: true, force: true });
     rmSync(jsonRoot, { recursive: true, force: true });
@@ -352,26 +338,18 @@ test('version output is repository-independent and includes available source pro
   }
 });
 
-test('Context Firewall policy rejects disabling without durable mutation', () => {
+test('Context Firewall is mandatory behavior and has no policy switch', () => {
   const root = repository();
   try {
     initialize(root, { actor: 'firewall-policy' });
     const policyBefore = readFileSync(paths(root).policy);
     const eventsBefore = readFileSync(paths(root).eventsLog);
-    const disabled = runCli(root, ['policy', 'context-firewall', 'disable']);
-    assert.equal(disabled.status, 1);
-    assert.match(disabled.stderr, /Context Firewall is mandatory and cannot be disabled/);
+    const result = runCli(root, ['policy', 'context-firewall', 'disable']);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /unknown policy command/);
     assert.deepEqual(readFileSync(paths(root).policy), policyBefore);
     assert.deepEqual(readFileSync(paths(root).eventsLog), eventsBefore);
-    const enabled = runCli(root, ['policy', 'context-firewall', 'enable']);
-    assert.equal(enabled.status, 0, enabled.stderr);
-    assert.equal(readJson(paths(root).policy).context_firewall.enabled, true);
-
-    const policy = readJson(paths(root).policy);
-    policy.context_firewall.enabled = false;
-    writeJson(paths(root).policy, policy);
-    assert.equal(validateDurableState(root).valid, false);
-    assert.ok(validateDurableState(root).errors.includes('Context Firewall is mandatory'));
+    assert.equal(readJson(paths(root).policy).context_firewall, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

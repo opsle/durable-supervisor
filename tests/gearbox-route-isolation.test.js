@@ -43,7 +43,7 @@ function fixture() {
   mkdirSync(join(root, '.opsle'));
   cpSync(join(sourceRoot, '.opsle', 'specification.md'), join(root, '.opsle', 'specification.md'));
   cpSync(join(sourceRoot, '.opsle', 'requirements.json'), join(root, '.opsle', 'requirements.json'));
-  initialize(root, { actor: 'test' });
+  initialize(root, { actor: 'test', objectiveText: 'Exercise exact route isolation.' });
   return root;
 }
 
@@ -185,10 +185,9 @@ test('exact selected route is immutable in decision and policy snapshot', () => 
       review: { enabled: false, mode: 'off', reviewer: null },
       fallback: { enabled: false, provider_allowlist: [] },
     });
-    assert.equal(
-      decision.considered_routes.find((route) => route.route === 'claude').eligible,
-      false,
-    );
+    assert.equal(decision.considered_routes, undefined);
+    assert.equal(decision.permitted_capabilities, undefined);
+    assert.equal(decision.discovery.commands.claude.available, true);
     assert.equal(validateDurableState(root).valid, true);
 
     for (const invalidSelectedTool of [undefined, 'deterministic-command']) {

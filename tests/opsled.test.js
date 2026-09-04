@@ -28,6 +28,7 @@ import {
   opsledStatus,
   renderOpsledStatus,
   runOpsledService,
+  startOpsled,
 } from '../src/opsled.js';
 import { dispatchRepositoryWakes } from '../src/opsled-wake.js';
 import {
@@ -39,10 +40,6 @@ import {
 function repository(name = 'repository') {
   const root = mkdtempSync(join(tmpdir(), `opsled-${name}-`));
   mkdirSync(join(root, '.opsle', 'wake', 'requests'), { recursive: true });
-  writeJson(join(root, '.opsle', 'runtime-compatibility.json'), {
-    schema: 'opsle.durable-supervisor.runtime-compatibility/v1',
-    state_version: 3,
-  });
   writeJson(join(root, '.opsle', 'supervisor.json'), {
     schema: 'fixture',
     repository: realpathSync(root),
@@ -129,6 +126,24 @@ test('registry fails closed for reasoning authority and newer schemas', () => {
     assert.throws(
       () => readRegistry(hostRoot),
       (error) => error.classification === 'UPGRADE_REQUIRED',
+    );
+  } finally {
+    rmSync(hostRoot, { recursive: true, force: true });
+  }
+});
+
+test('UPGRADE_REQUIRED names managed/current and invoking roots and artifacts', async () => {
+  const hostRoot = host();
+  try {
+    const service = stageService(hostRoot);
+    service.release_fence.release_root = '/managed/same-semver-release';
+    service.release_fence.packaged_artifact_sha256 = '0'.repeat(64);
+    writeJson(registryPaths(hostRoot).service, service);
+    await assert.rejects(
+      startOpsled(hostRoot, { getProcessIdentity: () => service.process }),
+      (error) => error.classification === 'UPGRADE_REQUIRED'
+        && /managed\/current root=\/managed\/same-semver-release artifact=0{64}/.test(error.message)
+        && /invoking root=.* artifact=[a-f0-9]{64}/.test(error.message),
     );
   } finally {
     rmSync(hostRoot, { recursive: true, force: true });

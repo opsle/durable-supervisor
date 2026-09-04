@@ -4,6 +4,7 @@ import {
   existsSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
@@ -11,12 +12,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const RELEASE_MANIFEST_SCHEMA = 'opsle.durable-supervisor.runtime-release/v1';
-export const COMPATIBILITY_SCHEMA = 'opsle.durable-supervisor.runtime-compatibility/v1';
 export const RELEASE_FENCE_SCHEMA = 'opsle.durable-supervisor.runtime-release-fence/v1';
-export const CURRENT_STATE_VERSION = 3;
-export const CURRENT_READER_VERSIONS = Object.freeze([1, 2, 3]);
-export const CURRENT_WRITER_VERSIONS = Object.freeze([1, 2, 3]);
-export const CURRENT_MIGRATION_VERSIONS = Object.freeze([]);
 export const RUNTIME_HELPER_ROLES = Object.freeze({
   'bin/opsle.js': 'cli',
   'bin/opsle-codex-resume.js': 'codex-resume',
@@ -52,23 +48,6 @@ function canonicalPackageMode(path) {
 function packagePathCompare(left, right) {
   const lower = left.toLowerCase().localeCompare(right.toLowerCase(), 'en');
   return lower || left.localeCompare(right, 'en');
-}
-
-function fail(classification, message, details = {}) {
-  const error = new Error(message);
-  error.name = classification === 'UPGRADE_REQUIRED' ? 'UpgradeRequiredError' : 'CorruptStateError';
-  error.code = classification;
-  error.classification = classification;
-  Object.assign(error, details);
-  return error;
-}
-
-function exactIntegerArray(value, name, { allowEmpty = false } = {}) {
-  if (!Array.isArray(value) || (!allowEmpty && value.length === 0)
-      || value.some((item, index) => !Number.isSafeInteger(item) || item < 1
-        || (index > 0 && value[index - 1] >= item))) {
-    throw new Error(`release manifest has invalid ${name}`);
-  }
 }
 
 function normalizedManifestBytes(manifest) {
@@ -107,9 +86,6 @@ function validateManifestShape(manifest) {
       || !Array.isArray(manifest.artifact?.files) || manifest.artifact.files.length === 0) {
     throw new Error('invalid runtime release manifest');
   }
-  exactIntegerArray(manifest.supported_reader_versions, 'supported_reader_versions');
-  exactIntegerArray(manifest.supported_writer_versions, 'supported_writer_versions');
-  exactIntegerArray(manifest.migration_versions, 'migration_versions', { allowEmpty: true });
   const paths = manifest.artifact.files.map((entry) => entry?.path);
   if (paths.some((path) => typeof path !== 'string' || !path)
       || new Set(paths).size !== paths.length
@@ -163,63 +139,12 @@ export function loadRuntimeRelease({ root = packageRoot, verify = true, refresh 
   return manifest;
 }
 
-export function compatibilityHeader(stateVersion = CURRENT_STATE_VERSION) {
-  return {
-    schema: COMPATIBILITY_SCHEMA,
-    state_version: stateVersion,
-  };
-}
-
-export function compatibilityPreflight(root, {
-  readerVersions = CURRENT_READER_VERSIONS,
-  writerVersions = CURRENT_WRITER_VERSIONS,
-  operation = 'read',
-} = {}) {
-  const path = join(root, '.opsle', 'runtime-compatibility.json');
-  if (!existsSync(path)) {
-    const legacyVersion = 1;
-    const supported = operation === 'write' ? writerVersions : readerVersions;
-    if (!supported.includes(legacyVersion)) {
-      throw fail('UPGRADE_REQUIRED', `UPGRADE_REQUIRED: state version ${legacyVersion} is not supported for ${operation}`, {
-        state_version: legacyVersion,
-      });
-    }
-    return { classification: 'COMPATIBLE', state_version: legacyVersion, legacy_header_absent: true };
-  }
-  let header;
-  try {
-    const bytes = readFileSync(path, 'utf8');
-    header = JSON.parse(bytes);
-    if (bytes !== canonicalJson(header)) throw new Error('compatibility header is not canonical JSON');
-  } catch (error) {
-    throw fail('CORRUPT', `CORRUPT: malformed runtime compatibility metadata: ${error.message}`);
-  }
-  if (header?.schema !== COMPATIBILITY_SCHEMA
-      || !Number.isSafeInteger(header.state_version) || header.state_version < 1
-      || Object.keys(header).sort().join(',') !== 'schema,state_version') {
-    throw fail('CORRUPT', 'CORRUPT: unknown or malformed runtime compatibility metadata');
-  }
-  const supported = operation === 'write' ? writerVersions : readerVersions;
-  if (!supported.includes(header.state_version)) {
-    throw fail('UPGRADE_REQUIRED', `UPGRADE_REQUIRED: state version ${header.state_version} is not supported for ${operation}`, {
-      state_version: header.state_version,
-    });
-  }
-  return { classification: 'COMPATIBLE', state_version: header.state_version, legacy_header_absent: false };
-}
-
 export function operationalRootForPath(path) {
   const absolute = resolve(path);
   const marker = `${sep}.opsle${sep}`;
   const index = absolute.indexOf(marker);
   if (index < 0) return null;
   return absolute.slice(0, index);
-}
-
-export function preflightOperationalPath(path, operation = 'read') {
-  const root = operationalRootForPath(path);
-  if (!root || resolve(path) === join(root, '.opsle', 'runtime-compatibility.json')) return null;
-  return compatibilityPreflight(root, { operation });
 }
 
 export function processStartIdentity(pid = process.pid, procRoot = '/proc') {
@@ -240,11 +165,13 @@ export function processStartIdentity(pid = process.pid, procRoot = '/proc') {
   }
 }
 
-export function releaseIdentity(role) {
+export function releaseIdentity(role, { root = packageRoot } = {}) {
   if (!Object.values(RUNTIME_HELPER_ROLES).includes(role)) throw new Error(`unknown runtime helper role: ${role}`);
-  const manifest = loadRuntimeRelease();
+  const releaseRoot = realpathSync(resolve(root));
+  const manifest = loadRuntimeRelease({ root: releaseRoot });
   return {
     runtime_release_id: manifest.runtime_release_id,
+    release_root: releaseRoot,
     packaged_artifact_sha256: manifest.packaged_artifact_sha256,
     runtime_epoch: manifest.runtime_epoch,
     helper_role: role,
@@ -255,9 +182,17 @@ export function sameReleaseIdentity(left, right) {
   return left != null
     && right != null
     && left.runtime_release_id === right.runtime_release_id
+    && left.release_root === right.release_root
     && left.packaged_artifact_sha256 === right.packaged_artifact_sha256
     && left.runtime_epoch === right.runtime_epoch
     && left.helper_role === right.helper_role;
+}
+
+export function releaseConflictMessage(managed, invoking) {
+  const summary = (label, release) => (
+    `${label} root=${release?.release_root ?? 'unknown'} artifact=${release?.packaged_artifact_sha256 ?? 'unknown'}`
+  );
+  return `${summary('managed/current', managed)}; ${summary('invoking', invoking)}`;
 }
 
 export function createReleaseFence(role, processIdentity = processStartIdentity()) {
@@ -282,6 +217,7 @@ export function assertReleaseFence(fence, {
   const expected = releaseIdentity(role);
   if (fence?.schema !== RELEASE_FENCE_SCHEMA
       || fence.runtime_release_id !== expected.runtime_release_id
+      || fence.release_root !== expected.release_root
       || fence.packaged_artifact_sha256 !== expected.packaged_artifact_sha256
       || fence.runtime_epoch !== expected.runtime_epoch
       || fence.helper_role !== role
@@ -305,6 +241,9 @@ export function runtimePackageRoot() {
 export function completeRuntimeReleaseManifest({ root = packageRoot } = {}) {
   const path = join(root, 'release-manifest.json');
   const manifest = JSON.parse(readFileSync(path, 'utf8'));
+  delete manifest.supported_reader_versions;
+  delete manifest.supported_writer_versions;
+  delete manifest.migration_versions;
   manifest.helpers = Object.entries(RUNTIME_HELPER_ROLES)
     .sort(([left], [right]) => left.localeCompare(right, 'en'))
     .map(([helperPath, role]) => ({

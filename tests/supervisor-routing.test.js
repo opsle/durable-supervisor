@@ -38,7 +38,7 @@ function fixture() {
   mkdirSync(join(root, '.opsle'));
   cpSync(join(sourceRoot, '.opsle', 'specification.md'), join(root, '.opsle', 'specification.md'));
   cpSync(join(sourceRoot, '.opsle', 'requirements.json'), join(root, '.opsle', 'requirements.json'));
-  initialize(root, { actor: 'supervisor-routing-test' });
+  initialize(root, { actor: 'supervisor-routing-test', objectiveText: 'Exercise supervisor routing.' });
   return root;
 }
 

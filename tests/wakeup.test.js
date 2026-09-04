@@ -86,7 +86,7 @@ function fixture() {
   mkdirSync(join(root, '.opsle'));
   cpSync(join(sourceRoot, '.opsle', 'specification.md'), join(root, '.opsle', 'specification.md'));
   cpSync(join(sourceRoot, '.opsle', 'requirements.json'), join(root, '.opsle', 'requirements.json'));
-  initialize(root, { actor: 'wake-test' });
+  initialize(root, { actor: 'wake-test', objectiveText: 'Exercise wake delivery.' });
   const supervisor = readJson(paths(root).supervisor);
   supervisor.session_id = 'opsle-wake-fixture';
   writeJson(paths(root).supervisor, supervisor);
@@ -2298,13 +2298,10 @@ test('binding revision is shared by status and resume freshness invalidates on f
       }),
       herdrSnapshot: () => structuredClone(snapshot),
     };
-    assert.throws(
-      () => readResumePacket(root, { bindingDependencies: dependencies }),
-      /resume packet is stale/,
-    );
-    const regenerated = generateResumePacket(root, { bindingDependencies: dependencies }).packet;
-    assert.equal(regenerated.session_binding.binding_revision, initial.binding_revision + 1);
-    assert.equal(regenerated.session_binding.codex_session_uuid, nextSession);
+    const refreshed = readResumePacket(root, { bindingDependencies: dependencies });
+    assert.equal(refreshed.session_binding.binding_revision, initial.binding_revision + 1);
+    assert.equal(refreshed.session_binding.codex_session_uuid, nextSession);
+    assert.deepEqual(readJson(paths(root).resumePacket), refreshed);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

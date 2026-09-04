@@ -18,7 +18,6 @@ import {
   EVIDENCE_OUTPUT_BYTE_CEILING,
   PACKET_BYTE_CEILING,
   PACKET_CHARACTER_CEILING,
-  PACKET_TOKEN_BUDGET,
   RESUME_PACKET_SCHEMA,
   generateResumePacket,
   readResumeEvidence,
@@ -28,7 +27,7 @@ import { paths } from '../src/state.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 const cliPath = join(sourceRoot, 'bin', 'opsle.js');
-const LIVE_OBJECTIVE_740 = 'Make Durable Supervisor reconstruction extremely cheap by deriving a deterministic compact authoritative resume packet from full durable .opsle state, enforcing a normal <=1000 estimated or exactly measured model-input-token budget and deterministic size ceiling, exposing bounded escalation and provenance, instrumenting reconstruction, updating fresh-activation procedure to read only the packet in the normal case, preserving all history and the proven Herdr/Runner/wake/routing/fencing architecture, proving clean and escalation behavior including a fresh-context no-broad-scan live proof, running focused and full verification, continuing unmerged PR #1, verifying the exact new head in a fresh detached worktree, and finishing PAUSED.';
+const LIVE_OBJECTIVE_740 = 'Make Durable Supervisor reconstruction extremely cheap by deriving a deterministic compact authoritative resume packet from full durable .opsle state, enforcing exact byte and character ceilings, exposing bounded escalation and provenance, instrumenting reconstruction, updating fresh-activation procedure to read only the packet in the normal case, preserving all history and the proven Herdr/Runner/wake/routing/fencing architecture, proving clean and escalation behavior including a fresh-context no-broad-scan live proof, running focused and full verification, continuing unmerged PR #1, verifying the exact new head in a fresh detached worktree, and finishing PAUSED. Keep this sentence long enough to exercise complete objective retention without claiming a tokenizer measurement.';
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'durable-supervisor-reconstruction-'));
@@ -261,9 +260,9 @@ test('clean packet is complete, authoritative, and within every deterministic bu
   assert.equal(packet.next_action, 'Evaluate objective completion from the authoritative requirement state.');
   assert.ok(Buffer.byteLength(serialized) <= PACKET_BYTE_CEILING);
   assert.ok([...serialized].length <= PACKET_CHARACTER_CEILING);
-  assert.ok(packet.budget.estimated_tokens <= PACKET_TOKEN_BUDGET);
-  assert.ok(packet.budget.estimated_tokens >= 300 && packet.budget.estimated_tokens <= 700);
-  assert.match(packet.budget.method, /ceil\(UTF-8_bytes\/4\)/);
+  assert.equal(packet.budget.packet_bytes, Buffer.byteLength(serialized));
+  assert.equal(packet.budget.packet_characters, [...serialized].length);
+  assert.match(packet.budget.measurement, /exact serialized UTF-8 bytes/);
   assert.ok(telemetry.durable_state_bytes_considered > packet.budget.packet_bytes);
   assert.equal(packet.evidence.authoritative.count, 6);
   assert.match(packet.evidence.authoritative.manifest_sha256, /^[a-f0-9]{64}$/);
@@ -580,9 +579,9 @@ test('latest rejected supervisor decision for the current objective outranks old
   assert.equal(packet.next_action, 'Perform bounded reconciliation using only the selected escalation evidence.');
 });
 
-test('the exact 740-character live objective is retained when the complete packet fits', () => {
+test('a long live objective is retained when the complete packet fits', () => {
   const root = fixture();
-  assert.equal([...LIVE_OBJECTIVE_740].length, 740);
+  assert.ok([...LIVE_OBJECTIVE_740].length > 740);
   const objective = readJson(join(root, '.opsle', 'objective.json'));
   objective.history[0].objective = LIVE_OBJECTIVE_740;
   writeJson(join(root, '.opsle', 'objective.json'), objective);
@@ -600,7 +599,7 @@ test('the exact 740-character live objective is retained when the complete packe
   assert.equal(first.packet.objective.source_reference, undefined);
   assert.ok(Buffer.byteLength(first.serialized) <= PACKET_BYTE_CEILING);
   assert.ok([...first.serialized].length <= PACKET_CHARACTER_CEILING);
-  assert.ok(first.packet.budget.estimated_tokens <= PACKET_TOKEN_BUDGET);
+  assert.ok(first.packet.budget.packet_bytes <= PACKET_BYTE_CEILING);
 });
 
 test('oversize objective compaction is explicit, deterministic, and escalation-linked', () => {
@@ -637,7 +636,7 @@ test('oversize objective compaction is explicit, deterministic, and escalation-l
   assert.match(first.packet.evidence.escalation[0].sha256, /^[a-f0-9]{64}$/);
   assert.ok(Buffer.byteLength(first.serialized) <= PACKET_BYTE_CEILING);
   assert.ok([...first.serialized].length <= PACKET_CHARACTER_CEILING);
-  assert.ok(first.packet.budget.estimated_tokens <= PACKET_TOKEN_BUDGET);
+  assert.ok(first.packet.budget.packet_characters <= PACKET_CHARACTER_CEILING);
   assert.doesNotMatch(first.serialized, /x{1000}/);
   assert.notEqual(first.telemetry.generated_at, second.telemetry.generated_at);
 });
@@ -701,13 +700,12 @@ test('complete resume packets fence every decision-relevant authority change', (
     try {
       addActiveWork(root);
       generateResumePacket(root, { sessionStatus: currentSession() });
-      assert.equal(readResumePacket(root, { sessionStatus: currentSession() }).complete_for_resume, true);
+      const cached = readResumePacket(root, { sessionStatus: currentSession() });
+      assert.equal(cached.complete_for_resume, true);
       const options = mutate(root);
-      assert.throws(
-        () => readResumePacket(root, { sessionStatus: currentSession(), ...options }),
-        /resume packet is stale/,
-        label,
-      );
+      const fresh = readResumePacket(root, { sessionStatus: currentSession(), ...options });
+      assert.notEqual(fresh.freshness.authority_sha256, cached.freshness.authority_sha256, label);
+      assert.deepEqual(readJson(paths(root).resumePacket), fresh, label);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

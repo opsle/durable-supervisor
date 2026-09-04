@@ -15,7 +15,6 @@ import {
   effectiveRequirementMatrix,
   gitMetadata,
   paths,
-  policyWithDefaults,
   policyHash,
   resolveExecutable,
   updateState,
@@ -171,53 +170,23 @@ export function createTask(root, input) {
   return task;
 }
 
-function filterCapabilities(discovery, policy) {
-  const commands = structuredClone(discovery.commands);
-  for (const provider of ['codex', 'claude']) {
-    commands[provider].policy_enabled = policy.providers[provider]?.enabled === true;
-    commands[provider].eligible = commands[provider].available && commands[provider].policy_enabled;
-    commands[provider].rejected_reason = commands[provider].eligible
-      ? null
-      : (!commands[provider].available ? 'UNAVAILABLE' : 'DISABLED_BY_OPERATOR_POLICY');
-  }
-  return { ...discovery, commands };
-}
-
 export function routeTask(root, task) {
   validateTaskCommands(task);
   const p = paths(root);
-  const policy = policyWithDefaults(readJson(p.policy));
-  if (policy.context_firewall.enabled !== true) {
-    throw new Error('Context Firewall is mandatory for Runner execution');
-  }
+  const policy = readJson(p.policy);
   const discovery = discoverCapabilities(root);
-  const permitted = filterCapabilities(discovery, policy);
-  const considered = [];
+  let selected = null;
   if (task.deterministic_command) {
     const command = task.deterministic_command[0];
-    const capability = permitted.commands[basename(command)] ?? {
-      available: Boolean(executable(command)), policy_enabled: true, eligible: Boolean(executable(command)),
+    const capability = discovery.commands[basename(command)] ?? {
+      available: Boolean(executable(command)),
     };
-    const eligible = capability.eligible ?? capability.available === true;
-    considered.push({ route: 'deterministic', capability: command, eligible, reason: eligible ? null : 'COMMAND_UNAVAILABLE' });
+    if (capability.available) selected = { route: 'deterministic', capability: command };
+  } else if (policy.providers.codex?.enabled === true && discovery.commands.codex.available === true) {
+    selected = { route: 'codex', capability: 'codex' };
   }
-  considered.push({
-    route: 'codex',
-    capability: 'codex',
-    eligible: permitted.commands.codex.eligible,
-    reason: permitted.commands.codex.rejected_reason,
-  });
-  considered.push({
-    route: 'claude',
-    capability: 'claude',
-    eligible: permitted.commands.claude.eligible,
-    reason: permitted.commands.claude.rejected_reason,
-  });
   // route_hint is advisory classification input only. Adequacy, discovery, and
   // policy determine the route; a hint can neither force nor veto selection.
-  const selected = task.deterministic_command
-    ? considered.find((item) => item.route === 'deterministic' && item.eligible)
-    : considered.find((item) => item.route === 'codex' && item.eligible);
   if (!selected) throw new Error('no authorized, available, policy-permitted Gearbox route');
   const selectedRoute = selected.route === 'deterministic' ? {
     schema: 'opsle.durable-supervisor.exact-child-route/v2',
@@ -260,8 +229,6 @@ export function routeTask(root, task) {
     task_id: task.task_id,
     classified_work: task.deterministic_command ? 'bounded_command_or_implementation' : 'bounded_implementation',
     discovery,
-    permitted_capabilities: permitted,
-    considered_routes: considered,
     selected_route: selected.route,
     selected_capability: selected.capability,
     selected_route_config: selectedRoute,
@@ -421,10 +388,7 @@ export function createAttempt(root, task, gearbox, claimFactory = acquireClaim) 
     throw new Error(`rejected task cannot be relaunched: ${task.task_id}`);
   }
   const p = paths(root);
-  const policy = policyWithDefaults(readJson(p.policy));
-  if (policy.context_firewall.enabled !== true) {
-    throw new Error('Context Firewall is mandatory for Runner execution');
-  }
+  const policy = readJson(p.policy);
   const selectedRoute = gearbox.selected_route_config;
   if (gearbox.schema !== 'opsle.durable-supervisor.gearbox-decision/v3'
       || selectedRoute?.schema !== 'opsle.durable-supervisor.exact-child-route/v2'
@@ -472,11 +436,8 @@ export function createAttempt(root, task, gearbox, claimFactory = acquireClaim) 
     reasoning_effort: gearbox.selected_route === 'codex' ? policy.providers.codex.reasoning_effort : null,
     gearbox_decision: gearbox,
     selected_route: structuredClone(gearbox.selected_route_config),
-    allowed_providers: Object.entries(policy.providers).filter(([, value]) => value.enabled).map(([name]) => name),
-    review_mode: policy.review.mode,
-    reviewer: policy.review.reviewer,
-    independent_review: 'none',
-    context_firewall_enabled: policy.context_firewall.enabled,
+    providers: structuredClone(policy.providers),
+    review: structuredClone(policy.review),
     authorization_envelope: task.authorization,
     policy_version: policy.version,
     policy_sha256: policyHash(root),

@@ -137,15 +137,12 @@ The boundaries are deliberate:
   releases the claim as `FAILED`; it never relaunches the rejected task.
 - Requirement-aware task creation, evaluation, recovery, status, reconstruction,
   cutover, and next-action derivation share one effective-requirements boundary.
-  Foreign inherited DS matrices remain inert historical evidence, completed
-  matrices do not invent another requirement slice, and contradictory authority
-  fails closed before lifecycle mutation.
+  Bootstrap authority is only `matrix` or `none`: a matrix is validated and used
+  generically, while `none` leaves any retained historical matrix inert.
 - The Context Firewall keeps raw artifacts out of the normal return path and
   emits a bounded, provenance-linked packet. Raw evidence remains available
   for targeted escalation.
-- Context Firewall reduction is mandatory for Runner execution. The policy
-  command accepts `enable` for compatibility, but rejects `disable` before any
-  policy or runtime state is changed.
+- Context Firewall reduction is mandatory Runner behavior, not a policy option.
 - Child exit, verification, Acceptance, and the supervisor's objective-level
   decision are separate states. A successful process exit is not correctness.
 - Humans can inspect status without model inference, pause future progression,
@@ -169,10 +166,10 @@ npm test
 The package is currently private and has no supported cross-repository
 installer. When the CLI is available, `opsle init` initializes an ordinary Git
 repository without changing tracked project content or copying this repository.
-It records a neutral, versioned objective-driven bootstrap and does not invent a
+It records neutral `none` requirements authority and does not invent a
 requirement matrix or objective. Use `opsle init --objective TEXT` to record an
 initial objective explicitly. Pre-seeded specification/matrix repositories keep
-requirement-driven semantics, including the V0.1 self-host profile. Initialization
+generic `matrix` semantics. Initialization
 fails closed if an authoritative supervisor already exists.
 
 `opsle --version` works outside initialized repositories. It reports the short
@@ -181,17 +178,23 @@ artifact SHA-256, and source/build revision when known. Every CLI and detached
 helper verifies `release-manifest.json`, the complete declared package payload,
 and every helper entrypoint digest before acting.
 
-## Runtime compatibility boundary
+## Runtime identity boundary
 
-New repositories receive the bounded
-`.opsle/runtime-compatibility.json` header before operational state is written.
-All repository CLI and helper entrypoints preflight that header before parsing
-or mutating any other `.opsle` record. Well-formed state newer than the running
-reader or writer is classified `UPGRADE_REQUIRED`; malformed supported state or
-unknown/malformed compatibility metadata is `CORRUPT`. Upgrade refusal performs
-no validation, recovery, replacement, launch, wake delivery, authority change,
-or state mutation. Headerless historical repositories retain version-1
-compatibility.
+Process identity is exactly PID plus process start ticks plus executable path;
+PID alone never proves a live owner. Content and release identity use the
+immutable complete packaged-artifact SHA-256 rather than a mutable path, version
+label, generation, nonce, lease, or fencing token. New host coordination must
+reuse the race-safe host lock and may add another ownership identifier only when
+a named concurrent writer and a proof that these identities are insufficient
+exist.
+
+Registry, service lifecycle, and the bounded future-upgrade primitive use one
+host lock. Its owner record contains exact process identity, stale takeover is
+an atomic rename, retries are bounded, and cleanup verifies the owner before
+removal. No runtime upgrade installation is implemented. When a live managed
+service conflicts with an invoking release, `UPGRADE_REQUIRED` reports distinct
+managed/current and invoking roots and artifact digests, including conflicts
+between builds with the same semantic version.
 
 Detached Runner and wake helpers carry a release fence over release ID,
 complete artifact digest, runtime epoch, helper role, and exact helper
@@ -211,8 +214,8 @@ exposing broad recovery output. The path does not replay chat history, ingest
 append-only logs or raw evidence, or silently retry uncertain work.
 Complete packets carry a semantic freshness fence over decision-relevant
 objective, task, decision, pause, unresolved/wake, policy, generation, and
-session authority. Consumption rejects a stale complete packet while ignoring
-telemetry-only timestamps.
+session authority. A stale cache is replaced and returned from the fresh packet
+already computed by that validation pass; telemetry-only timestamps are ignored.
 
 ## Self-hosting evidence
 
@@ -241,8 +244,10 @@ implementations.
 
 Affected Verification is `advisory_only` and did not authorize reduced testing.
 Semantic Edit, continuous trajectory ingestion, distributed locking, a scheduler, a
-web UI, and production deployment are deferred. Codex is enabled in the
-recorded policy; Claude and independent review remained disabled.
+web UI, and production deployment are deferred. Codex and Claude configured
+availability, model, reasoning effort, and review mode remain repository-local.
+Gearbox reads that configuration and executable discovery directly without
+persisting derived eligibility or rejection layers.
 
 `opsled` is a repository-local implementation of a single-host service. Its
 atomic host registry has exactly one mapping per repository realpath and stores

@@ -458,14 +458,8 @@ Provider changes are prospective:
 ./bin/opsle.js policy disable claude
 ```
 
-Context Firewall policy is durable and explicit for new repositories. Historical
-policies without the field load as enabled—the safe compatibility default—and
-are made explicit on the next policy write:
-
-```bash
-./bin/opsle.js policy context-firewall disable
-./bin/opsle.js policy context-firewall enable
-```
+Context Firewall reduction is mandatory Runner behavior. It has no enable or
+disable policy command and every completed Runner path emits its bounded packet.
 
 Set risk-based review only after its reviewer is enabled:
 
@@ -550,15 +544,16 @@ activation, reconcile once and emit only the resulting packet:
 The packet is canonical `resume-packet/v1` JSON and answers current repository,
 supervisor/generation, authority and Herdr binding, objective, phase, policy,
 pause, active task/attempt/claim/fence, wake attention, latest relevant decision,
-unresolved state, and next action. Its hard ceilings are 4,000 UTF-8 bytes,
-4,000 characters, and 1,000 clearly labeled estimated tokens using
-`ceil(UTF-8 bytes / 4)`. Generation time and reconstruction telemetry are
+unresolved state, and next action. Its hard ceilings are 4,000 UTF-8 bytes and
+4,000 Unicode code points. Those exact measurements are recorded; no token count
+is claimed without a tokenizer. Generation time and reconstruction telemetry are
 written separately to `.opsle/evidence/reconstruction/telemetry.json` and never
 enter the packet.
 
 Every complete packet includes a semantic freshness fence. Packet consumption
-re-derives that fence and rejects stale objective, task, decision, pause/resume,
-unresolved/wake, policy, supervisor-generation, or session-binding authority.
+re-derives that fence and replaces a stale cached packet with the fresh packet
+already computed in that same pass for changed objective, task, decision,
+pause/resume, unresolved/wake, policy, supervisor-generation, or session authority.
 Telemetry-only timestamp changes are excluded from the fence.
 
 For a `complete_for_resume` packet, do not read broader durable files. For

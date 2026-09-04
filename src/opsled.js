@@ -2,18 +2,19 @@ import { spawn } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
-  rmdirSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { id, now, readJson, writeJson } from './io.js';
+import { acquireHostLock, sameProcessIdentity } from './host-lock.js';
 import {
   assertReleaseFence,
   createReleaseFence,
   loadRuntimeRelease,
   processStartIdentity,
+  releaseConflictMessage,
   releaseIdentity,
 } from './runtime-release.js';
 import {
@@ -43,13 +44,6 @@ function classifiedError(classification, message) {
   return error;
 }
 
-function sameProcess(left, right) {
-  return left != null && right != null
-    && left.pid === right.pid
-    && left.start_time_ticks === right.start_time_ticks
-    && left.executable === right.executable;
-}
-
 function readService(hostRoot) {
   const path = registryPaths(hostRoot).service;
   if (!existsSync(path)) return null;
@@ -65,7 +59,7 @@ function readService(hostRoot) {
 
 function currentService(record, getProcessIdentity = processStartIdentity) {
   const processIdentity = getProcessIdentity(record?.process?.pid);
-  if (!sameProcess(record?.process, processIdentity)) return { current: false, reason: 'process-absent-or-reused' };
+  if (!sameProcessIdentity(record?.process, processIdentity)) return { current: false, reason: 'process-absent-or-reused' };
   try {
     assertReleaseFence(record.release_fence, {
       role: 'opsled-worker',
@@ -82,13 +76,6 @@ function currentService(record, getProcessIdentity = processStartIdentity) {
   };
 }
 
-function acquireServiceLock(path) {
-  try { mkdirSync(path, { mode: 0o700 }); } catch (error) {
-    if (error.code === 'EEXIST') throw classifiedError('BUSY', 'opsled lifecycle operation is already in progress');
-    throw error;
-  }
-}
-
 export function assertCurrentOpsledService(hostRoot, expected, {
   processIdentity = processStartIdentity(),
 } = {}) {
@@ -97,7 +84,7 @@ export function assertCurrentOpsledService(hostRoot, expected, {
       || record.service_id !== expected.service_id
       || record.generation !== expected.generation
       || record.launch_nonce !== expected.launch_nonce
-      || !sameProcess(record.process, processIdentity)) {
+      || !sameProcessIdentity(record.process, processIdentity)) {
     throw new Error('opsled service identity was superseded');
   }
   assertReleaseFence(record.release_fence, { role: 'opsled-worker', processIdentity });
@@ -116,14 +103,17 @@ export async function startOpsled(hostRoot = defaultOpsledHome(), {
   assertReleaseFence(launcherFence, { role: 'opsled' });
   const host = registryPaths(hostRoot);
   mkdirSync(host.root, { recursive: true, mode: 0o700 });
-  acquireServiceLock(host.serviceLock);
+  const lock = acquireHostLock(host.serviceLock);
   let child = null;
   try {
     const prior = readService(hostRoot);
     const priorStatus = currentService(prior, getProcessIdentity);
     if (priorStatus.current) return { started: false, reason: 'current-opsled-already-live', service: prior };
     if (priorStatus.live && priorStatus.reason === 'runtime-release-fence-mismatch') {
-      throw classifiedError('UPGRADE_REQUIRED', 'a live opsled from another runtime release must retire before replacement');
+      throw classifiedError('UPGRADE_REQUIRED', releaseConflictMessage(
+        prior?.release_fence ?? prior?.expected_release,
+        releaseIdentity('opsled-worker'),
+      ));
     }
     const record = {
       schema: OPSLED_SERVICE_SCHEMA,
@@ -165,14 +155,14 @@ export async function startOpsled(hostRoot = defaultOpsledHome(), {
       }
       if (current.status === 'OWNED') return { started: true, reason: 'opsled-launched', service: current };
       if (current.status === 'FAILED') throw new Error(current.failure ?? 'opsled worker failed during ownership handshake');
-      if (!sameProcess(workerIdentity, getProcessIdentity(child.pid))) {
+      if (!sameProcessIdentity(workerIdentity, getProcessIdentity(child.pid))) {
         throw new Error('opsled worker exited before durable ownership');
       }
       await sleep(20);
     }
     throw new Error('opsled worker did not establish durable ownership before deadline');
   } finally {
-    rmdirSync(host.serviceLock);
+    lock.release();
   }
 }
 

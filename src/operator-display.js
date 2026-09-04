@@ -291,11 +291,7 @@ export function renderPolicy(policy, { verbose = false } = {}) {
   const polling = policy.model_polling?.permitted === false
     ? 'prohibited'
     : (policy.model_polling?.permitted === true ? 'permitted' : 'UNKNOWN');
-  const firewall = enabledLabel(policy.context_firewall?.enabled);
-  const compatibility = policy.context_firewall?.defaulted_for_compatibility === true
-    ? ' (historical safe default)'
-    : '';
-  const lines = [`Policy: ${providerText}; review ${words(review)}; Context Firewall ${firewall}${compatibility}; model polling ${polling}`];
+  const lines = [`Policy: ${providerText}; review ${words(review)}; Context Firewall mandatory; model polling ${polling}`];
   if (verbose) {
     lines.push(`Version: ${policy.version ?? 'unknown'}`);
     for (const [name, config] of providers) {
@@ -303,7 +299,7 @@ export function renderPolicy(policy, { verbose = false } = {}) {
     }
     lines.push(`Reviewer: ${policy.review?.reviewer ?? 'none'}`);
     lines.push(`Affected verification: ${words(policy.affected_verification?.authority)}`);
-    lines.push(`Context Firewall: ${firewall}${compatibility}`);
+    lines.push('Context Firewall: mandatory');
     lines.push(`Changed: ${policy.changed_at ?? 'unknown'} by ${policy.changed_by ?? 'unknown'}`);
   }
   return lines.join('\n');
@@ -399,7 +395,7 @@ export function renderSupervisorStatus(value, {
   const providers = Object.entries(value.policy.providers)
     .map(([name, enabled]) => `${title(name)} ${enabledLabel(enabled)}`)
     .join('; ');
-  lines.push(`Policy: ${providers}; review ${words(value.policy.review_mode)}; Context Firewall ${enabledLabel(value.policy.context_firewall_enabled)}${value.policy.context_firewall_defaulted ? ' (historical safe default)' : ''}`);
+  lines.push(`Policy: ${providers}; review ${words(value.policy.review_mode)}; Context Firewall mandatory`);
 
   if (verbose) {
     lines.push('');

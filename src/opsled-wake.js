@@ -4,7 +4,6 @@ import { readJson } from './io.js';
 import { paths } from './state.js';
 import {
   assertReleaseFence,
-  compatibilityPreflight,
   processStartIdentity,
 } from './runtime-release.js';
 import { deliverWake, wakeQueueStatus } from './wakeup.js';
@@ -17,7 +16,6 @@ export function assertOpsledRepositoryAccess(mapping, releaseFence, {
 } = {}) {
   validateRepositoryMapping(mapping, mapping.repository_id);
   assertReleaseFence(releaseFence, { role: 'opsled-worker', processIdentity });
-  compatibilityPreflight(mapping.repository_realpath, { operation: 'read' });
   return true;
 }
 

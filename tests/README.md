@@ -3,14 +3,18 @@
 Tests must map to named invariants in SPEC.md, include adversarial failure cases, and separate implementation correctness from evidence for the broader hypothesis.
 
 `runtime-version.test.js` covers the immutable complete-artifact release
-manifest, helper digests, compatibility preflight, byte-identical
-`UPGRADE_REQUIRED`, distinct `CORRUPT` handling, release role/artifact/epoch and
-PID/start fences, superseded wake-helper denial, and a deliberately executed
-legacy invalid-classification mutant that the invariant harness rejects.
+manifest, helper digests, distinct `CORRUPT` handling, release
+role/root/artifact/epoch and PID/start/executable fences, and superseded
+wake-helper denial. Inert state-version and migration claims are intentionally
+absent.
+
+`host-lock.test.js` uses concurrent subprocesses to prove atomic stale takeover,
+exclusive critical-section ownership, bounded retry, deterministic cleanup, and
+the shared registry/future-upgrade primitive.
 
 `invariant-harness.test.js` applies one reusable ownership-vector harness to
 wake consumption, claim acquisition/release, delivery commitment, recovery
-adoption, and session-binding adoption. It covers all five requirements
+adoption, and session-binding adoption. It covers all four requirements
 profiles, both bounded reducer sequences and the durable acquire-through-resume
 state machine, policy-effect enforcement, dispatcher diagnostics, and explicit
 test-only generation-only, stale-index, raw-requirement, and metadata-only
@@ -38,6 +42,6 @@ shape.
 
 `portability.test.js` provides the deterministic initialization matrix A-M for
 ordinary, unborn, gitfile, objective-driven, foreign requirement-driven,
-self-host, malformed/partial, duplicate/replaced authority, historical policy,
-and human/JSON CLI initialization. It also proves repository-independent version
-output and explicit Context Firewall policy migration.
+generic matrix, malformed/partial, duplicate/replaced authority, historical
+evidence, and human/JSON CLI initialization. It also proves repository-independent
+version output and the absence of a Context Firewall disable switch.

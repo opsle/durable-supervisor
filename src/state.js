@@ -20,7 +20,6 @@ import {
   writeJson,
 } from './io.js';
 import { supervisorRoutingDecisionErrors } from './supervisor-routing.js';
-import { compatibilityHeader, compatibilityPreflight } from './runtime-release.js';
 
 export const OPSLE_SCHEMA = 'opsle.durable-supervisor';
 export const BOOTSTRAP_SCHEMA = `${OPSLE_SCHEMA}.bootstrap/v1`;
@@ -37,24 +36,6 @@ export const SATISFIED_REQUIREMENT_STATES = new Set([
 ]);
 export const NEXT_UNSATISFIED_REQUIREMENT_ACTION = 'Select the next unsatisfied requirement slice.';
 
-function exactDurableSupervisorMatrix(matrix) {
-  return Array.isArray(matrix?.requirements)
-    && matrix.requirements.length === 101
-    && matrix.requirements.every((item, index) => (
-      item.id === `DS-${String(index).padStart(3, '0')}`
-    ));
-}
-
-function isDurableSupervisorSource(root) {
-  const packagePath = join(root, 'package.json');
-  if (!existsSync(packagePath)) return false;
-  try {
-    return readJson(packagePath).name === '@opsle/durable-supervisor';
-  } catch {
-    return false;
-  }
-}
-
 export function effectiveRequirementMatrix(root, options = {}) {
   const p = paths(root);
   const bootstrap = Object.hasOwn(options, 'bootstrap')
@@ -63,28 +44,14 @@ export function effectiveRequirementMatrix(root, options = {}) {
   const matrix = Object.hasOwn(options, 'matrix')
     ? options.matrix
     : (existsSync(p.requirements) ? readJson(p.requirements) : null);
-  const state = Object.hasOwn(options, 'state')
-    ? options.state
-    : (existsSync(p.state) ? readJson(p.state) : null);
   if (bootstrap) {
     if (bootstrap.schema !== BOOTSTRAP_SCHEMA
-        || !['objective_driven', 'requirement_driven', 'durable_supervisor_v0_1'].includes(bootstrap.profile)
-        || !['none', 'matrix'].includes(bootstrap.requirements?.mode)
-        || (bootstrap.profile === 'objective_driven' && bootstrap.requirements?.mode !== 'none')
-        || (['requirement_driven', 'durable_supervisor_v0_1'].includes(bootstrap.profile)
-          && bootstrap.requirements?.mode !== 'matrix')) {
+        || !['none', 'matrix'].includes(bootstrap.requirements?.mode)) {
       throw new Error('contradictory requirements authority');
     }
-    if (bootstrap.requirements.mode === 'none') {
-      if (matrix) throw new Error('objective-driven authority contradicts a requirements matrix');
-      return null;
-    }
+    if (bootstrap.requirements.mode === 'none') return null;
     if (!matrix) throw new Error('requirement-driven authority is missing its matrix');
   }
-  if (!bootstrap
-      && exactDurableSupervisorMatrix(matrix)
-      && state?.phase !== 'SELF_HOSTED'
-      && !isDurableSupervisorSource(root)) return null;
   if (matrix) {
     if (matrix.schema !== `${OPSLE_SCHEMA}.requirements/v1`
         || matrix.specification !== '.opsle/specification.md'
@@ -101,10 +68,6 @@ export function effectiveRequirementMatrix(root, options = {}) {
         ))
         || new Set(matrix.requirements.map((item) => item.id)).size !== matrix.requirements.length) {
       throw new Error('malformed effective requirements matrix');
-    }
-    if (bootstrap?.profile === 'durable_supervisor_v0_1'
-        && !exactDurableSupervisorMatrix(matrix)) {
-      throw new Error('Durable Supervisor requirements authority is malformed');
     }
   }
   return matrix;
@@ -133,15 +96,6 @@ export function derivePendingNextAction(state, matrix, fallback = state.pending_
   }
   if (fallback == null && unsatisfied.length > 0) return NEXT_UNSATISFIED_REQUIREMENT_ACTION;
   return fallback;
-}
-
-export function policyWithDefaults(policy) {
-  return {
-    ...policy,
-    context_firewall: policy?.context_firewall == null
-      ? { enabled: true, defaulted_for_compatibility: true }
-      : { ...policy.context_firewall },
-  };
 }
 
 export function currentObjective(objective) {
@@ -236,7 +190,6 @@ export const paths = (root) => {
     opsle,
     specification: join(opsle, 'specification.md'),
     bootstrap: join(opsle, 'bootstrap.json'),
-    compatibility: join(opsle, 'runtime-compatibility.json'),
     requirements: join(opsle, 'requirements.json'),
     objective: join(opsle, 'objective.json'),
     policy: join(opsle, 'policy.json'),
@@ -297,7 +250,6 @@ function gitWorktreeClean(root) {
 
 export function initialize(root, { actor = 'bootstrap-codex', objectiveText = null } = {}) {
   const p = paths(root);
-  if (existsSync(p.compatibility)) compatibilityPreflight(root, { operation: 'read' });
   const initialObjective = objectiveText?.trim() || null;
   const cleanBeforeBootstrap = gitWorktreeClean(root);
   const hasSpecification = existsSync(p.specification);
@@ -312,13 +264,8 @@ export function initialize(root, { actor = 'bootstrap-codex', objectiveText = nu
       throw new Error('invalid pre-seeded requirements matrix');
     }
   }
-  const selfHost = hasSpecification
-    && matrix.requirements.length === 101
-    && matrix.requirements.every((item, index) => item.id === `DS-${String(index).padStart(3, '0')}`);
   const bootstrap = {
     schema: BOOTSTRAP_SCHEMA,
-    profile: selfHost ? 'durable_supervisor_v0_1' : (hasRequirements ? 'requirement_driven' : 'objective_driven'),
-    objective_source: selfHost ? '.opsle/specification.md' : 'operator',
     requirements: hasRequirements ? {
       mode: 'matrix',
       path: '.opsle/requirements.json',
@@ -363,21 +310,9 @@ export function initialize(root, { actor = 'bootstrap-codex', objectiveText = nu
     review: { mode: 'off', reviewer: null },
     affected_verification: { authority: 'advisory_only' },
     gearbox: { required: true },
-    context_firewall: { enabled: true },
     model_polling: { permitted: false },
   };
-  const objective = selfHost ? {
-    schema: `${OPSLE_SCHEMA}.objective/v1`,
-    objective_id: id('objective'),
-    current_revision: 1,
-    history: [{
-      revision: 1,
-      objective: 'Implement, dogfood, verify, and document Opsle Durable Supervisor V0.1 according to .opsle/specification.md.',
-      specification_sha256: fileSha256(p.specification),
-      changed_by: actor,
-      effective_at: now(),
-    }],
-  } : {
+  const objective = {
     schema: `${OPSLE_SCHEMA}.objective/v2`,
     objective_id: id('objective'),
     current_revision: initialObjective ? 1 : 0,
@@ -391,15 +326,15 @@ export function initialize(root, { actor = 'bootstrap-codex', objectiveText = nu
   const state = {
     schema: `${OPSLE_SCHEMA}.state/v1`,
     supervisor_state: 'ACTIVE',
-    phase: selfHost ? 'BOOTSTRAP' : (initialObjective ? 'ACTIVE' : 'INITIALIZED'),
+    phase: initialObjective ? 'ACTIVE' : 'INITIALIZED',
     pause: { active: false, after_current: false, reason: null, changed_at: null },
     active_task_id: null,
     active_attempt_id: null,
     latest_accepted_task_id: null,
     latest_unresolved_issue: null,
-    pending_next_action: selfHost
-      ? 'Complete and verify the minimum self-hosting substrate.'
-      : (initialObjective ? 'Establish bounded work for objective revision 1.' : 'Set the repository objective.'),
+    pending_next_action: initialObjective
+      ? 'Establish bounded work for objective revision 1.'
+      : 'Set the repository objective.',
     updated_at: now(),
   };
   const audit = {
@@ -419,7 +354,6 @@ export function initialize(root, { actor = 'bootstrap-codex', objectiveText = nu
     inspected_at: now(),
     actor,
   };
-  writeJson(p.compatibility, compatibilityHeader());
   writeJson(p.bootstrap, bootstrap);
   writeJson(p.supervisor, supervisor);
   writeJson(p.policy, policy);
@@ -429,13 +363,6 @@ export function initialize(root, { actor = 'bootstrap-codex', objectiveText = nu
   const event = emit(root, 'SUPERVISOR_INITIALIZED', { actor, repository: root });
   supervisor.last_durable_event = event.event_id;
   writeJson(p.supervisor, supervisor);
-  if (selfHost) {
-    setRequirements(root, ['DS-000', 'DS-001'], 'VERIFIED', [
-      '.opsle/specification.md',
-      '.opsle/requirements.json',
-      '.opsle/evidence/repository-audit.json',
-    ]);
-  }
   return { bootstrap, supervisor, policy, objective, state, audit };
 }
 
@@ -477,18 +404,8 @@ export function validateDurableState(root) {
   if (errors.length) return { valid: false, errors };
   const bootstrap = existsSync(p.bootstrap) ? readJson(p.bootstrap) : null;
   if (bootstrap && bootstrap.schema !== BOOTSTRAP_SCHEMA) errors.push('invalid bootstrap schema');
-  if (bootstrap && !['objective_driven', 'requirement_driven', 'durable_supervisor_v0_1'].includes(bootstrap.profile)) {
-    errors.push('invalid bootstrap profile');
-  }
   if (bootstrap && !['none', 'matrix'].includes(bootstrap.requirements?.mode)) {
     errors.push('invalid bootstrap requirements mode');
-  }
-  if (bootstrap?.profile === 'objective_driven' && bootstrap.requirements?.mode !== 'none') {
-    errors.push('objective-driven bootstrap cannot declare requirement authority');
-  }
-  if (['requirement_driven', 'durable_supervisor_v0_1'].includes(bootstrap?.profile)
-      && bootstrap.requirements?.mode !== 'matrix') {
-    errors.push('requirement-driven bootstrap requires matrix authority');
   }
   const rawMatrix = existsSync(p.requirements) ? readJson(p.requirements) : null;
   const lifecycleState = readJson(p.state);
@@ -502,17 +419,11 @@ export function validateDurableState(root) {
   } catch (error) {
     errors.push(error.message);
   }
-  const historicalForeignSeed = !bootstrap && rawMatrix && !effectiveMatrix;
   const requirementDriven = Boolean(effectiveMatrix);
   if (requirementDriven && (!existsSync(p.requirements) || !existsSync(p.specification))) {
     errors.push('requirement-driven repository must contain both specification and requirements matrix');
   }
-  if (!requirementDriven
-      && !historicalForeignSeed
-      && (existsSync(p.requirements) || existsSync(p.specification))) {
-    errors.push('objective-driven bootstrap contradicts pre-seeded requirement authority');
-  }
-  const matrix = rawMatrix;
+  const matrix = effectiveMatrix;
   if (matrix) {
     if (!Array.isArray(matrix.allowed_states) || !Array.isArray(matrix.requirements)) {
       errors.push('invalid requirements matrix');
@@ -524,20 +435,19 @@ export function validateDurableState(root) {
       }
       if (!existsSync(p.specification)) errors.push('requirements matrix specification is missing');
       else if (matrix.specification_sha256 !== fileSha256(p.specification)) errors.push('specification hash mismatch');
-      if (bootstrap?.profile === 'durable_supervisor_v0_1') {
-        if (ids.length !== 101) errors.push('Durable Supervisor V0.1 requirements must contain 101 unique IDs');
-        for (let index = 0; index <= 100; index += 1) {
-          const expected = `DS-${String(index).padStart(3, '0')}`;
-          if (ids[index] !== expected) errors.push(`requirement ordering mismatch at ${expected}`);
-        }
-      }
     }
   }
   const rawPolicy = readJson(p.policy);
-  const policy = policyWithDefaults(rawPolicy);
+  const policy = rawPolicy;
   if (!REVIEW_MODES.has(policy.review?.mode)) errors.push('invalid review mode');
-  if (typeof policy.context_firewall?.enabled !== 'boolean') errors.push('invalid context firewall policy');
-  if (policy.context_firewall?.enabled === false) errors.push('Context Firewall is mandatory');
+  for (const provider of ['codex', 'claude']) {
+    const configured = policy.providers?.[provider];
+    if (typeof configured?.enabled !== 'boolean'
+        || !(configured.model === null || typeof configured.model === 'string')
+        || !(configured.reasoning_effort === null || typeof configured.reasoning_effort === 'string')) {
+      errors.push(`invalid ${provider} provider configuration`);
+    }
+  }
   const objective = readJson(p.objective);
   if (!Array.isArray(objective.history)) {
     errors.push('objective history must be an array');

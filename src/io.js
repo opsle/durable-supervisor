@@ -14,7 +14,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname } from 'node:path';
-import { operationalRootForPath, preflightOperationalPath } from './runtime-release.js';
+import { operationalRootForPath } from './runtime-release.js';
 
 export const now = () => new Date().toISOString();
 export const id = (prefix) => `${prefix}-${randomUUID()}`;
@@ -30,12 +30,10 @@ function canonicalize(value) {
 export const canonicalJson = (value) => `${JSON.stringify(canonicalize(value))}\n`;
 export const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 export const fileSha256 = (path) => {
-  preflightOperationalPath(path, 'read');
   return sha256(readFileSync(path));
 };
 
 export function readJson(path) {
-  preflightOperationalPath(path, 'read');
   let value;
   try {
     value = JSON.parse(readFileSync(path, 'utf8'));
@@ -61,7 +59,6 @@ export function readJson(path) {
 }
 
 export function atomicWrite(path, value, mode = 0o600) {
-  preflightOperationalPath(path, 'write');
   mkdirSync(dirname(path), { recursive: true });
   const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
   const descriptor = openSync(temporary, 'wx', mode);
@@ -88,7 +85,6 @@ export function atomicWrite(path, value, mode = 0o600) {
 export const writeJson = (path, value, mode = 0o600) => atomicWrite(path, canonicalJson(value), mode);
 
 export function atomicCreateJson(path, value, mode = 0o600) {
-  preflightOperationalPath(path, 'write');
   mkdirSync(dirname(path), { recursive: true });
   const temporary = `${path}.create-${process.pid}-${randomUUID()}`;
   const descriptor = openSync(temporary, 'wx', mode);
@@ -124,7 +120,6 @@ export function atomicCreateJson(path, value, mode = 0o600) {
 // a busy lock rather than guessing. A stale process never receives a successful
 // CAS because the expected content hash is checked while the lock is held.
 export function atomicCompareAndSwapJson(path, expectedSha256, value, mode = 0o600) {
-  preflightOperationalPath(path, 'write');
   const lock = `${path}.cas-lock`;
   mkdirSync(dirname(path), { recursive: true });
   try {
@@ -153,7 +148,6 @@ export function atomicCompareAndSwapJson(path, expectedSha256, value, mode = 0o6
 }
 
 export function appendEvent(path, event) {
-  preflightOperationalPath(path, 'write');
   mkdirSync(dirname(path), { recursive: true });
   const descriptor = openSync(path, 'a', 0o600);
   try {
@@ -165,7 +159,6 @@ export function appendEvent(path, event) {
 }
 
 export function assertRegular(path) {
-  preflightOperationalPath(path, 'read');
   const stats = statSync(path);
   if (!stats.isFile() || stats.isSymbolicLink()) {
     throw new Error(`expected regular non-symlink file: ${path}`);

@@ -56,7 +56,7 @@ function fixture() {
   mkdirSync(join(root, '.opsle'));
   cpSync(join(sourceRoot, '.opsle', 'specification.md'), join(root, '.opsle', 'specification.md'));
   cpSync(join(sourceRoot, '.opsle', 'requirements.json'), join(root, '.opsle', 'requirements.json'));
-  initialize(root, { actor: 'operator-controls-test' });
+  initialize(root, { actor: 'operator-controls-test', objectiveText: 'Exercise operator controls.' });
   return root;
 }
 

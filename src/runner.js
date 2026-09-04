@@ -271,9 +271,6 @@ export function codexLaunchSpec(root, task, attempt, {
   lastMessagePath,
   inheritedEnvironment = process.env,
 } = {}) {
-  if (attempt.policy_snapshot?.context_firewall_enabled !== true) {
-    throw new Error('Context Firewall is mandatory for Runner execution');
-  }
   const route = attempt.policy_snapshot.selected_route;
   assertIsolatedCodexRoute(route);
   const decision = attempt.policy_snapshot.gearbox_decision;
@@ -285,16 +282,16 @@ export function codexLaunchSpec(root, task, attempt, {
       || decision.selected_route !== 'codex'
       || canonicalJson(decision.selected_route_config) !== canonicalJson(route)
       || decision.operator_policy_sha256 !== attempt.policy_snapshot.policy_sha256
-      || decision.permitted_capabilities?.commands?.codex?.eligible !== true
-      || !Array.isArray(attempt.policy_snapshot.allowed_providers)
-      || !attempt.policy_snapshot.allowed_providers.includes('codex')
-      || attempt.policy_snapshot.review_mode !== 'off'
-      || attempt.policy_snapshot.reviewer != null
-      || attempt.policy_snapshot.independent_review !== 'none') {
+      || decision.discovery?.commands?.codex?.available !== true
+      || attempt.policy_snapshot.providers?.codex?.enabled !== true
+      || attempt.policy_snapshot.providers.codex.model !== route.provider.model
+      || attempt.policy_snapshot.providers.codex.reasoning_effort !== route.provider.reasoning_effort
+      || attempt.policy_snapshot.review?.mode !== 'off'
+      || attempt.policy_snapshot.review?.reviewer != null) {
     throw new Error('Codex policy snapshot does not exactly authorize the selected isolated route');
   }
   if (!codexHome || !lastMessagePath) throw new Error('isolated Codex launch paths are required');
-  const command = decision.permitted_capabilities.commands.codex.path;
+  const command = decision.discovery.commands.codex.path;
   const prompt = childPrompt(task, attempt);
   const args = [
     'exec',
@@ -476,7 +473,7 @@ function contextPacket({ task, attempt, result, verification, changed, unexpecte
   const base = {
     schema: CONTEXT_PACKET_SCHEMA,
     context_firewall: {
-      enabled_at_launch: attempt.policy_snapshot.context_firewall_enabled !== false,
+      enforcement: 'mandatory',
       output_contract: 'bounded-decision-evidence',
     },
     task_id: task.task_id,
@@ -843,9 +840,6 @@ export async function runAttempt(root, task, attempt, claim, {
   const p = paths(root);
   const attemptPath = join(p.attempts, `${attempt.attempt_id}.json`);
   validateTaskCommands(task);
-  if (attempt.policy_snapshot?.context_firewall_enabled !== true) {
-    throw new Error('Context Firewall is mandatory for Runner execution');
-  }
   if (!prepared) prepareAttemptLaunch(root, task, attempt, detached ? 'detached-worker' : 'foreground-wait');
   const rawDirectory = join(p.raw, attempt.attempt_id);
   mkdirSync(rawDirectory, { recursive: true, mode: 0o700 });

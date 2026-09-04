@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { runWakeDispatcher } from '../src/wakeup.js';
-import { compatibilityPreflight, loadRuntimeRelease } from '../src/runtime-release.js';
+import { loadRuntimeRelease } from '../src/runtime-release.js';
 
 function valueAfter(args, flag) {
   const index = args.indexOf(flag);
@@ -19,7 +19,6 @@ if (!root || !dispatcherId || !launchNonce || !Number.isSafeInteger(dispatcherGe
   process.exitCode = 1;
 } else {
   loadRuntimeRelease();
-  compatibilityPreflight(root, { operation: 'read' });
   runWakeDispatcher(root, {
     dispatcherId,
     dispatcherGeneration,

@@ -54,7 +54,7 @@ function fixture() {
   mkdirSync(join(root, '.opsle'));
   cpSync(join(sourceRoot, '.opsle', 'specification.md'), join(root, '.opsle', 'specification.md'));
   cpSync(join(sourceRoot, '.opsle', 'requirements.json'), join(root, '.opsle', 'requirements.json'));
-  initialize(root, { actor: 'recovery-test' });
+  initialize(root, { actor: 'recovery-test', objectiveText: 'Exercise recovery behavior.' });
   return root;
 }
 
@@ -280,11 +280,12 @@ test('live policy changes are prospective and retry creates immutable distinct a
     assert.equal(second.attempt.attempt_id, `${task.task_id}-attempt-002`);
     assert.notEqual(second.attempt.claim_id, first.attempt.claim_id);
     assert.equal(readFileSync(firstPath, 'utf8'), firstBytes);
-    assert.deepEqual(readJson(firstPath).policy_snapshot.allowed_providers, ['codex']);
-    assert.equal(readJson(firstPath).policy_snapshot.review_mode, 'off');
-    assert.deepEqual(second.attempt.policy_snapshot.allowed_providers.sort(), ['claude', 'codex']);
-    assert.equal(second.attempt.policy_snapshot.review_mode, 'risk_based');
-    assert.equal(second.attempt.policy_snapshot.reviewer, 'claude');
+    assert.equal(readJson(firstPath).policy_snapshot.providers.claude.enabled, false);
+    assert.equal(readJson(firstPath).policy_snapshot.review.mode, 'off');
+    assert.equal(second.attempt.policy_snapshot.providers.codex.enabled, true);
+    assert.equal(second.attempt.policy_snapshot.providers.claude.enabled, true);
+    assert.equal(second.attempt.policy_snapshot.review.mode, 'risk_based');
+    assert.equal(second.attempt.policy_snapshot.review.reviewer, 'claude');
     assert.equal(readJson(join(p.tasks, `${task.task_id}.json`)).attempts.length, 2);
   } finally {
     rmSync(root, { recursive: true, force: true });
