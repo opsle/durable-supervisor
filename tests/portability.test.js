@@ -106,9 +106,12 @@ test('initialization matrix A: ordinary Git repository gets a neutral objective-
     assert.deepEqual(validateDurableState(root), { valid: true, errors: [] });
     const status = runCli(root, ['status']);
     assert.equal(status.status, 0, status.stderr);
-    assert.match(status.stdout, /^ATTENTION: ACTION NEEDED — objective required/m);
-    assert.match(status.stdout, /^Supervisor: INITIALIZED — no objective set/m);
-    assert.match(status.stdout, /Herdr (snapshot unavailable|discovery requires)/);
+    assert.match(status.stdout, /^Lifecycle: Initialized — no objective set/m);
+    assert.match(status.stdout, /^Pause: clear/m);
+    assert.match(status.stdout, /^Work: none/m);
+    assert.match(status.stdout, /^Wake: clear/m);
+    assert.match(status.stdout, /^Herdr: unbound/m);
+    assert.match(status.stdout, /^Next: Set the repository objective\./m);
     const objectiveSet = runCli(root, [
       'objective', 'set', '--text', 'Operate the foreign repository.',
     ]);

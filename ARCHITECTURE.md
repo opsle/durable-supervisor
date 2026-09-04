@@ -100,12 +100,13 @@ Supervisor and child lifecycles are independent:
 - Supervisor: `ACTIVE`, `DORMANT`, or `PAUSED`.
 - Child: `QUEUED`, `LAUNCHING`, `RUNNING`, a terminal state, or `UNKNOWN`.
 
-The default `task run` path persists its wait and detached-worker launch record,
-sets the supervisor `DORMANT`, spawns an independent Node worker, and returns
-after that worker durably acknowledges exact claim, fence, supervisor, nonce,
-and PID ownership. No child process or wait remains attached to the initiating
-supervisor turn. `--foreground-wait` deliberately selects the prior blocking
-compatibility path.
+The default `task run` path creates the task attempt and claim, then persists one
+immutable Runner request under `.opsle/runner/requests/`. It does not launch a
+child. The host opsled validates the registered repository and the exact
+supervisor/task/attempt/claim decision, launches the independent Node Runner,
+records its PID/start/executable identity, and supervises it. No child process
+or wait remains attached to the initiating supervisor turn.
+`--foreground-wait` deliberately selects the prior blocking compatibility path.
 
 The detached worker owns the full lifecycle. After process close it persists
 the provider process result first, then verification, raw evidence, the compact
@@ -208,8 +209,8 @@ release fence.
 ## Host-level opsled
 
 `src/opsled.js` is the single host process abstraction. `src/opsled-registry.js`
-maintains a canonical, atomically replaced registry under `OPSLED_HOME` (or the
-XDG state directory). Repository aliases resolve to one realpath-derived ID.
+maintains a canonical, atomically replaced registry under the operating-system
+account's fixed state directory. Repository aliases resolve to one realpath-derived ID.
 Mappings contain only the repository realpath, host-state path, enabled bit,
 and timestamps; objective, policy, task, decision, history, and evidence remain
 under that repository's `.opsle` authority.
@@ -230,6 +231,36 @@ fence generation, worker PID/start/executable, and runtime release. Raw outputs,
 Context Firewall evidence, Acceptance, and terminal authority remain in the
 repository. Cross-repository host records and stale worker identities fail
 closed.
+
+Repository registration also writes `.opsle/host-ownership.json`. This small
+pointer binds the repository realpath to one host opsled registry, one Herdr
+workspace/pane/terminal, and the repository's current Codex session-binding
+pointer. Callers do not select that authority with environment variables,
+their current directory, or their current terminal. The repository supervisor
+writes immutable requests under `.opsle/runner/requests/`; opsled validates and
+executes only those explicit intents. It never selects work from objectives or
+tasks.
+
+Blocking wake delivery runs in one transient opsled-owned process per request.
+This keeps plain `codex resume` confirmation waits from blocking another
+repository's Runner or wake transport.
+
+Runtime releases are verified and installed beneath the canonical host state
+directory by immutable artifact digest. Upgrade uses the same host lock,
+stops the exact current opsled process before its final inventory, reports
+repository inventory failures independently, invokes the target release's
+re-runnable durable migrations, switches one current-release pointer, and then
+starts the installed target. It does not accept a caller-selected host root.
+
+## Identity constraint
+
+New process ownership uses PID, process start ticks, and executable. New
+content or release ownership uses an immutable digest. A new generation,
+nonce, lease, fencing token, or ownership ID is prohibited unless its design
+names the specific concurrent writer it orders and proves that process identity
+and content identity cannot order that writer. Existing live legacy fences are
+retained until single-writer opsled ownership makes their removal a separately
+proved change.
 
 ## Adapter and deferred boundaries
 

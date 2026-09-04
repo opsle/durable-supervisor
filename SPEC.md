@@ -269,3 +269,30 @@ release. It MUST retain raw result references, heartbeat and deadline state, and
 terminal publication. It MUST reject cross-repository or stale PID/fence
 confusion. A failure, pause, or upgrade requirement in one repository MUST NOT
 block another registered repository.
+
+The default identity primitives for new architecture are exact process identity
+(PID, process start ticks, executable) and immutable content or release digest.
+No new generation, nonce, lease, fencing token, or ownership ID may be added
+unless the implementation and review name the specific concurrent writer it
+orders and prove why those two primitives are insufficient. Existing live
+legacy fences are not removed by this rule.
+
+Registration MUST create one repository-local host ownership pointer from the
+repository realpath to the canonical opsled registry, its Herdr
+workspace/pane/terminal, and the current Codex session-binding pointer. Normal
+callers MUST NOT choose the opsled root through `OPSLED_HOME`, `XDG_STATE_HOME`,
+cwd, tmux, inherited Codex variables, or a caller Herdr pane.
+
+The repository supervisor MUST express execution as an immutable request under
+`.opsle/runner/requests/`. Opsled MUST validate the registered repository,
+supervisor, task, attempt, claim, and existing claim fence before launching the
+request. Opsled MUST NOT derive execution intent by scanning project objectives
+or tasks. Wake transports that may block MUST execute as transient supervised
+workers so one repository cannot block another.
+
+Runtime upgrade MUST verify the complete target artifact, install it under its
+immutable digest, stop the exact current opsled process, reject live transient
+workers, run the target release's real migrations, and switch the current
+runtime pointer only after every migration succeeds. Upgrade inventory MUST
+retain per-repository failures rather than allowing one repository to hide the
+state of another.

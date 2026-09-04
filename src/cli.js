@@ -40,6 +40,7 @@ import {
   routeTask,
 } from './pipeline.js';
 import { launchDetachedAttempt, runAttempt } from './runner.js';
+import { createRunnerRequest } from './opsled-runner.js';
 import {
   loadSelectedSupervisorSkillInstructions,
   readSupervisorRoutingDecision,
@@ -49,7 +50,6 @@ import { activationSummary } from './activation-telemetry.js';
 import {
   deriveDisplayState,
   deriveSupervisorLiveness,
-  detachedLaunchNotice,
   renderModels,
   renderPolicy,
   renderSession,
@@ -76,10 +76,12 @@ import {
   wakeQueueStatus,
   reconcileWakeTransportNotStarted,
   consumeReconciledTransportNotStarted,
+  codexSessionBindingStatus,
 } from './wakeup.js';
 import {
   loadRuntimeRelease,
 } from './runtime-release.js';
+import { ensureDurableCompatibility } from './durable-schema.js';
 
 function usage() {
   return `usage: opsle COMMAND
@@ -194,7 +196,10 @@ function integerOption(args, flag, fallback, { minimum = 1, maximum = Number.MAX
 }
 
 export function sessionCommand(root, subcommand, args, { dependencies = {} } = {}) {
-  if (subcommand === 'status') return refreshCodexSessionBinding(root, { dependencies });
+  if (subcommand === 'status') return refreshCodexSessionBinding(root, {
+    dependencies,
+    allowEnvironmentMismatch: true,
+  });
   if (subcommand === 'adopt') return adoptCodexSessionBinding(root, { dependencies });
   if (subcommand !== 'bind') throw new Error('session requires bind, status, or adopt');
   const required = [
@@ -407,7 +412,7 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
     ? join(p.opsle, 'workers', `${attempt.attempt_id}.json`)
     : null;
   const runner = runnerPath && existsSync(runnerPath) ? readJson(runnerPath) : null;
-  const sessionBinding = refreshCodexSessionBinding(root);
+  const sessionBinding = codexSessionBindingStatus(root);
   const selectedWake = lifecycleWakeAttention(root, supervisor, state);
   const operatorState = deriveDisplayState({
     supervisor,
@@ -468,6 +473,7 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
     },
     objective: objective.history.find((item) => item.revision === objective.current_revision) ?? null,
     session_binding: sessionBinding,
+    wake: selectedWake,
     operator_state: operatorState,
     active_work: task ? {
       task_id: task.task_id,
@@ -1055,6 +1061,9 @@ export async function main(args) {
     return;
   }
   if (!existsSync(paths(root).supervisor)) throw new Error('run opsle init first');
+  if (!(command === 'resume-packet' && ['show', 'evidence'].includes(subcommand))) {
+    ensureDurableCompatibility(root);
+  }
   if (command === 'status') {
     const mode = outputMode(args);
     if (args.includes('--watch')) await watchStatus(root, args);
@@ -1220,13 +1229,33 @@ export async function main(args) {
           completion_event_id: result.completion_event.event_id,
         });
       } else {
-        const launch = await launchDetachedAttempt(root, task, attempt, claim, {
-          pauseAfterCurrent: pauseAfterCurrent ? {
+        if (pauseAfterCurrent) {
+          const reason = valueAfter(rest, '--reason', 'task run requested pause after current');
+          updateState(root, {
+            pause: { active: true, after_current: true, reason, changed_at: now() },
+          });
+          emit(root, 'PAUSE_AFTER_CURRENT_REQUESTED', {
             actor: 'operator-cli',
-            reason: valueAfter(rest, '--reason', 'task run requested pause after current'),
-          } : null,
-        });
-        print(rest.includes('--json') ? launch : detachedLaunchNotice(launch));
+            task_id: task.task_id,
+            attempt_id: attempt.attempt_id,
+            reason,
+          });
+        }
+        const request = createRunnerRequest(root, task, attempt, claim);
+        const queued = {
+          launch_mode: 'opsled-request',
+          action: 'REQUEST_SUBMITTED',
+          task_id: task.task_id,
+          attempt_id: attempt.attempt_id,
+          request_id: request.request_id,
+          child_state: attempt.child_state,
+          monitoring_owner: 'OPSLED',
+          pause_after_current: pauseAfterCurrent,
+        };
+        print(rest.includes('--json') ? queued : [
+          `Runner request ${request.request_id} queued for ${task.task_id}.`,
+          'Opsled owns launch and supervision.',
+        ].join('\n'));
       }
     } else if (subcommand === 'evaluate') {
       const taskId = rest[0];
@@ -1329,7 +1358,7 @@ export async function main(args) {
     else if (subcommand === 'is-alive') {
       const mode = outputMode(rest);
       const supervisor = readJson(paths(root).supervisor);
-      const herdr = refreshCodexSessionBinding(root);
+      const herdr = codexSessionBindingStatus(root);
       const tmux = { session: name, alive: tmuxAlive(name) };
       const liveness = deriveSupervisorLiveness({
         authorityStatus: supervisor.authority_status,

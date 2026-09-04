@@ -20,6 +20,7 @@ export const RUNTIME_HELPER_ROLES = Object.freeze({
   'bin/opsle-wake-delivery.js': 'wake-delivery',
   'bin/opsled.js': 'opsled',
   'bin/opsled-worker.js': 'opsled-worker',
+  'bin/opsled-wake-worker.js': 'opsled-wake-worker',
 });
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');

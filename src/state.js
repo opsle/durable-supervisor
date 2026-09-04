@@ -20,6 +20,7 @@ import {
   writeJson,
 } from './io.js';
 import { supervisorRoutingDecisionErrors } from './supervisor-routing.js';
+import { ensureDurableCompatibility } from './durable-schema.js';
 
 export const OPSLE_SCHEMA = 'opsle.durable-supervisor';
 export const BOOTSTRAP_SCHEMA = `${OPSLE_SCHEMA}.bootstrap/v1`;
@@ -190,6 +191,8 @@ export const paths = (root) => {
     opsle,
     specification: join(opsle, 'specification.md'),
     bootstrap: join(opsle, 'bootstrap.json'),
+    compatibility: join(opsle, 'compatibility.json'),
+    hostOwnership: join(opsle, 'host-ownership.json'),
     requirements: join(opsle, 'requirements.json'),
     objective: join(opsle, 'objective.json'),
     policy: join(opsle, 'policy.json'),
@@ -207,6 +210,7 @@ export const paths = (root) => {
     resumePacket: join(opsle, 'resume-packet.json'),
     reconstructionTelemetry: join(opsle, 'evidence', 'reconstruction', 'telemetry.json'),
     supervisorRouting: join(opsle, 'supervisor-routing'),
+    runnerRequests: join(opsle, 'runner', 'requests'),
   };
 };
 
@@ -276,6 +280,7 @@ export function initialize(root, { actor = 'bootstrap-codex', objectiveText = nu
   };
   for (const directory of [
     p.tasks, p.attempts, p.claims, p.events, p.raw, p.compact, p.supervisorRouting,
+    p.runnerRequests,
   ]) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
   }
@@ -360,10 +365,11 @@ export function initialize(root, { actor = 'bootstrap-codex', objectiveText = nu
   writeJson(p.objective, objective);
   writeJson(p.state, state);
   writeJson(p.audit, audit);
+  const compatibility = ensureDurableCompatibility(root);
   const event = emit(root, 'SUPERVISOR_INITIALIZED', { actor, repository: root });
   supervisor.last_durable_event = event.event_id;
   writeJson(p.supervisor, supervisor);
-  return { bootstrap, supervisor, policy, objective, state, audit };
+  return { bootstrap, supervisor, policy, objective, state, audit, compatibility };
 }
 
 export function setRequirements(root, ids, state, evidence = [], justification = null) {

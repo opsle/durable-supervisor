@@ -353,20 +353,31 @@ export function renderSupervisorStatus(value, {
     active?.attempt_id,
     active?.claim_id,
   ].filter(Boolean);
-  const lines = [];
-  if (value.operator_state.attention) {
-    const label = ['UNKNOWN', 'UNCERTAIN'].includes(value.operator_state.child.label)
-      ? value.operator_state.child.label
-      : 'ACTION NEEDED';
-    lines.push(`ATTENTION: ${label} — ${compactText(value.operator_state.reasons.join('; ') || 'operator action is required')}`);
-  }
-  lines.push(value.objective
-    ? `Supervisor: ${value.operator_state.supervisor} — objective r${value.objective.revision}`
-    : `Supervisor: ${value.operator_state.supervisor} — no objective set`);
+  const lifecycle = value.objective
+    ? `${title(value.supervisor.phase)} — objective r${value.objective.revision}`
+    : `${title(value.supervisor.phase)} — no objective set`;
+  const pause = value.supervisor.pause?.active
+    ? `${value.supervisor.pause.after_current ? 'after current work' : 'active'}${value.supervisor.pause.reason ? ` — ${compactText(value.supervisor.pause.reason)}` : ''}`
+    : 'clear';
   const sessionLabel = value.session_binding.valid === true
-    ? 'CURRENT (authoritative Herdr)'
-    : `${value.session_binding.classification === 'stale' ? 'UNKNOWN' : value.session_binding.classification.toUpperCase()}${value.session_binding.reasons?.length ? ` — ${value.session_binding.reasons.map(words).join(', ')}` : ''}`;
-  lines.push(`Herdr: ${sessionLabel}`);
+    ? `current — workspace ${value.session_binding.binding.host.workspace_id}, pane ${value.session_binding.binding.host.pane_id}`
+    : `${value.session_binding.classification === 'stale' ? 'unknown' : words(value.session_binding.classification)}${value.session_binding.reasons?.length ? ` — ${value.session_binding.reasons.map(words).join(', ')}` : ''}`;
+  const wakeCurrent = value.wake?.current ?? null;
+  const wake = wakeCurrent
+    ? `${title(wakeCurrent.classification)} — ${words(wakeCurrent.terminal_type)} for ${abbreviateIdentifier(wakeCurrent.task_id, identifiers)}`
+    : 'clear';
+  let next = value.progress.pending_next_action ?? 'none';
+  if (active && ['COMPLETED', 'FAILED', 'CANCELLED'].includes(active.child_state)) {
+    next = `Evaluate ${abbreviateIdentifier(active.task_id, identifiers)}.`;
+  } else if (active) {
+    next = 'Await the current Runner result.';
+  } else if (value.supervisor.pause?.active) {
+    next = 'Await operator direction.';
+  }
+  const lines = [
+    `Lifecycle: ${lifecycle}`,
+    `Pause: ${pause}`,
+  ];
   if (!active) {
     lines.push('Work: none');
   } else {
@@ -375,27 +386,13 @@ export function renderSupervisorStatus(value, {
     const timing = ['LAUNCHING', 'RUNNING'].includes(value.operator_state.child.label)
       ? ` for ${formatDuration(active.elapsed_ms)}`
       : (active.completion ? ` ${formatRelativeTime(active.completion, referenceTime)}` : '');
-    lines.push(`Work: ${value.operator_state.child.label} — ${active.description} [${taskId}]${timing}`);
-    lines.push(`Attempt: ${attemptId}; heartbeat ${formatRelativeTime(active.last_heartbeat, referenceTime)}`);
+    lines.push(`Work: ${title(value.operator_state.child.label)} — ${active.description} [${taskId}]${timing}; attempt ${attemptId}`);
   }
+  lines.push(`Wake: ${wake}`);
+  lines.push(`Herdr: ${sessionLabel}`);
+  lines.push(`Next: ${compactText(next)}`);
+
   const requirementEntries = Object.entries(value.progress.requirements);
-  const terminalRequirementStates = new Set([
-    'VERIFIED',
-    'DEFERRED_WITH_JUSTIFICATION',
-    'NOT_APPLICABLE_WITH_JUSTIFICATION',
-  ]);
-  const done = requirementEntries
-    .filter(([name]) => terminalRequirementStates.has(name))
-    .reduce((sum, [, count]) => sum + count, 0);
-  const open = requirementEntries
-    .filter(([name]) => !terminalRequirementStates.has(name))
-    .reduce((sum, [, count]) => sum + count, 0);
-  lines.push(`Progress: ${done} resolved; ${open} open`);
-  lines.push(`Next: ${compactText(value.progress.pending_next_action ?? 'none')}`);
-  const providers = Object.entries(value.policy.providers)
-    .map(([name, enabled]) => `${title(name)} ${enabledLabel(enabled)}`)
-    .join('; ');
-  lines.push(`Policy: ${providers}; review ${words(value.policy.review_mode)}; Context Firewall mandatory`);
 
   if (verbose) {
     lines.push('');
@@ -406,6 +403,7 @@ export function renderSupervisorStatus(value, {
     lines.push(`Durable state: ${value.supervisor.state}`);
     lines.push(`Phase: ${value.supervisor.phase}`);
     lines.push(`Pause: ${JSON.stringify(value.supervisor.pause)}`);
+    lines.push(`Attention: ${value.operator_state.attention ? value.operator_state.reasons.join('; ') : 'none'}`);
     lines.push(`Herdr classification: ${value.session_binding.classification}`);
     lines.push(`Herdr session ID: ${value.session_binding.binding?.codex_session_uuid ?? 'none'}`);
     lines.push(`Herdr reasons: ${(value.session_binding.reasons ?? []).join(', ') || 'none'}`);

@@ -72,7 +72,7 @@ import { resumeHelperResult } from '../bin/opsle-codex-resume.js';
 import { generateResumePacket, readResumePacket } from '../src/reconstruction.js';
 import { createReleaseFence } from '../src/runtime-release.js';
 import { readRegistry, registerRepository } from '../src/opsled-registry.js';
-import { dispatchRepositoryWakes } from '../src/opsled-wake.js';
+import { dispatchRepositoryWakes, repositoryBindingDependencies } from '../src/opsled-wake.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 
@@ -2034,7 +2034,7 @@ test('authoritative Herdr binding rejects stale tmux authority before any transp
       bindingDependencies: bound.dependencies,
     });
     assert.equal(result.classification, 'queued');
-    assert.equal(result.reason, 'codex-session-binding-stale');
+    assert.equal(result.reason, 'codex-session-binding-refresh-unproven');
     assert.equal(result.delivered, false);
     assert.equal(resumeCalls, 0);
     assert.equal(existsSync(join(root, '.opsle', 'wake', 'requests', `${event.event_id}.json`)), true);
@@ -2190,7 +2190,40 @@ test('current Herdr snapshot refreshes from the attached frontend environment wi
   }
 });
 
-test('refresh invalidates current use on ambiguity, detached environment, races, and dual tmux authority', () => {
+test('opsled resolves the current registered session from an unrelated hostile Bash environment', () => {
+  const root = fixture();
+  const hostRoot = mkdtempSync(join(tmpdir(), 'opsled-session-host-'));
+  try {
+    const bound = bindingFixture(root);
+    registerRepository(hostRoot, root);
+    const mapping = Object.values(readRegistry(hostRoot).repositories)[0];
+    const dependencies = repositoryBindingDependencies(mapping, {
+      ...bound.dependencies,
+      environment: () => ({
+        HOME: '/tmp/hostile-home',
+        XDG_STATE_HOME: '/tmp/hostile-state',
+        OPSLED_HOME: '/tmp/hostile-opsled',
+        CODEX_HOME: '/tmp/hostile-codex',
+        CODEX_SESSION_ID: '01a05952-e1fa-71e2-adea-df7e3f7d9999',
+        CODEX_THREAD_ID: '01a05952-e1fa-71e2-adea-df7e3f7d9999',
+        TMUX: 'hostile-pane',
+      }),
+    });
+    const refreshed = refreshCodexSessionBinding(root, {
+      dependencies,
+      allowEnvironmentMismatch: true,
+    });
+    assert.equal(refreshed.valid, true);
+    assert.equal(refreshed.binding.codex_session_uuid, bound.sessionId);
+    assert.equal(refreshed.binding.host.workspace_id, mapping.herdr.workspace_id);
+    assert.equal(refreshed.binding.host.pane_id, mapping.herdr.pane_id);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(hostRoot, { recursive: true, force: true });
+  }
+});
+
+test('failed session refresh preserves the last valid binding pointer byte for byte', () => {
   const cases = [
     ['ambiguous Herdr candidates', (bound) => {
       const snapshot = structuredClone(bound.dependencies.herdrSnapshot());
@@ -2223,24 +2256,17 @@ test('refresh invalidates current use on ambiguity, detached environment, races,
     const root = fixture();
     try {
       const bound = bindingFixture(root);
-      const first = readJson(join(root, '.opsle', 'wake', 'codex-session-binding.json'));
+      const bindingPath = join(root, '.opsle', 'wake', 'codex-session-binding.json');
+      const firstBytes = readFileSync(bindingPath, 'utf8');
       const dependencies = { ...bound.dependencies, ...mutate(bound) };
-      const invalid = refreshCodexSessionBinding(root, { dependencies });
-      assert.equal(invalid.valid, false, label);
-      assert.equal(invalid.classification, 'attention', label);
-      assert.equal(invalid.binding.state, 'INVALID', label);
-      assert.equal(invalid.binding.binding_revision, first.binding_revision + 1, label);
-      assert.equal(invalid.binding.codex_session_uuid, undefined, label);
-      assert.equal(invalid.binding.rollout, undefined, label);
-      assert.equal(invalid.binding.host, undefined, label);
+      const result = refreshCodexSessionBinding(root, { dependencies });
+      assert.equal(result.preserved_prior_binding, true, label);
+      assert.equal(typeof result.refresh_error, 'string', label);
+      assert.equal(readFileSync(bindingPath, 'utf8'), firstBytes, label);
+      assert.equal(result.valid, label !== 'dual tmux authority', label);
       const repeated = refreshCodexSessionBinding(root, { dependencies });
-      if (label === 'frontend discovery race') {
-        assert.equal(repeated.valid, true, label);
-        assert.equal(repeated.binding.binding_revision, invalid.binding.binding_revision + 1, label);
-      } else {
-        assert.equal(repeated.binding.binding_id, invalid.binding.binding_id, label);
-        assert.equal(repeated.binding.binding_revision, invalid.binding.binding_revision, label);
-      }
+      assert.equal(readFileSync(bindingPath, 'utf8'), firstBytes, label);
+      if (label !== 'frontend discovery race') assert.equal(repeated.preserved_prior_binding, true, label);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

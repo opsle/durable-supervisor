@@ -18,6 +18,7 @@ import {
   registerRepository,
   unregisterRepository,
 } from '../src/opsled-registry.js';
+import { upgradeHostRuntime } from '../src/runtime-upgrade.js';
 
 function valueAfter(args, flag, fallback = null) {
   const index = args.indexOf(flag);
@@ -25,13 +26,14 @@ function valueAfter(args, flag, fallback = null) {
 }
 
 function usage() {
-  return `usage: opsled COMMAND [--home PATH]
+  return `usage: opsled COMMAND
 
 commands:
   register [REPOSITORY]
   unregister [REPOSITORY]
   start [--interval-ms MS]
   stop
+  upgrade --release PATH
   status [--verbose|--json]
 `;
 }
@@ -58,7 +60,8 @@ async function main(args) {
     print(usage());
     return;
   }
-  const home = defaultOpsledHome({ ...process.env, OPSLED_HOME: valueAfter(args, '--home', process.env.OPSLED_HOME) });
+  if (args.includes('--home')) throw new Error('--home is not supported; opsled host authority is caller-independent');
+  const home = defaultOpsledHome();
   if (command === 'status') {
     const verbose = args.includes('--verbose');
     if (verbose && args.includes('--json')) throw new Error('choose only one of --verbose or --json');
@@ -76,6 +79,16 @@ async function main(args) {
   }
   if (command === 'stop') {
     print(stopOpsled(home));
+    return;
+  }
+  if (command === 'upgrade') {
+    const release = valueAfter(args, '--release');
+    if (!release) throw new Error('upgrade requires --release PATH');
+    const result = await upgradeHostRuntime(home, release);
+    print(args.includes('--json') ? result : [
+      `Upgraded opsled to ${result.target.runtime_release_id}.`,
+      `Repositories: ${result.repositories.length}.`,
+    ].join('\n'));
     return;
   }
   if (command === 'register' || command === 'unregister') {

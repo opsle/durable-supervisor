@@ -18,7 +18,7 @@
   ],
   "scripts": {
     "build:release-manifest": "node scripts/build-runtime-release.mjs && node ./bin/opsled.js --complete-release-manifest",
-    "check": "node --check src/*.js && node --check bin/*.js && node --check tools/*.mjs && node --check scripts/*.mjs && node --check tests/*.js",
+    "check": "node --check src/*.js && node --check bin/*.js && node --check tools/*.mjs && node --check scripts/*.mjs && node --check tests/*.js && node scripts/check-durable-schema.mjs",
     "test": "node --test --test-isolation=none",
     "test:route-isolation": "node --test --test-isolation=none tests/gearbox-route-isolation.test.js",
     "test:supervisor-routing": "node --test --test-isolation=none tests/supervisor-routing.test.js",

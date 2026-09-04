@@ -11,10 +11,11 @@ production service or a published installable package.
 ## Durable does not mean continuously inferring
 
 The supervisor may remain available in a terminal or tmux session, but an open
-session does not imply a running model turn. `task run` now defaults to a
-detached repository-local Runner worker. The command returns after durable
-worker ownership is established, while the supervisor remains logically
-`DORMANT`. The worker owns the child, heartbeat, timeout, evidence, verification,
+session does not imply a running model turn. `task run` now writes an immutable
+repository-local Runner request. The command returns after durable
+request publication; the host opsled validates that exact request and launches
+the transient Runner. Once worker ownership is established, the supervisor is
+logically `DORMANT`. The worker owns the child, heartbeat, timeout, evidence, verification,
 Context Firewall packet, Acceptance, terminal event, claim release, and wake
 queue. `--foreground-wait` is an explicit compatibility fallback.
 
@@ -191,10 +192,13 @@ exist.
 Registry, service lifecycle, and the bounded future-upgrade primitive use one
 host lock. Its owner record contains exact process identity, stale takeover is
 an atomic rename, retries are bounded, and cleanup verifies the owner before
-removal. No runtime upgrade installation is implemented. When a live managed
-service conflicts with an invoking release, `UPGRADE_REQUIRED` reports distinct
-managed/current and invoking roots and artifact digests, including conflicts
-between builds with the same semantic version.
+removal. `opsled upgrade --release PATH` verifies and installs the complete
+artifact under its digest, stops the exact current service, inventories
+transient processes per repository, runs the target release's real repository
+migrations, switches the managed pointer, and starts that installed release.
+When a managed service conflicts with an invoking release, `UPGRADE_REQUIRED`
+reports distinct managed/current and invoking roots and artifact digests,
+including conflicts between builds with the same semantic version.
 
 Detached Runner and wake helpers carry a release fence over release ID,
 complete artifact digest, runtime epoch, helper role, and exact helper
@@ -249,15 +253,18 @@ availability, model, reasoning effort, and review mode remain repository-local.
 Gearbox reads that configuration and executable discovery directly without
 persisting derived eligibility or rejection layers.
 
-`opsled` is a repository-local implementation of a single-host service. Its
+`opsled` is a repository-shipped implementation of a single host service. Its
 atomic host registry has exactly one mapping per repository realpath and stores
-only operational paths and identifiers. The service and helpers fence release
+only operational paths and identifiers. Registration writes the repository's
+single host-ownership pointer, including its Herdr workspace/pane and current
+session-binding pointer. The service and helpers fence release
 ID, complete artifact digest, runtime epoch, role, and PID/start/executable
 before repository state access. A stopped or upgraded service leaves each
 repository's queued requests intact for restart-safe replay. Repository
 supervisors and Runner workers enqueue terminal requests but never keep wake
-infrastructure alive. The old repository dispatcher command remains an explicit
-compatibility surface.
+infrastructure alive. Blocking wake transports are transient opsled workers, so
+one repository cannot block another. The old repository dispatcher command
+remains an explicit compatibility surface.
 Delivery commitment and consumption recheck the complete ownership vector:
 repository, event, delivery and activation fence, supervisor identity and
 generation, current session/host binding, queue version, opsled owner, and wake

@@ -710,28 +710,6 @@ function replaceBindingPointer(root, build) {
   throw new Error('session binding replacement raced repeatedly');
 }
 
-function invalidBinding(root, prior, priorSha256, reasons) {
-  const supervisor = readJson(paths(root).supervisor);
-  const normalizedReasons = [...new Set(reasons)].sort();
-  const revision = (Number(prior?.binding_revision) || 0) + 1;
-  return {
-    schema: CODEX_SESSION_BINDING_INVALID_SCHEMA,
-    state: 'INVALID',
-    binding_id: `codex-session-binding-invalid-${sha256(canonicalJson({
-      supervisor_id: supervisor.supervisor_id,
-      supervisor_generation: supervisor.generation,
-      prior_sha256: priorSha256,
-      reasons: normalizedReasons,
-    }))}`,
-    binding_revision: revision,
-    supervisor_id: supervisor.supervisor_id,
-    supervisor_generation: supervisor.generation,
-    reasons: normalizedReasons,
-    supersedes_binding_sha256: priorSha256,
-    invalidated_at: now(),
-  };
-}
-
 function invalidStatus(binding, error = null) {
   return {
     classification: 'attention',
@@ -769,6 +747,14 @@ export function refreshCodexSessionBinding(root, {
       allowEnvironmentMismatch,
       priorBinding,
     );
+    const expectedHerdr = dependencies.expectedHerdr ?? null;
+    if (expectedHerdr && (
+      (expectedHerdr.workspace_id && expectedHerdr.workspace_id !== frontend.workspace.workspace_id)
+      || (expectedHerdr.pane_id && expectedHerdr.pane_id !== frontend.pane.pane_id)
+      || (expectedHerdr.terminal_id && expectedHerdr.terminal_id !== frontend.pane.terminal_id)
+    )) {
+      throw new Error('Herdr discovery does not match the registered host ownership pointer');
+    }
     const processInfo = normalizedPaneProcessInfo(deps.herdrPaneProcessInfo(frontend.pane.pane_id));
     const frontendProcess = exactFrontendProcess(
       processInfo,
@@ -783,9 +769,11 @@ export function refreshCodexSessionBinding(root, {
     }
     const sessionsRoot = dependencies.sessionsRoot
       ? dependencies.sessionsRoot(environment)
-      : (environment.CODEX_HOME
-        ? join(environment.CODEX_HOME, 'sessions')
-        : priorBinding?.sessions_root_realpath ?? null);
+      : (allowEnvironmentMismatch
+        ? priorBinding?.sessions_root_realpath ?? null
+        : (environment.CODEX_HOME
+          ? join(environment.CODEX_HOME, 'sessions')
+          : priorBinding?.sessions_root_realpath ?? null));
     if (!sessionsRoot) throw new Error('CODEX_HOME sessions root is unavailable');
     const sessionsRootRealpath = deps.realpath(sessionsRoot);
     const candidates = deps.sessionCandidates(sessionsRootRealpath, frontend.sessionId);
@@ -848,14 +836,26 @@ export function refreshCodexSessionBinding(root, {
         error: reason,
       };
     }
-    const replaced = replaceBindingPointer(root, (prior, priorSha256) => {
-      if (prior?.schema === CODEX_SESSION_BINDING_INVALID_SCHEMA
-          && canonicalJson(prior.reasons) === canonicalJson([reason].sort())
-          && prior.supervisor_id === readJson(paths(root).supervisor).supervisor_id
-          && prior.supervisor_generation === readJson(paths(root).supervisor).generation) return prior;
-      return invalidBinding(root, prior, priorSha256, [reason]);
-    });
-    return { ...invalidStatus(replaced.binding, reason), refreshed: replaced.changed };
+    let prior;
+    try { prior = readOptional(wake.sessionBinding); } catch {
+      return {
+        classification: 'attention',
+        valid: false,
+        supported: false,
+        reasons: [reason, 'existing-session-binding-unreadable'],
+        binding: null,
+        binding_revision: null,
+        refreshed: false,
+        error: reason,
+      };
+    }
+    const priorStatus = codexSessionBindingStatus(root, { binding: prior, dependencies });
+    return {
+      ...priorStatus,
+      refreshed: false,
+      refresh_error: reason,
+      preserved_prior_binding: true,
+    };
   }
 
   const replaced = replaceBindingPointer(root, (prior) => {
@@ -988,13 +988,13 @@ function sameActivationOwner(left, right) {
 
 function activationOwnerCurrent(owner, getProcessIdentity = processIdentity) {
   if (!owner || !sameProcess(owner.process, getProcessIdentity(owner.process?.pid))) return false;
-  if (owner.kind !== 'opsled') return true;
+  if (!['opsled', 'opsled-wake-worker'].includes(owner.kind)) return true;
   if (owner.schema !== 'opsle.durable-supervisor.opsled-wake-owner/v1'
       || typeof owner.service_id !== 'string'
       || !Number.isSafeInteger(owner.service_generation)) return false;
   try {
     assertReleaseFence(owner.release_fence, {
-      role: 'opsled-worker',
+      role: owner.kind === 'opsled-wake-worker' ? 'opsled-wake-worker' : 'opsled-worker',
       processIdentity: owner.process,
     });
     return true;
@@ -2193,6 +2193,15 @@ export function deliverWake(root, eventId, {
     );
     if (reconciled) return reconciled;
   }
+  if (bindingStatus.refresh_error) {
+    return {
+      classification: 'queued',
+      reason: 'codex-session-binding-refresh-unproven',
+      binding_status: bindingStatus,
+      event_id: eventId,
+      delivered: false,
+    };
+  }
   const lifecycle = classifyQueuedWake(root, request, supervisor);
   if (lifecycle.classification !== 'queued'
       || lifecycle.reason !== 'awaiting-supported-native-transport') {
@@ -2409,17 +2418,20 @@ export function deliverWake(root, eventId, {
     dispatcher,
     activationOwner,
   );
-  if (!preDeliveryBinding.valid || !preDeliveryBinding.supported || !preDeliveryFence.current) {
+  const preDeliveryBindingReady = preDeliveryBinding.valid
+    && preDeliveryBinding.supported
+    && !preDeliveryBinding.refresh_error;
+  if (!preDeliveryBindingReady || !preDeliveryFence.current) {
     updateActivationDecision(
       root,
       claim.decision,
       'TRANSPORT_NOT_STARTED',
-      preDeliveryBinding.valid ? preDeliveryFence.reason : 'live session binding refresh unproven',
+      preDeliveryBindingReady ? preDeliveryFence.reason : 'live session binding refresh unproven',
     );
     releaseActivationLease(root, lease);
     return {
       classification: 'queued',
-      reason: preDeliveryBinding.valid
+      reason: preDeliveryBindingReady
         ? preDeliveryFence.reason
         : 'codex-session-binding-refresh-unproven',
       binding_status: preDeliveryBinding,

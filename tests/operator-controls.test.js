@@ -688,8 +688,12 @@ test('operator status commands separate concise, verbose, and JSON output', asyn
     const concise = await runCli(root, ['status']);
     assert.equal(concise.code, 0, concise.stderr);
     assert.ok(concise.stdout.trim().split('\n').length <= 10, concise.stdout);
-    assert.match(concise.stdout, /^Supervisor: ATTENTION/m);
-    assert.match(concise.stdout, /Herdr (snapshot unavailable|discovery requires)/);
+    assert.match(concise.stdout, /^Lifecycle: Active — objective r1/m);
+    assert.match(concise.stdout, /^Pause: clear/m);
+    assert.match(concise.stdout, /^Work: none/m);
+    assert.match(concise.stdout, /^Wake: clear/m);
+    assert.match(concise.stdout, /^Herdr: unbound/m);
+    assert.match(concise.stdout, /^Next: /m);
     assert.doesNotMatch(concise.stdout, /Repository:|Tmux fallback:/);
     assert.doesNotMatch(concise.stdout, /^\s*\{/);
 

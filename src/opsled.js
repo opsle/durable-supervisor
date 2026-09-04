@@ -3,7 +3,7 @@ import {
   existsSync,
   mkdirSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
+import { userInfo } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -18,23 +18,22 @@ import {
   releaseIdentity,
 } from './runtime-release.js';
 import {
+  ensureRepositoryOwnershipPointer,
   readRegistry,
   registryPaths,
   validateRepositoryMapping,
 } from './opsled-registry.js';
-import { dispatchRepositoryWakes } from './opsled-wake.js';
-import { listOpsledRunners } from './opsled-runner.js';
+import { dispatchRepositoryWakes, launchRepositoryWakeTransports } from './opsled-wake.js';
+import { listOpsledRunners, processRunnerRequests } from './opsled-runner.js';
+import { ensureDurableCompatibility } from './durable-schema.js';
+import { assertRuntimeStartAllowed, runtimeUpgradeStatus } from './runtime-upgrade.js';
 
 export const OPSLED_SERVICE_SCHEMA = 'opsle.durable-supervisor.opsled-service/v1';
 export const OPSLED_REPOSITORY_STATUS_SCHEMA = 'opsle.durable-supervisor.opsled-repository-status/v1';
 const DEFAULT_WORKER = fileURLToPath(new URL('../bin/opsled-worker.js', import.meta.url));
 
-export function defaultOpsledHome(environment = process.env) {
-  if (environment.OPSLED_HOME?.trim()) return resolve(environment.OPSLED_HOME.trim());
-  const stateHome = environment.XDG_STATE_HOME?.trim()
-    ? resolve(environment.XDG_STATE_HOME.trim())
-    : join(homedir(), '.local', 'state');
-  return join(stateHome, 'opsled');
+export function defaultOpsledHome() {
+  return join(userInfo().homedir, '.local', 'state', 'opsled');
 }
 
 function classifiedError(classification, message) {
@@ -99,6 +98,7 @@ export async function startOpsled(hostRoot = defaultOpsledHome(), {
   intervalMs = 1000,
 } = {}) {
   loadRuntimeRelease();
+  assertRuntimeStartAllowed(hostRoot);
   const launcherFence = createReleaseFence('opsled');
   assertReleaseFence(launcherFence, { role: 'opsled' });
   const host = registryPaths(hostRoot);
@@ -139,7 +139,16 @@ export async function startOpsled(hostRoot = defaultOpsledHome(), {
       '--generation', String(record.generation),
       '--launch-nonce', record.launch_nonce,
       '--interval-ms', String(intervalMs),
-    ], { cwd: fileURLToPath(new URL('..', import.meta.url)), detached: true, stdio: 'ignore' });
+    ], {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      detached: true,
+      stdio: 'ignore',
+      env: {
+        HOME: userInfo().homedir,
+        PATH: '/usr/local/bin:/usr/bin:/bin',
+        LANG: 'C.UTF-8',
+      },
+    });
     if (!Number.isSafeInteger(child.pid)) throw new Error('opsled worker did not receive a PID');
     const workerIdentity = getProcessIdentity(child.pid);
     if (!workerIdentity) throw new Error('opsled worker process-start identity is unavailable');
@@ -178,13 +187,26 @@ export async function processOpsledRepository(mapping, {
   bindingDependencies = {},
 } = {}) {
   validateRepositoryMapping(mapping, mapping.repository_id);
-  const wake = dispatchRepositoryWakes(mapping, {
+  ensureDurableCompatibility(mapping.repository_realpath);
+  ensureRepositoryOwnershipPointer(mapping);
+  const runnerRequests = await processRunnerRequests(mapping, {
     releaseFence,
     processIdentity,
     serviceIdentity,
-    nativeTransport,
-    bindingDependencies,
   });
+  const wake = nativeTransport
+    ? dispatchRepositoryWakes(mapping, {
+      releaseFence,
+      processIdentity,
+      serviceIdentity,
+      nativeTransport,
+      bindingDependencies,
+    })
+    : launchRepositoryWakeTransports(mapping, {
+      releaseFence,
+      processIdentity,
+      serviceIdentity,
+    });
   let runners = [];
   try {
     runners = listOpsledRunners(mapping, { releaseFence, processIdentity });
@@ -208,6 +230,12 @@ export async function processOpsledRepository(mapping, {
       attempt_id: runner.attempt_id,
       status: runner.status,
       worker: runner.worker,
+    })),
+    runner_requests: runnerRequests.map((request) => ({
+      request_id: request.request_id,
+      status: request.status,
+      runner_process: request.runner_process,
+      failure: request.failure,
     })),
     error: null,
   };
@@ -233,6 +261,9 @@ export async function runOpsledCycle(hostRoot, service, {
         serviceIdentity: {
           service_id: current.service_id,
           generation: current.generation,
+          launch_nonce: current.launch_nonce,
+          process: current.process,
+          host_root: registryPaths(hostRoot).root,
         },
       });
       return { repository_id: mapping.repository_id, status: 'OK', value };
@@ -242,7 +273,9 @@ export async function runOpsledCycle(hostRoot, service, {
         repository_id: mapping.repository_id,
         repository_realpath: mapping.repository_realpath,
         service_identity: { service_id: current.service_id, generation: current.generation },
-        status: error.classification === 'UPGRADE_REQUIRED' ? 'UPGRADE_REQUIRED' : 'ERROR',
+        status: ['UPGRADE_REQUIRED', 'CORRUPT'].includes(error.classification)
+          ? error.classification
+          : 'ERROR',
         observed_at: now(),
         wake: null,
         runners: [],
@@ -331,6 +364,12 @@ export function opsledStatus(hostRoot = defaultOpsledHome(), {
   const service = readService(hostRoot);
   const serviceState = currentService(service, getProcessIdentity);
   const registry = readRegistry(hostRoot);
+  let runtime;
+  try {
+    runtime = runtimeUpgradeStatus(hostRoot);
+  } catch (error) {
+    runtime = { current: null, status: null, inventory: null, error: error.message };
+  }
   const repositories = Object.values(registry.repositories).map((mapping) => {
     let operational = null;
     let error = null;
@@ -342,6 +381,7 @@ export function opsledStatus(hostRoot = defaultOpsledHome(), {
       status: error ? 'ERROR' : (operational?.status ?? 'PENDING'),
       wake: operational?.wake ?? null,
       runners: operational?.runners ?? [],
+      runner_requests: operational?.runner_requests ?? [],
       observed_at: operational?.observed_at ?? null,
       error: error ?? operational?.error ?? null,
       ...(verbose ? { mapping, operational } : {}),
@@ -362,6 +402,7 @@ export function opsledStatus(hostRoot = defaultOpsledHome(), {
       failure: service?.failure ?? null,
     },
     repositories,
+    runtime,
     registry: verbose ? registry : {
       revision: registry.revision,
       count: repositories.length,
@@ -375,13 +416,17 @@ export function renderOpsledStatus(status, { verbose = false } = {}) {
     `  ${status.opsled.status} release=${status.opsled.release_id}`,
   ];
   if (status.opsled.process) {
-    lines.push(`  pid=${status.opsled.process.pid} start=${status.opsled.process.start_time_ticks} generation=${status.opsled.generation}`);
+    lines.push(`  pid=${status.opsled.process.pid} start=${status.opsled.process.start_time_ticks}`);
   }
   if (status.opsled.reason) lines.push(`  reason=${status.opsled.reason}`);
   if (verbose) {
+    lines.push(`  service=${status.opsled.service_id ?? 'none'} generation=${status.opsled.generation ?? 'none'}`);
     lines.push(`  artifact=${status.opsled.artifact_digest}`);
     lines.push(`  epoch=${status.opsled.runtime_epoch}`);
     if (status.opsled.failure) lines.push(`  failure=${status.opsled.failure}`);
+    lines.push(`  managed-runtime=${status.runtime.current?.runtime_release_id ?? 'unmanaged'}`);
+    if (status.runtime.status) lines.push(`  upgrade=${status.runtime.status.status}:${status.runtime.status.phase}`);
+    if (status.runtime.error) lines.push(`  runtime-error=${status.runtime.error}`);
   }
   lines.push('REPOSITORIES');
   if (status.repositories.length === 0) lines.push('  none');
@@ -392,7 +437,10 @@ export function renderOpsledStatus(status, { verbose = false } = {}) {
     const runners = repository.runners.length > 0
       ? ` runners=${repository.runners.map((runner) => runner.status).join(',')}`
       : '';
-    lines.push(`  ${repository.name} ${repository.status}${wake}${runners}`);
+    const requests = repository.runner_requests.length > 0
+      ? ` requests=${repository.runner_requests.map((request) => request.status).join(',')}`
+      : '';
+    lines.push(`  ${repository.name} ${repository.status}${wake}${runners}${requests}`);
     if (verbose) {
       lines.push(`    path=${repository.repository_realpath}`);
       lines.push(`    id=${repository.repository_id}`);
