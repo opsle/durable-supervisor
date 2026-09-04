@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {
+  chmodSync,
   cpSync,
   mkdirSync,
   mkdtempSync,
@@ -79,6 +80,27 @@ test('immutable release manifest verifies the complete normalized package and ev
   ]);
   assert.ok(release.artifact.files.some((entry) => entry.path === 'release-manifest.json'));
   assert.ok(release.artifact.files.some((entry) => entry.path === 'package.json'));
+});
+
+test('release digest is stable across checkout umasks', () => {
+  const source = runtimePackageRoot();
+  const release = loadRuntimeRelease();
+  const root = mkdtempSync(join(tmpdir(), 'opsle-runtime-umask-'));
+  try {
+    for (const entry of release.artifact.files) {
+      const from = join(source, entry.path);
+      const to = join(root, entry.path);
+      mkdirSync(join(to, '..'), { recursive: true });
+      cpSync(from, to);
+      chmodSync(to, (statSync(from).mode & 0o111) === 0 ? 0o664 : 0o775);
+    }
+    assert.equal(
+      loadRuntimeRelease({ root }).packaged_artifact_sha256,
+      release.packaged_artifact_sha256,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('artifact and manifest mismatches fail closed', () => {

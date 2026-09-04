@@ -45,6 +45,10 @@ function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function canonicalPackageMode(path) {
+  return (statSync(path).mode & 0o111) === 0 ? 0o644 : 0o755;
+}
+
 function packagePathCompare(left, right) {
   const lower = left.toLowerCase().localeCompare(right.toLowerCase(), 'en');
   return lower || left.localeCompare(right, 'en');
@@ -84,7 +88,7 @@ export function packagedArtifactDigest(root, manifest) {
     const bytes = entry.path === 'release-manifest.json'
       ? Buffer.from(normalizedManifestBytes(manifest))
       : readFileSync(path);
-    const mode = (statSync(path).mode & 0o777) & ~0o022;
+    const mode = canonicalPackageMode(path);
     digest.update(`${entry.path}\0${mode.toString(8)}\0${bytes.length}\0`);
     digest.update(bytes);
   }
@@ -98,7 +102,7 @@ function validateManifestShape(manifest) {
       || typeof manifest.source_revision !== 'string' || !manifest.source_revision
       || typeof manifest.runtime_epoch !== 'string' || !manifest.runtime_epoch
       || !/^[a-f0-9]{64}$/.test(manifest.packaged_artifact_sha256 ?? '')
-      || manifest.artifact?.digest_algorithm !== 'sha256-path-mode-length-bytes-manifest-digest-zeroed-v1'
+      || manifest.artifact?.digest_algorithm !== 'sha256-path-canonical-mode-length-bytes-manifest-digest-zeroed-v1'
       || manifest.artifact?.manifest_self_reference !== 'release-manifest.json is included with packaged_artifact_sha256 replaced by 64 ASCII zeroes'
       || !Array.isArray(manifest.artifact?.files) || manifest.artifact.files.length === 0) {
     throw new Error('invalid runtime release manifest');

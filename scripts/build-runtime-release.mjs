@@ -31,6 +31,10 @@ function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function canonicalPackageMode(path) {
+  return (statSync(path).mode & 0o111) === 0 ? 0o644 : 0o755;
+}
+
 function packagePathCompare(left, right) {
   const lower = left.toLowerCase().localeCompare(right.toLowerCase(), 'en');
   return lower || left.localeCompare(right, 'en');
@@ -62,7 +66,7 @@ const releaseContent = createHash('sha256');
 for (const path of relativeFiles.filter((entry) => entry !== 'release-manifest.json')) {
   const target = join(root, path);
   const bytes = readFileSync(target);
-  const mode = (statSync(target).mode & 0o777) & ~0o022;
+  const mode = canonicalPackageMode(target);
   releaseContent.update(`${path}\0${mode.toString(8)}\0${bytes.length}\0`);
   releaseContent.update(bytes);
 }
@@ -91,7 +95,7 @@ const manifest = {
   migration_versions: [],
   helpers,
   artifact: {
-    digest_algorithm: 'sha256-path-mode-length-bytes-manifest-digest-zeroed-v1',
+    digest_algorithm: 'sha256-path-canonical-mode-length-bytes-manifest-digest-zeroed-v1',
     manifest_self_reference: 'release-manifest.json is included with packaged_artifact_sha256 replaced by 64 ASCII zeroes',
     files: relativeFiles.map((path) => ({ path })),
   },
@@ -105,7 +109,7 @@ for (const entry of manifest.artifact.files) {
     : readFileSync(path);
   const mode = entry.path === basename(manifestPath)
     ? 0o644
-    : (statSync(path).mode & 0o777) & ~0o022;
+    : canonicalPackageMode(path);
   digest.update(`${entry.path}\0${mode.toString(8)}\0${bytes.length}\0`);
   digest.update(bytes);
 }
