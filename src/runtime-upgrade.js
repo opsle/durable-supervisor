@@ -129,6 +129,19 @@ function jsonFiles(directory) {
     .map((name) => join(directory, name));
 }
 
+function validProcessIdentity(value) {
+  return Number.isSafeInteger(value?.pid)
+    && value.pid > 0
+    && typeof value.start_time_ticks === 'string'
+    && /^\d+$/.test(value.start_time_ticks)
+    && typeof value.executable === 'string'
+    && value.executable.startsWith('/');
+}
+
+function repositoryDispatcherPath(repositoryRoot) {
+  return join(repositoryRoot, '.opsle', 'wake', 'dispatcher.json');
+}
+
 export function inventoryManagedRuntime(hostRoot, {
   getProcessIdentity = processStartIdentity,
 } = {}) {
@@ -139,19 +152,60 @@ export function inventoryManagedRuntime(hostRoot, {
   if (existsSync(host.service)) {
     try {
       const service = readJson(host.service);
-      if (!Number.isSafeInteger(service.process?.pid)
-          || typeof service.process?.start_time_ticks !== 'string'
-          || typeof service.process?.executable !== 'string'
-          || typeof service.release_fence?.packaged_artifact_sha256 !== 'string') {
+      if (!validProcessIdentity(service.process)
+          || typeof service.release_fence?.packaged_artifact_sha256 !== 'string'
+          || !sameProcessIdentity(service.process, service.release_fence?.helper_process)) {
         throw new Error('invalid opsled service process or release identity');
       }
-      processes.push({ kind: 'opsled', repository_id: null, process: service.process, release: service.release_fence });
+      processes.push({
+        kind: 'opsled',
+        lifecycle: 'long-lived',
+        repository_id: null,
+        process: service.process,
+        release: service.release_fence,
+        authority_path: host.service,
+      });
     } catch (error) {
       throw classifiedError('CORRUPT', `opsled service inventory failed: ${error.message}`);
     }
   }
   for (const mapping of Object.values(registry.repositories)) {
     const repository = { repository_id: mapping.repository_id, repository_realpath: mapping.repository_realpath, errors: [] };
+    const dispatcherPath = repositoryDispatcherPath(mapping.repository_realpath);
+    if (existsSync(dispatcherPath)) {
+      try {
+        const dispatcher = readJson(dispatcherPath);
+        if (dispatcher?.schema !== 'opsle.durable-supervisor.host-wake-dispatcher/v1') {
+          throw new Error('invalid managed wake dispatcher schema');
+        }
+        if (dispatcher.process == null) {
+          if (['LAUNCHING', 'LAUNCHED', 'OWNED'].includes(dispatcher.status)) {
+            throw new Error('active managed wake dispatcher has no exact process identity');
+          }
+        } else {
+          if (!validProcessIdentity(dispatcher.process)) {
+            throw new Error('managed wake dispatcher has an invalid process identity');
+          }
+          if (dispatcher.release_fence
+              && !sameProcessIdentity(
+                dispatcher.process,
+                dispatcher.release_fence.helper_process,
+              )) {
+            throw new Error('managed wake dispatcher release identity does not match its process');
+          }
+          processes.push({
+            kind: 'repository-wake-dispatcher',
+            lifecycle: 'long-lived',
+            repository_id: mapping.repository_id,
+            process: dispatcher.process,
+            release: dispatcher.release_fence ?? null,
+            authority_path: dispatcherPath,
+          });
+        }
+      } catch (error) {
+        repository.errors.push(`wake-dispatcher: ${error.message}`);
+      }
+    }
     for (const [kind, directory] of [
       ['runner', join(mapping.host_state_path, 'runners')],
       ['wake-transport', join(mapping.host_state_path, 'wake-transports')],
@@ -162,16 +216,20 @@ export function inventoryManagedRuntime(hostRoot, {
           if (kind === 'runner') validateOpsledRunnerRecord(record, mapping);
           else validateWakeTransportRecord(record, mapping);
           const processIdentity = record.worker;
-          if (!Number.isSafeInteger(processIdentity?.pid)
-              || typeof processIdentity.start_time_ticks !== 'string'
-              || typeof processIdentity.executable !== 'string') {
+          if (!validProcessIdentity(processIdentity)
+              || !sameProcessIdentity(
+                processIdentity,
+                record.worker_release_fence?.helper_process,
+              )) {
             throw new Error(`invalid ${kind} process identity at ${path}`);
           }
           processes.push({
             kind,
+            lifecycle: 'transient',
             repository_id: mapping.repository_id,
             process: processIdentity,
             release: record.worker_release_fence,
+            authority_path: path,
           });
         }
       } catch (error) {
@@ -233,28 +291,95 @@ function compareVersions(left, right) {
   return 0;
 }
 
-async function stopCurrentService(hostRoot, service, {
+async function stopExactManagedProcess(entry, {
+  signal = process.kill,
+  getProcessIdentity = processStartIdentity,
+} = {}) {
+  if (!entry?.live || !sameProcessIdentity(
+    entry.process,
+    getProcessIdentity(entry.process.pid),
+  )) return false;
+  try {
+    signal(entry.process.pid, 'SIGTERM');
+  } catch (error) {
+    if (error.code !== 'ESRCH') throw error;
+  }
+  return true;
+}
+
+function assertReadableProcessInventory(inventory) {
+  if (inventory.failures.length > 0) {
+    throw classifiedError('CORRUPT', 'one or more repository process inventories are unreadable');
+  }
+}
+
+function processKey(entry) {
+  return [
+    entry.kind,
+    entry.repository_id ?? 'host',
+    entry.authority_path,
+    entry.process.pid,
+    entry.process.start_time_ticks,
+    entry.process.executable,
+  ].join(':');
+}
+
+async function quiesceManagedRuntime(hostRoot, initialInventory, {
   signal = process.kill,
   getProcessIdentity = processStartIdentity,
   timeoutMs = 10000,
 } = {}) {
-  if (!service?.live) return;
-  signal(service.process.pid, 'SIGTERM');
+  assertReadableProcessInventory(initialInventory);
+  const captured = new Map();
+  const captureLive = (inventory) => {
+    for (const entry of inventory.processes.filter((item) => item.live)) {
+      captured.set(processKey(entry), entry);
+    }
+  };
+  captureLive(initialInventory);
   const deadline = Date.now() + timeoutMs;
-  while (sameProcessIdentity(service.process, getProcessIdentity(service.process.pid))) {
-    if (Date.now() >= deadline) throw classifiedError('BUSY', 'current opsled did not stop before the upgrade deadline');
+  let inventory = initialInventory;
+  while (true) {
+    assertReadableProcessInventory(inventory);
+    captureLive(inventory);
+    for (const entry of inventory.processes.filter(
+      (item) => item.live && item.lifecycle === 'long-lived',
+    )) {
+      await stopExactManagedProcess(entry, { signal, getProcessIdentity });
+    }
+    const live = inventory.processes.filter((entry) => entry.live);
+    if (live.length === 0) break;
+    if (Date.now() >= deadline) {
+      const transientCount = live.filter((entry) => entry.lifecycle === 'transient').length;
+      const longLivedCount = live.length - transientCount;
+      throw classifiedError(
+        'BUSY',
+        `${transientCount} child-owned and ${longLivedCount} long-lived managed process(es) remain live`,
+      );
+    }
     await sleep(20);
+    inventory = inventoryManagedRuntime(hostRoot, { getProcessIdentity });
   }
-}
-
-function assertQuiescentInventory(inventory) {
-  if (inventory.failures.length > 0) {
-    throw classifiedError('CORRUPT', 'one or more repository process inventories are unreadable');
+  const retiredProcesses = [...captured.values()].map((entry) => {
+    const observed = getProcessIdentity(entry.process.pid);
+    return {
+      kind: entry.kind,
+      lifecycle: entry.lifecycle,
+      repository_id: entry.repository_id,
+      process: entry.process,
+      release: entry.release,
+      authority_path: entry.authority_path,
+      verified_absent: !sameProcessIdentity(entry.process, observed),
+      verified_at: now(),
+    };
+  });
+  if (retiredProcesses.some((entry) => !entry.verified_absent)) {
+    throw classifiedError('BUSY', 'a captured managed process identity survived quiescence');
   }
-  const transients = inventory.processes.filter((entry) => entry.kind !== 'opsled' && entry.live);
-  if (transients.length > 0) {
-    throw classifiedError('BUSY', `${transients.length} transient managed process(es) are still live`);
-  }
+  return {
+    final_inventory: inventoryManagedRuntime(hostRoot, { getProcessIdentity }),
+    retired_processes: retiredProcesses,
+  };
 }
 
 async function migrateRepositoriesWithTarget(releaseRoot, registry) {
@@ -268,16 +393,48 @@ async function migrateRepositoriesWithTarget(releaseRoot, registry) {
   for (const mapping of Object.values(registry.repositories)) {
     try {
       const compatibility = targetSchema.ensureDurableCompatibility(mapping.repository_realpath);
-      results.push({ repository_id: mapping.repository_id, status: 'OK', compatibility });
+      results.push({
+        repository_id: mapping.repository_id,
+        repository_realpath: mapping.repository_realpath,
+        status: 'OK',
+        availability: 'AVAILABLE',
+        compatibility,
+      });
     } catch (error) {
       results.push({
         repository_id: mapping.repository_id,
-        status: error.classification ?? 'CORRUPT',
+        repository_realpath: mapping.repository_realpath,
+        status: 'ATTENTION',
+        availability: 'QUARANTINED',
+        classification: error.classification ?? 'CORRUPT',
         error: error.message,
+        evidence_preserved: true,
       });
     }
   }
   return results;
+}
+
+function persistRepositoryQuarantines(registry, results) {
+  for (const result of results.filter((entry) => entry.status === 'ATTENTION')) {
+    const mapping = registry.repositories[result.repository_id];
+    const statusPath = join(mapping.host_state_path, 'status.json');
+    mkdirSync(mapping.host_state_path, { recursive: true, mode: 0o700 });
+    writeJson(statusPath, {
+      schema: 'opsle.durable-supervisor.opsled-repository-status/v1',
+      repository_id: mapping.repository_id,
+      repository_realpath: mapping.repository_realpath,
+      service_identity: null,
+      status: 'ATTENTION',
+      availability: 'QUARANTINED',
+      classification: result.classification,
+      observed_at: now(),
+      wake: null,
+      runners: [],
+      runner_requests: [],
+      error: result.error,
+    });
+  }
 }
 
 function defaultStartTarget(releaseRoot) {
@@ -313,6 +470,8 @@ export async function upgradeHostRuntime(hostRoot, sourcePath, {
     phase: 'LOCKED',
     status: 'RUNNING',
     inventory: null,
+    final_inventory: null,
+    retired_processes: [],
     repositories: [],
     failure: null,
     started_at: now(),
@@ -334,22 +493,22 @@ export async function upgradeHostRuntime(hostRoot, sourcePath, {
     releaseRoot = installRelease(hostRoot, sourceRoot, target);
     status.target = releaseSummary(target, releaseRoot);
     persist('INSTALLED');
-    const initialInventory = inventoryManagedRuntime(hostRoot, { getProcessIdentity });
-    assertQuiescentInventory(initialInventory);
-    const service = initialInventory.processes.find((entry) => entry.kind === 'opsled');
-    await stopCurrentService(hostRoot, service, { signal, getProcessIdentity, timeoutMs: stopTimeoutMs });
-    persist('STOPPED');
     status.inventory = inventoryManagedRuntime(hostRoot, { getProcessIdentity });
+    persist('QUIESCING');
+    const quiesced = await quiesceManagedRuntime(hostRoot, status.inventory, {
+      signal,
+      getProcessIdentity,
+      timeoutMs: stopTimeoutMs,
+    });
+    status.final_inventory = quiesced.final_inventory;
+    status.retired_processes = quiesced.retired_processes;
     persist('INVENTORIED');
-    assertQuiescentInventory(status.inventory);
+    assertReadableProcessInventory(status.final_inventory);
     const registry = readRegistry(hostRoot);
     persist('MIGRATING');
     status.repositories = await migrateRepositoriesWithTarget(releaseRoot, registry);
+    persistRepositoryQuarantines(registry, status.repositories);
     persist('MIGRATED');
-    const failed = status.repositories.filter((repository) => repository.status !== 'OK');
-    if (failed.length > 0) {
-      throw classifiedError('CORRUPT', `${failed.length} repository migration(s) failed`);
-    }
     const current = {
       schema: RUNTIME_CURRENT_SCHEMA,
       ...releaseSummary(target, releaseRoot),

@@ -14,6 +14,7 @@ import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import {
   DURABLE_COMPATIBILITY_SCHEMA,
+  DURABLE_MIGRATION_WRITE_BOUNDARIES,
   DURABLE_SCHEMA_VERSION,
   assertSchemaEvolution,
   durableSchemaManifest,
@@ -56,25 +57,75 @@ test('missing compatibility header backfills only after an idempotent migration 
   }
 });
 
-test('an interrupted v1 to v2 migration does not advance the compatibility header', () => {
-  const root = fixture({ complete: false });
+test('the exact legacy incomplete v1 header resumes without publishing another intermediate version', () => {
+  const root = fixture();
   const compatibility = join(root, '.opsle', 'compatibility.json');
   try {
     writeJson(compatibility, {
       schema: DURABLE_COMPATIBILITY_SCHEMA,
       durable_schema_version: 1,
-      schema_fingerprint_sha256: '1'.repeat(64),
+      schema_fingerprint_sha256: null,
       migrated_at: '2026-09-03T00:00:00.000Z',
     });
-    assert.throws(
-      () => ensureDurableCompatibility(root),
-      (error) => error.classification === 'CORRUPT',
-    );
-    assert.equal(readJson(compatibility).durable_schema_version, 1);
-    writeJson(join(root, '.opsle', 'policy.json'), { providers: {} });
-    assert.equal(ensureDurableCompatibility(root).durable_schema_version, 2);
+    const migrated = ensureDurableCompatibility(root);
+    assert.equal(migrated.durable_schema_version, DURABLE_SCHEMA_VERSION);
+    assert.equal(migrated.schema_fingerprint_sha256, durableSchemaManifest().fingerprint_sha256);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function migrateInProcess(root, crashBoundary = '') {
+  const moduleUrl = new URL('../src/durable-schema.js', import.meta.url).href;
+  const source = [
+    `import { ensureDurableCompatibility } from ${JSON.stringify(moduleUrl)};`,
+    'const root = process.argv[1];',
+    'const crash = process.argv[2] || null;',
+    'const result = ensureDurableCompatibility(root, {',
+    '  afterDurableWrite(boundary) {',
+    '    if (boundary === crash) process.exit(86);',
+    '  },',
+    '});',
+    'process.stdout.write(JSON.stringify(result));',
+  ].join('\n');
+  return spawnSync(process.execPath, [
+    '--input-type=module', '-e', source, root, crashBoundary,
+  ], { encoding: 'utf8' });
+}
+
+test('crash after every migration durable write restarts from valid committed state and converges', () => {
+  for (const boundary of DURABLE_MIGRATION_WRITE_BOUNDARIES) {
+    const root = fixture();
+    const compatibility = join(root, '.opsle', 'compatibility.json');
+    const authorityFiles = ['supervisor.json', 'state.json', 'objective.json', 'policy.json'];
+    const authorityBefore = new Map(authorityFiles.map((name) => [
+      name,
+      readFileSync(join(root, '.opsle', name)),
+    ]));
+    try {
+      const interrupted = migrateInProcess(root, boundary);
+      assert.equal(interrupted.status, 86, `${boundary}: ${interrupted.stderr}`);
+      if (existsSync(compatibility)) {
+        const committed = readJson(compatibility);
+        assert.equal(committed.durable_schema_version, DURABLE_SCHEMA_VERSION, boundary);
+        assert.equal(committed.schema_fingerprint_sha256, durableSchemaManifest().fingerprint_sha256);
+      }
+      const restarted = migrateInProcess(root);
+      assert.equal(restarted.status, 0, `${boundary}: ${restarted.stderr}`);
+      const migrated = JSON.parse(restarted.stdout);
+      assert.equal(migrated.durable_schema_version, DURABLE_SCHEMA_VERSION, boundary);
+      assert.equal(migrated.schema_fingerprint_sha256, durableSchemaManifest().fingerprint_sha256);
+      assert.equal(existsSync(join(root, '.opsle', 'runner', 'requests')), true);
+      for (const [name, bytes] of authorityBefore) {
+        assert.deepEqual(readFileSync(join(root, '.opsle', name)), bytes, `${boundary}: ${name}`);
+      }
+      const committedBytes = readFileSync(compatibility);
+      const idempotent = migrateInProcess(root);
+      assert.equal(idempotent.status, 0, `${boundary}: ${idempotent.stderr}`);
+      assert.deepEqual(readFileSync(compatibility), committedBytes, boundary);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -86,6 +137,12 @@ test('newer compatibility state is UPGRADE_REQUIRED and malformed state is CORRU
       schema_fingerprint_sha256: '0'.repeat(64),
       migrated_at: '2026-09-04T00:00:00.000Z',
     }), 'UPGRADE_REQUIRED'],
+    ['unknown-v1-fingerprint', (path) => writeJson(path, {
+      schema: DURABLE_COMPATIBILITY_SCHEMA,
+      durable_schema_version: 1,
+      schema_fingerprint_sha256: '1'.repeat(64),
+      migrated_at: '2026-09-04T00:00:00.000Z',
+    }), 'CORRUPT'],
     ['malformed', (path) => writeFileSync(path, '{not-json\n'), 'CORRUPT'],
   ]) {
     const root = fixture();

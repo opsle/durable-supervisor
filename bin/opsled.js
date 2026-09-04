@@ -85,9 +85,12 @@ async function main(args) {
     const release = valueAfter(args, '--release');
     if (!release) throw new Error('upgrade requires --release PATH');
     const result = await upgradeHostRuntime(home, release);
+    const attention = result.repositories.filter((entry) => entry.status === 'ATTENTION').length;
     print(args.includes('--json') ? result : [
       `Upgraded opsled to ${result.target.runtime_release_id}.`,
       `Repositories: ${result.repositories.length}.`,
+      `Healthy: ${result.repositories.length - attention}.`,
+      `Attention: ${attention}.`,
     ].join('\n'));
     return;
   }

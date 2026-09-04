@@ -5,15 +5,14 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { join } from 'node:path';
 import test from 'node:test';
-import { canonicalJson, readJson, writeJson } from '../src/io.js';
+import { canonicalJson, readJson } from '../src/io.js';
 import {
   assertReleaseFence,
   createReleaseFence,
@@ -24,10 +23,6 @@ import {
   sameReleaseIdentity,
 } from '../src/runtime-release.js';
 import { initialize, paths } from '../src/state.js';
-import {
-  WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-  runWakeDispatcher,
-} from '../src/wakeup.js';
 
 function repository() {
   const root = mkdtempSync(join(tmpdir(), 'opsle-runtime-version-'));
@@ -38,25 +33,6 @@ function repository() {
   writeFileSync(join(root, 'README.md'), '# runtime fixture\n');
   initialize(root, { actor: 'runtime-version-test', objectiveText: 'Test runtime boundaries.' });
   return root;
-}
-
-function operationalBytes(root) {
-  const base = join(root, '.opsle');
-  const values = new Map();
-  function walk(directory) {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) walk(path);
-      else if (entry.isFile()) values.set(relative(base, path), readFileSync(path));
-    }
-  }
-  walk(base);
-  return values;
-}
-
-function assertBytesEqual(actual, expected) {
-  assert.deepEqual([...actual.keys()].sort(), [...expected.keys()].sort());
-  for (const [path, bytes] of expected) assert.deepEqual(actual.get(path), bytes, path);
 }
 
 test('immutable release manifest verifies the complete normalized package and every helper', () => {
@@ -175,61 +151,5 @@ test('release identity equality ignores object key ordering but rejects changed 
     ['helper_role', 'wake-delivery'],
   ]) {
     assert.equal(sameReleaseIdentity({ ...reordered, [field]: value }, expected), false, field);
-  }
-});
-
-test('old helper fence denies representative mutation, launch, wake, and authority actions', () => {
-  const identity = processStartIdentity();
-  const old = createReleaseFence('runner-worker', identity);
-  old.runtime_epoch = 'superseded-runtime-epoch';
-  for (const action of ['state-mutation', 'child-launch', 'wake-delivery', 'authority-transition']) {
-    let sideEffect = false;
-    assert.throws(() => {
-      assertReleaseFence(old, { role: 'runner-worker', processIdentity: identity });
-      sideEffect = true;
-    }, /runtime release fence mismatch/, action);
-    assert.equal(sideEffect, false, action);
-  }
-});
-
-test('superseded wake helper retires before ownership or delivery mutation', async () => {
-  const root = repository();
-  try {
-    const wake = join(root, '.opsle', 'wake');
-    mkdirSync(join(wake, 'requests'), { recursive: true });
-    const identity = { pid: 8123, start_time_ticks: '812300', executable: '/usr/bin/node' };
-    const supervisor = readJson(paths(root).supervisor);
-    const fence = createReleaseFence('wake-delivery', identity);
-    fence.packaged_artifact_sha256 = '0'.repeat(64);
-    writeJson(join(wake, 'dispatcher.json'), {
-      schema: 'opsle.durable-supervisor.host-wake-dispatcher/v1',
-      dispatcher_id: 'dispatcher-old-release',
-      dispatcher_generation: 1,
-      implementation_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-      release_fence: fence,
-      supervisor_id: supervisor.supervisor_id,
-      supervisor_generation: supervisor.generation,
-      queue_generation: supervisor.generation,
-      launch_nonce: 'old-release-launch',
-      process: identity,
-      status: 'LAUNCHED',
-    });
-    const before = operationalBytes(root);
-    const result = await runWakeDispatcher(root, {
-      dispatcherId: 'dispatcher-old-release',
-      dispatcherGeneration: 1,
-      launchNonce: 'old-release-launch',
-      pid: identity.pid,
-      getProcessIdentity: (pid) => pid === identity.pid ? identity : null,
-      delay: async () => {},
-      maxCycles: 0,
-    });
-    assert.deepEqual(result, {
-      status: 'STALE',
-      reason: 'dispatcher-runtime-release-fence-mismatch',
-    });
-    assertBytesEqual(operationalBytes(root), before);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
   }
 });

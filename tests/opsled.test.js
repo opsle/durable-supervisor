@@ -326,7 +326,7 @@ test('a corrupt managed repository does not block a healthy repository', async (
     assert.equal(current.last_cycle.failed, 1);
     assert.equal(
       current.last_cycle.outcomes.find((item) => item.repository_id === corrupt.repository_id).status,
-      'CORRUPT',
+      'ATTENTION',
     );
     assert.equal(
       current.last_cycle.outcomes.find((item) => item.repository_id === healthy.repository_id).status,

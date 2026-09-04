@@ -219,6 +219,8 @@ export async function processOpsledRepository(mapping, {
     repository_realpath: mapping.repository_realpath,
     service_identity: serviceIdentity,
     status: 'OK',
+    availability: 'AVAILABLE',
+    classification: null,
     observed_at: now(),
     wake: {
       scanned: wake.scanned,
@@ -274,17 +276,19 @@ export async function runOpsledCycle(hostRoot, service, {
       });
       return { repository_id: mapping.repository_id, status: 'OK', value };
     } catch (error) {
+      const quarantined = ['UPGRADE_REQUIRED', 'CORRUPT'].includes(error.classification);
       const value = {
         schema: OPSLED_REPOSITORY_STATUS_SCHEMA,
         repository_id: mapping.repository_id,
         repository_realpath: mapping.repository_realpath,
         service_identity: { service_id: current.service_id, generation: current.generation },
-        status: ['UPGRADE_REQUIRED', 'CORRUPT'].includes(error.classification)
-          ? error.classification
-          : 'ERROR',
+        status: quarantined ? 'ATTENTION' : 'ERROR',
+        availability: quarantined ? 'QUARANTINED' : 'UNAVAILABLE',
+        classification: error.classification ?? 'ERROR',
         observed_at: now(),
         wake: null,
         runners: [],
+        runner_requests: [],
         error: error.message,
       };
       mkdirSync(mapping.host_state_path, { recursive: true, mode: 0o700 });
@@ -385,6 +389,8 @@ export function opsledStatus(hostRoot = defaultOpsledHome(), {
       name: basename(mapping.repository_realpath),
       repository_realpath: mapping.repository_realpath,
       status: error ? 'ERROR' : (operational?.status ?? 'PENDING'),
+      availability: error ? 'UNAVAILABLE' : (operational?.availability ?? 'PENDING'),
+      classification: error ? 'CORRUPT' : (operational?.classification ?? null),
       wake: operational?.wake ?? null,
       runners: operational?.runners ?? [],
       runner_requests: operational?.runner_requests ?? [],
@@ -393,6 +399,9 @@ export function opsledStatus(hostRoot = defaultOpsledHome(), {
       ...(verbose ? { mapping, operational } : {}),
     };
   });
+  const attention = repositories.filter((repository) => (
+    repository.status === 'ATTENTION' || repository.status === 'ERROR'
+  )).length;
   return {
     schema: 'opsle.durable-supervisor.opsled-status/v1',
     opsled: {
@@ -407,6 +416,12 @@ export function opsledStatus(hostRoot = defaultOpsledHome(), {
       heartbeat_at: service?.heartbeat_at ?? null,
       failure: service?.failure ?? null,
     },
+    state: attention > 0 ? 'ATTENTION' : 'OK',
+    summary: {
+      repositories: repositories.length,
+      healthy: repositories.length - attention,
+      attention,
+    },
     repositories,
     runtime,
     registry: verbose ? registry : {
@@ -419,12 +434,16 @@ export function opsledStatus(hostRoot = defaultOpsledHome(), {
 export function renderOpsledStatus(status, { verbose = false } = {}) {
   const lines = [
     'OPSLED',
-    `  ${status.opsled.status} release=${status.opsled.release_id}`,
+    `state: ${status.state}`,
+    `release: ${status.opsled.release_id}`,
+    `repositories: ${status.summary.repositories}`,
+    `healthy: ${status.summary.healthy}`,
+    `attention: ${status.summary.attention}`,
   ];
   if (status.opsled.process) {
-    lines.push(`  pid=${status.opsled.process.pid} start=${status.opsled.process.start_time_ticks}`);
+    lines.push(`process: ${status.opsled.status} pid=${status.opsled.process.pid}`);
   }
-  if (status.opsled.reason) lines.push(`  reason=${status.opsled.reason}`);
+  if (status.opsled.reason) lines.push(`reason: ${status.opsled.reason}`);
   if (verbose) {
     lines.push(`  service=${status.opsled.service_id ?? 'none'} generation=${status.opsled.generation ?? 'none'}`);
     lines.push(`  artifact=${status.opsled.artifact_digest}`);
@@ -446,7 +465,10 @@ export function renderOpsledStatus(status, { verbose = false } = {}) {
     const requests = repository.runner_requests.length > 0
       ? ` requests=${repository.runner_requests.map((request) => request.status).join(',')}`
       : '';
-    lines.push(`  ${repository.name} ${repository.status}${wake}${runners}${requests}`);
+    const attentionReason = repository.status === 'ATTENTION'
+      ? ` \u00b7 ${repository.classification === 'CORRUPT' ? 'corrupt state' : 'upgrade required'}`
+      : '';
+    lines.push(`  ${repository.name} ${repository.status}${attentionReason}${wake}${runners}${requests}`);
     if (verbose) {
       lines.push(`    path=${repository.repository_realpath}`);
       lines.push(`    id=${repository.repository_id}`);

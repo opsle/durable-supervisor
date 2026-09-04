@@ -5,6 +5,10 @@ import { canonicalJson, now, readJson, sha256, writeJson } from './io.js';
 
 export const DURABLE_COMPATIBILITY_SCHEMA = 'opsle.durable-supervisor.compatibility/v1';
 export const DURABLE_SCHEMA_VERSION = 2;
+export const DURABLE_MIGRATION_WRITE_BOUNDARIES = Object.freeze([
+  'runner-requests-directory',
+  'compatibility-header-v2',
+]);
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const manifestPath = join(packageRoot, 'src', 'durable-schema-manifest.json');
@@ -48,16 +52,27 @@ function validateCoreState(root) {
   }
 }
 
-const MIGRATIONS = new Map([
-  [1, function migrateToV1(root) {
-    validateCoreState(root);
-    mkdirSync(join(root, '.opsle', 'runner', 'requests'), { recursive: true, mode: 0o700 });
-  }],
-  [2, function migrateToV2(root) {
-    validateCoreState(root);
-    mkdirSync(join(root, '.opsle', 'runner', 'requests'), { recursive: true, mode: 0o700 });
-  }],
-]);
+function migrateToCurrent(root, afterDurableWrite) {
+  validateCoreState(root);
+  const requests = join(root, '.opsle', 'runner', 'requests');
+  if (!existsSync(requests)) {
+    mkdirSync(requests, { recursive: true, mode: 0o700 });
+    afterDurableWrite('runner-requests-directory');
+  }
+}
+
+function legacyInterruptedHeader(header) {
+  return header?.schema === DURABLE_COMPATIBILITY_SCHEMA
+    && header.durable_schema_version === 1
+    && header.schema_fingerprint_sha256 === null
+    && typeof header.migrated_at === 'string'
+    && Object.keys(header).sort().join(',') === [
+      'durable_schema_version',
+      'migrated_at',
+      'schema',
+      'schema_fingerprint_sha256',
+    ].sort().join(',');
+}
 
 function validateHeader(header, manifest) {
   if (header?.schema !== DURABLE_COMPATIBILITY_SCHEMA
@@ -80,32 +95,32 @@ function validateHeader(header, manifest) {
   return header;
 }
 
-export function ensureDurableCompatibility(root) {
+export function ensureDurableCompatibility(root, {
+  afterDurableWrite = () => {},
+} = {}) {
   const repositoryRoot = resolve(root);
   const path = compatibilityPath(repositoryRoot);
   const manifest = durableSchemaManifest();
-  let version = 0;
   if (existsSync(path)) {
-    version = validateHeader(readDurableJson(path), manifest).durable_schema_version;
-  }
-  while (version < DURABLE_SCHEMA_VERSION) {
-    const targetVersion = version + 1;
-    const migrate = MIGRATIONS.get(targetVersion);
-    if (typeof migrate !== 'function') {
-      throw classifiedError('CORRUPT', `missing migration function for durable schema v${targetVersion}`);
+    const header = readDurableJson(path);
+    if (!legacyInterruptedHeader(header)) {
+      const validated = validateHeader(header, manifest);
+      if (validated.durable_schema_version === DURABLE_SCHEMA_VERSION) return validated;
+      throw classifiedError(
+        'CORRUPT',
+        `unsupported historical durable schema v${validated.durable_schema_version} fingerprint`,
+      );
     }
-    migrate(repositoryRoot);
-    const header = {
-      schema: DURABLE_COMPATIBILITY_SCHEMA,
-      durable_schema_version: targetVersion,
-      schema_fingerprint_sha256: targetVersion === DURABLE_SCHEMA_VERSION
-        ? manifest.fingerprint_sha256
-        : null,
-      migrated_at: now(),
-    };
-    writeJson(path, header);
-    version = targetVersion;
   }
+  migrateToCurrent(repositoryRoot, afterDurableWrite);
+  const header = {
+    schema: DURABLE_COMPATIBILITY_SCHEMA,
+    durable_schema_version: DURABLE_SCHEMA_VERSION,
+    schema_fingerprint_sha256: manifest.fingerprint_sha256,
+    migrated_at: now(),
+  };
+  writeJson(path, header);
+  afterDurableWrite('compatibility-header-v2');
   return validateHeader(readDurableJson(path), manifest);
 }
 
