@@ -224,6 +224,12 @@ export async function processOpsledRepository(mapping, {
       scanned: wake.scanned,
       delivered: wake.delivered,
       classifications: wake.results.map((item) => item.classification),
+      results: wake.results.map((item) => ({
+        event_id: item.event_id ?? item.record?.event_id ?? null,
+        classification: item.classification,
+        reason: item.reason ?? item.record?.reason ?? null,
+        delivered: item.delivered === true,
+      })),
     },
     runners: runners.map((runner) => ({
       task_id: runner.task_id,

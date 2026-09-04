@@ -1416,7 +1416,10 @@ export function classifyWakeDelivery({
       || dispatcher.supervisor_generation !== supervisor.generation)) {
     return { classification: 'stale-generation', reason: 'dispatcher-supervisor-generation-mismatch' };
   }
-  if (busy) return { classification: 'busy', reason: 'active-delivery-or-supervisor-busy-marker' };
+  const nativeResume = request.schema === NATIVE_WAKE_REQUEST_SCHEMA;
+  if (!nativeResume && busy) {
+    return { classification: 'busy', reason: 'active-delivery-or-supervisor-busy-marker' };
+  }
   if (binding && evidence?.host_kind && evidence.host_kind !== binding.host) {
     return { classification: 'unavailable', reason: 'stale-or-mismatched-host-adapter' };
   }
@@ -1428,6 +1431,12 @@ export function classifyWakeDelivery({
   }
   if (!evidence?.available || !evidence.session_alive || evidence.pane_dead) {
     return { classification: 'unavailable', reason: evidence?.reason ?? 'tmux-unavailable' };
+  }
+  if (nativeResume) {
+    return {
+      classification: 'native-ready',
+      reason: 'plain-codex-resume-does-not-require-idle-supervisor',
+    };
   }
   if (evidence.attached_clients?.length) {
     return { classification: 'human-interacting', reason: 'tmux-client-attached' };
@@ -2173,7 +2182,8 @@ export function deliverWake(root, eventId, {
   }
   const refreshOptions = {
     dependencies: bindingDependencies,
-    allowEnvironmentMismatch: Boolean(dispatcher),
+    allowEnvironmentMismatch: Boolean(dispatcher)
+      || ['opsled', 'opsled-wake-worker'].includes(activationOwner?.kind),
   };
   const bindingStatus = refreshCodexSessionBinding(root, refreshOptions);
   const deliveryFence = {

@@ -36,7 +36,13 @@ import {
   runOpsledService,
   startOpsled,
 } from '../src/opsled.js';
-import { canonicalOpsledEnvironment, dispatchRepositoryWakes } from '../src/opsled-wake.js';
+import {
+  canonicalOpsledEnvironment,
+  dispatchRepositoryWakes,
+  launchWakeTransport,
+  persistWakeTransportOutcome,
+  reconcileOpsledTransportNotStarted,
+} from '../src/opsled-wake.js';
 import {
   createRunnerRequest,
   executeRunnerRequest,
@@ -54,12 +60,14 @@ function repository(name = 'repository') {
     schema: 'opsle.durable-supervisor.supervisor/v1',
     repository: realpathSync(root),
     supervisor_id: `supervisor-${name}`,
+    generation: 1,
     authority_status: 'AUTHORITATIVE',
   });
   writeJson(join(root, '.opsle', 'state.json'), {
     schema: 'opsle.durable-supervisor.state/v1',
     active_task_id: null,
     active_attempt_id: null,
+    processed_event_ids: [],
   });
   writeJson(join(root, '.opsle', 'objective.json'), {
     schema: 'opsle.durable-supervisor.objective/v2',
@@ -607,9 +615,19 @@ test('repo A and repo B wake transports launch independently without waiting for
       return { pid, unref() {} };
     };
     for (const mapping of mappings) {
+      const supervisor = JSON.parse(readFileSync(
+        join(mapping.repository_realpath, '.opsle', 'supervisor.json'),
+      ));
       writeJson(join(mapping.repository_realpath, '.opsle', 'wake', 'requests', 'event-parallel.json'), {
+        schema: 'opsle.durable-supervisor.native-wake-request/v2',
         event_id: 'event-parallel',
-        target: { repository: mapping.repository_realpath },
+        task_id: 'task-parallel',
+        attempt_id: 'attempt-parallel',
+        target: {
+          repository: mapping.repository_realpath,
+          supervisor_id: supervisor.supervisor_id,
+          supervisor_generation: supervisor.generation,
+        },
         queue_version: 1,
       });
     }
@@ -627,6 +645,129 @@ test('repo A and repo B wake transports launch independently without waiting for
   } finally {
     rmSync(first, { recursive: true, force: true });
     rmSync(second, { recursive: true, force: true });
+    rmSync(hostRoot, { recursive: true, force: true });
+  }
+});
+
+test('opsled persists the exact reason for every terminal non-delivery', () => {
+  const hostRoot = host();
+  const root = repository('wake-reason');
+  try {
+    const mapping = register(hostRoot, root);
+    const identity = processStartIdentity();
+    const releaseFence = createReleaseFence('opsled-worker', identity);
+    const serviceIdentity = {
+      service_id: 'opsled-reason-service',
+      generation: 1,
+      launch_nonce: 'opsled-reason-launch',
+      process: identity,
+      host_root: hostRoot,
+    };
+    const worker = {
+      pid: 1_500_000_001,
+      start_time_ticks: '1500000001',
+      executable: process.execPath,
+    };
+    const request = {
+      event_id: 'event-reason',
+      queue_version: 1,
+      target: { repository: mapping.repository_realpath },
+    };
+    launchWakeTransport(mapping, request, {
+      releaseFence,
+      processIdentity: identity,
+      serviceIdentity,
+      spawnProcess: () => ({ pid: worker.pid, unref() {} }),
+      getProcessIdentity: () => worker,
+    });
+    const recorded = persistWakeTransportOutcome(
+      mapping,
+      request.event_id,
+      worker,
+      {
+        classification: 'queued',
+        reason: 'codex-session-binding-refresh-unproven',
+        delivered: false,
+      },
+    );
+    assert.equal(recorded.status, 'NO_DELIVERY');
+    assert.equal(recorded.classification, 'queued');
+    assert.equal(recorded.reason, 'codex-session-binding-refresh-unproven');
+    assert.equal(recorded.failure, null);
+
+    const missingReason = {
+      ...recorded,
+      status: 'RUNNING',
+      reason: null,
+      terminal_at: null,
+    };
+    writeJson(join(mapping.host_state_path, 'wake-transports', 'event-reason.json'), missingReason);
+    const rejected = persistWakeTransportOutcome(
+      mapping,
+      request.event_id,
+      worker,
+      { classification: 'queued', delivered: false },
+    );
+    assert.equal(rejected.status, 'FAILED');
+    assert.equal(rejected.reason, 'wake-delivery-non-delivery-reason-missing');
+    assert.equal(rejected.failure, rejected.reason);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(hostRoot, { recursive: true, force: true });
+  }
+});
+
+test('receipt-free dead opsled wake worker reconciles as transport not started', () => {
+  const hostRoot = host();
+  const root = repository('wake-reconcile');
+  try {
+    const mapping = register(hostRoot, root);
+    const identity = processStartIdentity();
+    const worker = {
+      pid: 1_500_000_002,
+      start_time_ticks: '1500000002',
+      executable: process.execPath,
+    };
+    launchWakeTransport(mapping, {
+      event_id: 'event-reconcile',
+      queue_version: 1,
+      target: { repository: mapping.repository_realpath },
+    }, {
+      releaseFence: createReleaseFence('opsled-worker', identity),
+      processIdentity: identity,
+      serviceIdentity: {
+        service_id: 'opsled-reconcile-service',
+        generation: 1,
+        launch_nonce: 'opsled-reconcile-launch',
+        process: identity,
+        host_root: hostRoot,
+      },
+      spawnProcess: () => ({ pid: worker.pid, unref() {} }),
+      getProcessIdentity: () => worker,
+    });
+    persistWakeTransportOutcome(mapping, 'event-reconcile', worker, {
+      classification: 'queued',
+      reason: 'codex-session-binding-refresh-unproven',
+      delivered: false,
+    });
+    const reconciled = reconcileOpsledTransportNotStarted(
+      mapping,
+      'event-reconcile',
+      { getProcessIdentity: () => null },
+    );
+    assert.equal(reconciled.classification, 'transport-not-started');
+    assert.equal(
+      reconciled.reason,
+      'no activation decision, transport attempt, or delivery receipt exists',
+    );
+    assert.deepEqual(reconciled.reconciliation, {
+      worker_current: false,
+      activation_decision_exists: false,
+      transport_attempt_count: 0,
+      delivery_receipt_exists: false,
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
     rmSync(hostRoot, { recursive: true, force: true });
   }
 });

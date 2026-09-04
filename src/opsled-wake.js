@@ -10,7 +10,7 @@ import {
   createReleaseFence,
   processStartIdentity,
 } from './runtime-release.js';
-import { deliverWake, wakeQueueStatus } from './wakeup.js';
+import { classifyQueuedWake, deliverWake, wakeQueueStatus } from './wakeup.js';
 import { validateRepositoryMapping } from './opsled-registry.js';
 import { sameProcessIdentity } from './host-lock.js';
 
@@ -133,7 +133,8 @@ export function validateWakeTransportRecord(record, mapping) {
       || typeof record.owner?.launch_nonce !== 'string'
       || !Number.isSafeInteger(record.owner?.process?.pid)
       || typeof record.owner?.process?.start_time_ticks !== 'string'
-      || typeof record.owner?.process?.executable !== 'string') {
+      || typeof record.owner?.process?.executable !== 'string'
+      || ![null, 'string'].includes(record.reason == null ? null : typeof record.reason)) {
     throw new Error('invalid opsled wake transport record');
   }
   return true;
@@ -167,10 +168,20 @@ export function launchWakeTransport(mapping, request, {
     const live = getProcessIdentity(prior.worker.pid);
     if (['LAUNCHED', 'RUNNING'].includes(prior.status)
         && sameProcessIdentity(prior.worker, live)) {
-      return { classification: 'transport-running', delivered: false, record: prior };
+      return {
+        classification: 'transport-running',
+        reason: prior.reason ?? 'wake-transport-worker-current',
+        delivered: false,
+        record: prior,
+      };
     }
     if (prior.status === 'DELIVERED') {
-      return { classification: prior.status.toLowerCase(), delivered: prior.status === 'DELIVERED', record: prior };
+      return {
+        classification: prior.status.toLowerCase(),
+        reason: 'event-already-delivered',
+        delivered: true,
+        record: prior,
+      };
     }
   }
   const child = spawnProcess(process.execPath, [
@@ -205,12 +216,78 @@ export function launchWakeTransport(mapping, request, {
     launched_at: now(),
     terminal_at: null,
     classification: null,
+    reason: 'wake-transport-worker-launched',
     failure: null,
   };
   mkdirSync(join(mapping.host_state_path, 'wake-transports'), { recursive: true, mode: 0o700 });
   writeJson(target, record);
   child.unref?.();
-  return { classification: 'transport-launched', delivered: false, record };
+  return {
+    classification: 'transport-launched',
+    reason: record.reason,
+    delivered: false,
+    record,
+  };
+}
+
+export function persistWakeTransportOutcome(mapping, eventId, worker, result) {
+  const target = wakeTransportPath(mapping, eventId);
+  const record = readJson(target);
+  validateWakeTransportRecord(record, mapping);
+  if (!sameProcessIdentity(record.worker, worker)) {
+    throw new Error('wake transport outcome worker identity mismatch');
+  }
+  const missingReason = result?.delivered !== true
+    && (typeof result?.reason !== 'string' || result.reason.length === 0);
+  record.status = missingReason
+    ? 'FAILED'
+    : (result.delivered ? 'DELIVERED' : 'NO_DELIVERY');
+  record.classification = result?.classification ?? null;
+  record.reason = missingReason
+    ? 'wake-delivery-non-delivery-reason-missing'
+    : (result?.reason ?? null);
+  record.failure = missingReason ? record.reason : null;
+  record.terminal_at = now();
+  writeJson(target, record);
+  return record;
+}
+
+export function reconcileOpsledTransportNotStarted(mapping, eventId, {
+  getProcessIdentity = processStartIdentity,
+} = {}) {
+  const root = mapping.repository_realpath;
+  const target = wakeTransportPath(mapping, eventId);
+  const record = readJson(target);
+  validateWakeTransportRecord(record, mapping);
+  if (record.status !== 'NO_DELIVERY' || record.classification !== 'queued') {
+    throw new Error('opsled transport is not a receipt-free queued non-delivery');
+  }
+  if (sameProcessIdentity(record.worker, getProcessIdentity(record.worker.pid))) {
+    throw new Error('opsled transport worker is still current');
+  }
+  const activationDecision = join(root, '.opsle', 'wake', 'activation-decisions', `${eventId}.json`);
+  const deliveryReceipt = join(root, '.opsle', 'wake', 'deliveries', `${eventId}.json`);
+  const attemptsDirectory = join(root, '.opsle', 'wake', 'transport-attempts');
+  const matchingAttempts = existsSync(attemptsDirectory)
+    ? readdirSync(attemptsDirectory)
+      .filter((name) => name.endsWith('.json'))
+      .map((name) => readJson(join(attemptsDirectory, name)))
+      .filter((attempt) => attempt.event_id === eventId)
+    : [];
+  if (existsSync(activationDecision) || existsSync(deliveryReceipt) || matchingAttempts.length > 0) {
+    throw new Error('native transport start absence is not proven');
+  }
+  record.classification = 'transport-not-started';
+  record.reason = 'no activation decision, transport attempt, or delivery receipt exists';
+  record.reconciled_at = now();
+  record.reconciliation = {
+    worker_current: false,
+    activation_decision_exists: false,
+    transport_attempt_count: 0,
+    delivery_receipt_exists: false,
+  };
+  writeJson(target, record);
+  return record;
 }
 
 export function launchRepositoryWakeTransports(mapping, options = {}) {
@@ -222,6 +299,17 @@ export function launchRepositoryWakeTransports(mapping, options = {}) {
       const bytes = readFileSync(path, 'utf8');
       request = JSON.parse(bytes);
       if (bytes !== canonicalJson(request)) throw new Error('wake request is not canonical JSON');
+      const lifecycle = classifyQueuedWake(mapping.repository_realpath, request);
+      if (lifecycle.classification !== 'queued'
+          || lifecycle.reason !== 'awaiting-supported-native-transport') {
+        results.push({
+          event_id: request.event_id,
+          classification: lifecycle.classification,
+          reason: lifecycle.reason,
+          delivered: false,
+        });
+        continue;
+      }
       results.push(launchWakeTransport(mapping, request, options));
     } catch (error) {
       results.push({

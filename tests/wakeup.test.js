@@ -1462,6 +1462,89 @@ test('opsled submits into a busy Codex queue and consumes and evaluates exactly 
   }
 });
 
+test('opsled uses the registered current session during a busy turn and submits immediately', () => {
+  const root = fixture();
+  try {
+    const bound = bindingFixture(root);
+    const event = terminalEvent(root, 'opsled-current-session-busy');
+    enqueueTerminalWake(root, event);
+    writeFileSync(bound.rolloutPath, `${readFileSync(bound.rolloutPath, 'utf8')}${JSON.stringify({
+      ordinal: 1,
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'active-supervisor-turn' },
+    })}\n`);
+    const busyDependencies = {
+      ...bound.dependencies,
+      environment: () => ({
+        CODEX_SESSION_ID: '00000000-0000-0000-0000-000000000000',
+        CODEX_THREAD_ID: '00000000-0000-0000-0000-000000000000',
+        CODEX_HOME: '/tmp/not-authority',
+      }),
+      herdrSnapshot: () => {
+        const value = structuredClone(bound.dependencies.herdrSnapshot());
+        delete value.snapshot.panes[0].agent_session;
+        return value;
+      },
+    };
+    const ownerProcess = processIdentity(process.pid);
+    const activationOwner = {
+      schema: 'opsle.durable-supervisor.opsled-wake-owner/v1',
+      kind: 'opsled-wake-worker',
+      service_id: 'opsled-busy-service',
+      service_generation: 1,
+      release_fence: createReleaseFence('opsled-wake-worker', ownerProcess),
+      process: ownerProcess,
+    };
+    let calls = 0;
+    const result = deliverWake(root, event.event_id, {
+      bindingDependencies: busyDependencies,
+      activationOwner,
+      nativeTransport: {
+        kind: 'plain-codex-resume',
+        resume(request) {
+          calls += 1;
+          assert.equal(request.session_id, bound.sessionId);
+          appendWakeConfirmation(bound.rolloutPath, request.session_id, request.message);
+          return confirmedResumeResult(request.session_id, request.message, 9800);
+        },
+      },
+    });
+    assert.equal(calls, 1);
+    assert.equal(result.classification, 'native-delivered');
+    assert.equal(result.receipt.codex_session_uuid, bound.sessionId);
+    assert.equal(result.receipt.wake_owner.kind, 'opsled-wake-worker');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('opsled does not invoke transport when no valid current session exists', () => {
+  const root = fixture();
+  try {
+    const event = terminalEvent(root, 'opsled-invalid-session');
+    enqueueTerminalWake(root, event);
+    let calls = 0;
+    const result = deliverWake(root, event.event_id, {
+      bindingDependencies: {
+        environment: () => ({}),
+        herdrSnapshot: () => ({
+          type: 'session_snapshot',
+          snapshot: { workspaces: [], panes: [], agents: [], tabs: [], layouts: [] },
+        }),
+      },
+      nativeTransport: {
+        kind: 'plain-codex-resume',
+        resume() { calls += 1; },
+      },
+    });
+    assert.equal(calls, 0);
+    assert.equal(result.classification, 'queued');
+    assert.equal(result.reason, 'codex-session-unbound');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('transport journal distinguishes spawn failure, session rejection, and early termination', async () => {
   const sessionId = '01a05952-e1fa-71e2-adea-df7e3f7d99ce';
   const message = 'OPSLE_WAKE v1 event=event-failure-evidence gen=3; read durable state.';
@@ -1801,6 +1884,17 @@ test('delivery classification uses current host evidence and fails closed for un
   assert.equal(classify({
     evidence: hostEvidence({ prompt_state: 'ambiguous', prompt_idle: false, composer_empty: false }),
   }), 'ambiguous-composer');
+
+  const nativeRequest = {
+    ...request,
+    schema: 'opsle.durable-supervisor.native-wake-request/v2',
+  };
+  assert.equal(classifyWakeDelivery({
+    request: nativeRequest,
+    supervisor,
+    busy: { event_id: 'active-delivery' },
+    evidence: hostEvidence({ prompt_state: 'busy', prompt_idle: false }),
+  }).classification, 'native-ready');
 });
 
 test('duplicate dispatcher start is idempotent and exact process death advances dispatcher generation', () => {

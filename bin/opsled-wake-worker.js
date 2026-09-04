@@ -7,6 +7,7 @@ import { resolveRepositoryMapping, updateRepositoryHerdrBinding } from '../src/o
 import { assertCurrentOpsledService } from '../src/opsled.js';
 import {
   repositoryBindingDependencies,
+  persistWakeTransportOutcome,
   validateWakeTransportRecord,
   wakeTransportPath,
 } from '../src/opsled-wake.js';
@@ -77,11 +78,7 @@ async function main() {
       process: identity,
     },
   });
-  record = readJson(target);
-  record.status = result.delivered ? 'DELIVERED' : 'NO_DELIVERY';
-  record.classification = result.classification ?? null;
-  record.terminal_at = now();
-  writeJson(target, record);
+  persistWakeTransportOutcome(mapping, eventId, identity, result);
 }
 
 main().catch((error) => {
@@ -93,6 +90,7 @@ main().catch((error) => {
       if (record.worker?.pid === process.pid) {
         record.status = 'FAILED';
         record.failure = error.message;
+        record.reason = error.message;
         record.terminal_at = now();
         writeJson(target, record);
       }
