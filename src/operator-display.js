@@ -26,6 +26,33 @@ function compactText(value, maximum = 180) {
   return text.length <= maximum ? text : `${text.slice(0, maximum - 1)}…`;
 }
 
+function receiptMetric(metric, { percentage = false } = {}) {
+  const evidenceClass = metric?.evidence_class ?? 'UNAVAILABLE';
+  if (metric?.value == null) return `unavailable [${evidenceClass}]`;
+  const value = percentage ? `${(metric.value * 100).toFixed(2)}%` : `${metric.value} ${metric.unit}`;
+  return `${value} [${evidenceClass}]`;
+}
+
+export function renderModelChildReceipt(receipt) {
+  if (receipt?.kind !== 'model-child-receipt' || receipt.version !== 1) {
+    throw new Error('unsupported model child receipt');
+  }
+  const child = receipt.child ?? {};
+  const route = receipt.route ?? {};
+  const context = receipt.context ?? {};
+  return [
+    'CHILD RECEIPT',
+    `Child: ${receipt.attempt_id} — ${child.provider}/${child.model}; reasoning ${child.reasoning_effort} [${child.evidence_class}]`,
+    `Route: ${route.name}; ${words(route.execution_class)}; tool ${route.selected_tool} [${route.evidence_class}]`,
+    `Why: ${receipt.why?.value ?? 'unavailable'} [${receipt.why?.evidence_class ?? 'UNAVAILABLE'}]`,
+    `Context raw to retained: ${receiptMetric(context.raw_bytes)} -> ${receiptMetric(context.retained_bytes)}`,
+    `Reduction: ${receiptMetric(context.reduction_bytes)} (${receiptMetric(context.reduction_ratio, { percentage: true })})`,
+    `Serialized packet: ${receiptMetric(context.serialized_packet_bytes)}`,
+    `Tokens: raw ${receiptMetric(context.raw_tokens)}; retained ${receiptMetric(context.retained_tokens)}`,
+    `Provenance: Gearbox ${receipt.provenance?.gearbox_decision?.decision_id ?? 'unavailable'} at ${receipt.provenance?.gearbox_decision?.locator ?? 'unavailable'}; Context Firewall ${receipt.provenance?.context_firewall?.locator ?? 'unavailable'}`,
+  ].join('\n');
+}
+
 export function formatDuration(milliseconds) {
   if (!Number.isFinite(milliseconds) || milliseconds < 0) return 'unknown';
   if (milliseconds < 1000) return milliseconds === 0 ? '0s' : 'less than 1s';
@@ -381,6 +408,10 @@ export function renderSupervisorStatus(value, {
       ? ` for ${formatDuration(active.elapsed_ms)}`
       : (active.completion ? ` ${formatRelativeTime(active.completion, referenceTime)}` : '');
     lines.push(`Work: ${title(value.operator_state.child.label)} — ${active.description} [${taskId}]${timing}; attempt ${attemptId}`);
+  }
+  if (active?.child_receipt) {
+    lines.push('');
+    lines.push(renderModelChildReceipt(active.child_receipt));
   }
   lines.push(`Wake: ${wake}`);
   lines.push(`Herdr: ${sessionLabel}`);

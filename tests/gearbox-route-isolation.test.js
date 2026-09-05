@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
+  chmodSync,
   cpSync,
   existsSync,
   lstatSync,
@@ -19,10 +20,13 @@ import { createAttempt, createTask, routeTask } from '../src/pipeline.js';
 import { readJson, writeJson } from '../src/io.js';
 import { initialize, paths, validateDurableState } from '../src/state.js';
 import {
+  buildModelChildReceipt,
   childPrompt,
   codexLaunchSpec,
+  measureContextPacket,
   prepareIsolatedCodexHome,
   promptByteMeasurement,
+  runAttempt,
 } from '../src/runner.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
@@ -222,6 +226,142 @@ test('exact selected route is immutable in decision and policy snapshot', () => 
     writeJson(join(paths(root).attempts, `${attempt.attempt_id}.json`), legacyAttempt);
     assert.equal(validateDurableState(root).valid, true);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('model child receipt faithfully projects exact route and measured Context Firewall evidence', () => {
+  const root = fixture();
+  try {
+    const task = createTask(root, handoff({ task_id: 'task-model-child-receipt' }));
+    const decision = routeTask(root, task);
+    const { attempt } = createAttempt(root, task, decision);
+    const packet = measureContextPacket({
+      schema: 'opsle.durable-supervisor.context-firewall-packet/v2',
+      task_id: task.task_id,
+      attempt_id: attempt.attempt_id,
+      raw_bytes: 10_000,
+      compact_bytes: null,
+      retained_bytes: null,
+      suppressed_bytes: null,
+      retained_ratio: null,
+      reduction_ratio: null,
+      serialized_packet_bytes: null,
+      byte_measurement: {
+        schema: 'opsle.durable-supervisor.context-firewall-byte-measurement/v1',
+        compact_bytes_basis: 'canonical-json-utf8-with-derived-measurement-fields-null',
+        serialized_packet_bytes_basis: 'canonical-json-utf8-with-16-digit-fixed-width-self-field',
+      },
+      source_sha256: 'a'.repeat(64),
+    });
+    const options = {
+      attemptReference: `.opsle/children/${attempt.attempt_id}.json`,
+      contextPacketReference: `.opsle/evidence/compact/${attempt.attempt_id}.json`,
+    };
+    const receipt = buildModelChildReceipt(attempt, packet, options);
+
+    assert.deepEqual(buildModelChildReceipt(attempt, packet, options), receipt);
+    assert.equal(receipt.kind, 'model-child-receipt');
+    assert.equal(receipt.version, 1);
+    assert.deepEqual(receipt.child, {
+      provider: 'codex',
+      model: decision.selected_route_config.provider.model,
+      reasoning_effort: decision.selected_route_config.provider.reasoning_effort,
+      evidence_class: 'MEASURED',
+    });
+    assert.deepEqual(receipt.route, {
+      name: decision.selected_route,
+      execution_class: decision.selected_route_config.execution_class,
+      selected_tool: decision.selected_route_config.selected_tool,
+      evidence_class: 'MEASURED',
+    });
+    assert.deepEqual(receipt.why, {
+      value: decision.rationale,
+      evidence_class: 'MEASURED',
+    });
+    assert.deepEqual(receipt.context.raw_bytes, {
+      value: packet.raw_bytes,
+      unit: 'bytes',
+      evidence_class: 'MEASURED',
+    });
+    assert.deepEqual(receipt.context.retained_bytes, {
+      value: packet.retained_bytes,
+      unit: 'bytes',
+      evidence_class: 'MEASURED',
+    });
+    assert.deepEqual(receipt.context.serialized_packet_bytes, {
+      value: Number(packet.serialized_packet_bytes),
+      unit: 'bytes',
+      evidence_class: 'MEASURED',
+    });
+    assert.deepEqual(receipt.context.reduction_bytes, {
+      value: packet.suppressed_bytes,
+      unit: 'bytes',
+      evidence_class: 'DERIVED',
+    });
+    assert.deepEqual(receipt.context.reduction_ratio, {
+      value: packet.reduction_ratio,
+      unit: 'ratio',
+      evidence_class: 'DERIVED',
+    });
+    assert.deepEqual(receipt.context.raw_tokens, {
+      value: null,
+      unit: 'tokens',
+      evidence_class: 'UNAVAILABLE',
+    });
+    assert.equal(receipt.provenance.gearbox_decision.decision_id, decision.decision_id);
+    assert.equal(receipt.provenance.context_firewall.locator,
+      options.contextPacketReference);
+    assert.equal(buildModelChildReceipt({ gearbox_route: 'deterministic' }, packet), null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Runner durably embeds exactly one receipt for a model child completion', async () => {
+  const root = fixture();
+  const priorCodexHome = process.env.CODEX_HOME;
+  try {
+    const fakeCodex = join(root, 'fake-codex.cjs');
+    writeFileSync(fakeCodex, [
+      '#!/usr/bin/env node',
+      "const { appendFileSync, writeFileSync } = require('node:fs');",
+      "const args = process.argv.slice(2);",
+      "const outputIndex = args.indexOf('--output-last-message');",
+      "writeFileSync(args[outputIndex + 1], 'Completed model fixture.\\n');",
+      "appendFileSync('README.md', 'model receipt fixture\\n');",
+      "process.stdout.write('{\"type\":\"fixture\"}\\n');",
+      '',
+    ].join('\n'));
+    chmodSync(fakeCodex, 0o755);
+    const sourceCodexHome = join(root, 'source-codex-home');
+    mkdirSync(sourceCodexHome);
+    writeFileSync(join(sourceCodexHome, 'auth.json'), '{"fixture":true}\n', { mode: 0o600 });
+    process.env.CODEX_HOME = sourceCodexHome;
+
+    const task = createTask(root, handoff({ task_id: 'task-model-receipt-runner' }));
+    const decision = routeTask(root, task);
+    decision.discovery.commands.codex.path = fakeCodex;
+    const { attempt, claim } = createAttempt(root, task, decision);
+    const completed = await runAttempt(root, task, attempt, claim);
+    const completionPath = join(root, completed.attempt.completion_handoff);
+    const durableCompletion = readJson(completionPath);
+
+    assert.deepEqual(completed.child_receipt, durableCompletion.child_receipt);
+    assert.equal(durableCompletion.child_receipt.kind, 'model-child-receipt');
+    assert.equal(completed.attempt.child_receipt_reference,
+      `${completed.attempt.completion_handoff}#/child_receipt`);
+    assert.equal(completed.completion_event.child_receipt_reference,
+      completed.attempt.child_receipt_reference);
+    assert.equal(
+      readdirSync(paths(root).compact)
+        .filter((name) => name.endsWith('.child-receipt.json')).length,
+      0,
+    );
+    assert.equal(validateDurableState(root).valid, true);
+  } finally {
+    if (priorCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = priorCodexHome;
     rmSync(root, { recursive: true, force: true });
   }
 });

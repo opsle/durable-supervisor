@@ -140,11 +140,27 @@ The boundaries are deliberate:
 - The Context Firewall keeps raw artifacts out of the normal return path and
   emits a bounded, provenance-linked packet. Raw evidence remains available
   for targeted escalation.
+- Every completed model child adds one versioned receipt to its durable
+  completion handoff. The receipt projects the actual Gearbox decision and
+  rationale plus the already-produced Context Firewall raw, retained, and
+  reduction measurements. `opsle status` renders the compact receipt directly,
+  and `opsle evidence show ATTEMPT_ID` exposes the same durable projection and
+  provenance locators without copying raw payloads into the operator view.
+- Receipt values identify their evidence as `MEASURED`, `DERIVED`,
+  `ESTIMATED`, or `UNAVAILABLE`. Current byte measurements are measured or
+  derived; token counts remain null and unavailable rather than being inferred
+  from bytes. Deterministic-command completions do not create model receipts.
+  Retained bytes use the Context Firewall measurement projection; separately
+  measured serialized-packet bytes remain distinct in the receipt.
 - Context Firewall reduction is mandatory Runner behavior, not a policy option.
 - Child exit, verification, Acceptance, and the supervisor's objective-level
   decision are separate states. A successful process exit is not correctness.
 - Humans can inspect status without model inference, pause future progression,
   change the objective or prospective policy, and resume explicitly.
+
+The model-child receipt addresses the DS-V0.1-01 operator-visibility boundary.
+It does not close DS-V0.1-02 and makes no token, cost, retry, first-pass,
+avoidable-intelligence, or total-savings claim.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the implemented component mapping and
 [SPEC.md](SPEC.md) for the public contract summary. Runtime authority remains
