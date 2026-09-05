@@ -21,6 +21,7 @@ import { validateOpsledRunnerRecord } from './opsled-runner.js';
 import { validateWakeTransportRecord } from './opsled-wake.js';
 import { HISTORICAL_SCHEMAS } from './wakeup.js';
 import {
+  loadPriorManagedRelease,
   loadRuntimeRelease,
   processStartIdentity,
   releaseConflictMessage,
@@ -86,7 +87,7 @@ export function readCurrentRuntime(hostRoot) {
     if (installedRoot !== join(runtimeHostPaths(hostRoot).releases, current.packaged_artifact_sha256)) {
       throw new Error('release root is outside its digest directory');
     }
-    installed = loadRuntimeRelease({ root: installedRoot });
+    installed = loadPriorManagedRelease({ root: installedRoot });
   } catch (error) {
     throw classifiedError('CORRUPT', `managed runtime artifact is unavailable: ${error.message}`);
   }

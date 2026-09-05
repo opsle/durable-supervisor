@@ -15,6 +15,7 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
+import { main as runOpsledCommand } from '../bin/opsled.js';
 import { fileSha256, readJson, writeJson } from '../src/io.js';
 import {
   registerRepository,
@@ -30,7 +31,11 @@ import {
   upgradeHostRuntime,
 } from '../src/runtime-upgrade.js';
 import { defaultOpsledHome } from '../src/opsled.js';
-import { processStartIdentity } from '../src/runtime-release.js';
+import {
+  loadPriorManagedRelease,
+  loadRuntimeRelease,
+  processStartIdentity,
+} from '../src/runtime-release.js';
 import { initialize } from '../src/state.js';
 
 const sourceRoot = resolve(dirname(new URL(import.meta.url).pathname), '..');
@@ -226,13 +231,43 @@ test('takeover retires an already-running managed prior helper before release B 
   assert.equal(priorRuntime.available, true, priorRuntime.reason);
   const hostRoot = mkdtempSync(join(tmpdir(), 'opsle-runtime-prior-helper-'));
   const root = repository('prior-helper');
+  const productionHost = defaultOpsledHome();
+  const productionCurrentPath = runtimeHostPaths(productionHost).current;
+  const productionServicePath = registryPaths(productionHost).service;
+  const productionCurrentBytes = existsSync(productionCurrentPath)
+    ? readFileSync(productionCurrentPath, 'utf8') : null;
+  const productionService = existsSync(productionServicePath)
+    ? readJson(productionServicePath) : null;
+  const productionIdentity = productionService?.process ?? null;
   const installedWakeup = priorRuntime.wakeupPath;
   const priorWakeupSha256 = priorRuntime.wakeupSha256;
   let priorIdentity = null;
+  let priorOpsledIdentity = null;
+  let priorStarted = null;
   let targetStarted = null;
   let sawQuiescedLaunchGate = false;
   try {
+    assert.notEqual(resolve(hostRoot), resolve(productionHost));
     assert.equal(fileSha256(installedWakeup), priorWakeupSha256);
+    const priorManifest = loadPriorManagedRelease({ root: priorRuntime.root });
+    assert.ok(priorManifest.helpers.some((entry) => entry.path === 'bin/opsle-wake-delivery.js'));
+    const targetManifest = loadRuntimeRelease({ refresh: true });
+    assert.equal(targetManifest.helpers.some((entry) => entry.path === 'bin/opsle-wake-delivery.js'), false);
+
+    registerRepository(hostRoot, root);
+    const priorUpgradeUrl = pathToFileURL(join(priorRuntime.root, 'src', 'runtime-upgrade.js'));
+    priorUpgradeUrl.searchParams.set('proof', hostRoot);
+    const priorUpgrade = await import(priorUpgradeUrl.href);
+    const installedPrior = await priorUpgrade.upgradeHostRuntime(hostRoot, priorRuntime.root, {
+      startTarget: async (releaseRoot, targetHost) => {
+        priorStarted = await startInstalledOpsled(releaseRoot, targetHost);
+      },
+    });
+    assert.equal(installedPrior.status, 'COMPLETED');
+    assert.equal(installedPrior.target.packaged_artifact_sha256, priorManifest.packaged_artifact_sha256);
+    priorOpsledIdentity = priorStarted.started.service.process;
+    assert.ok(processStartIdentity(priorOpsledIdentity.pid));
+
     const launched = spawnSync(process.execPath, [
       join(priorRuntime.root, 'bin', 'opsle.js'), 'wake', 'start',
     ], { cwd: root, encoding: 'utf8' });
@@ -245,24 +280,31 @@ test('takeover retires an already-running managed prior helper before release B 
     priorIdentity = dispatcher.process;
     assert.ok(processStartIdentity(priorIdentity.pid));
 
-    registerRepository(hostRoot, root);
-    const upgraded = await upgradeHostRuntime(hostRoot, sourceRoot, {
-      signal: (pid, signal) => {
-        assert.throws(
-          () => assertRuntimeStartAllowed(hostRoot, { root: sourceRoot }),
-          (error) => error.classification === 'BUSY',
-        );
-        sawQuiescedLaunchGate = true;
-        process.kill(pid, signal);
-      },
-      startTarget: async (releaseRoot, targetHost) => {
-        assert.equal(sawQuiescedLaunchGate, true);
-        assert.equal(processStartIdentity(priorIdentity.pid), null);
-        targetStarted = await startInstalledOpsled(releaseRoot, targetHost);
+    const output = [];
+    await runOpsledCommand(['upgrade', '--release', sourceRoot, '--json'], {
+      home: hostRoot,
+      output: (value) => output.push(value),
+      upgradeOptions: {
+        signal: (pid, signal) => {
+          assert.throws(
+            () => assertRuntimeStartAllowed(hostRoot, { root: sourceRoot }),
+            (error) => error.classification === 'BUSY',
+          );
+          sawQuiescedLaunchGate = true;
+          process.kill(pid, signal);
+        },
+        startTarget: async (releaseRoot, targetHost) => {
+          assert.equal(sawQuiescedLaunchGate, true);
+          assert.equal(processStartIdentity(priorIdentity.pid), null);
+          assert.equal(processStartIdentity(priorOpsledIdentity.pid), null);
+          targetStarted = await startInstalledOpsled(releaseRoot, targetHost);
+        },
       },
     });
+    const [upgraded] = output;
 
     assert.equal(upgraded.status, 'COMPLETED');
+    assert.equal(upgraded.target.packaged_artifact_sha256, targetManifest.packaged_artifact_sha256);
     const retired = upgraded.retired_processes.find((entry) => (
       entry.kind === 'repository-wake-dispatcher'
       && entry.process.pid === priorIdentity.pid
@@ -272,6 +314,7 @@ test('takeover retires an already-running managed prior helper before release B 
     assert.ok(retired);
     assert.equal(retired.verified_absent, true);
     assert.equal(processStartIdentity(priorIdentity.pid), null);
+    assert.equal(processStartIdentity(priorOpsledIdentity.pid), null);
     assert.equal(readCurrentRuntime(hostRoot).release_root, upgraded.target.release_root);
     await waitFor(() => {
       const status = targetStarted.runtime.opsledStatus(hostRoot);
@@ -284,9 +327,28 @@ test('takeover retires an already-running managed prior helper before release B 
     priorRuntimeProofRan = true;
   } finally {
     await stopInstalledOpsled(targetStarted, hostRoot);
+    if (priorOpsledIdentity && processStartIdentity(priorOpsledIdentity.pid)?.start_time_ticks
+        === priorOpsledIdentity.start_time_ticks) {
+      process.kill(priorOpsledIdentity.pid, 'SIGTERM');
+    }
     if (priorIdentity && processStartIdentity(priorIdentity.pid)?.start_time_ticks
         === priorIdentity.start_time_ticks) {
       process.kill(priorIdentity.pid, 'SIGTERM');
+    }
+    assert.equal(
+      existsSync(productionCurrentPath) ? readFileSync(productionCurrentPath, 'utf8') : null,
+      productionCurrentBytes,
+    );
+    const currentProductionService = existsSync(productionServicePath)
+      ? readJson(productionServicePath) : null;
+    assert.equal(currentProductionService?.service_id ?? null, productionService?.service_id ?? null);
+    assert.deepEqual(currentProductionService?.process ?? null, productionIdentity);
+    assert.equal(
+      currentProductionService?.release_fence?.packaged_artifact_sha256 ?? null,
+      productionService?.release_fence?.packaged_artifact_sha256 ?? null,
+    );
+    if (productionIdentity) {
+      assert.deepEqual(processStartIdentity(productionIdentity.pid), productionIdentity);
     }
     rmSync(root, { recursive: true, force: true });
     rmSync(hostRoot, { recursive: true, force: true });

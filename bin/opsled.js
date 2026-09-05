@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   createReleaseFence,
   assertReleaseFence,
@@ -49,7 +50,11 @@ function renderError(error) {
   return `opsled: ${prefix}${error.message}\n`;
 }
 
-async function main(args) {
+export async function main(args, {
+  home = defaultOpsledHome(),
+  output = print,
+  upgradeOptions = {},
+} = {}) {
   const command = args[0];
   if (command === '--complete-release-manifest') {
     completeRuntimeReleaseManifest();
@@ -57,16 +62,15 @@ async function main(args) {
   }
   loadRuntimeRelease();
   if (!command || command === 'help' || command === '--help') {
-    print(usage());
+    output(usage());
     return;
   }
   if (args.includes('--home')) throw new Error('--home is not supported; opsled host authority is caller-independent');
-  const home = defaultOpsledHome();
   if (command === 'status') {
     const verbose = args.includes('--verbose');
     if (verbose && args.includes('--json')) throw new Error('choose only one of --verbose or --json');
     const status = opsledStatus(home, { verbose });
-    print(args.includes('--json') ? status : renderOpsledStatus(status, { verbose }));
+    output(args.includes('--json') ? status : renderOpsledStatus(status, { verbose }));
     return;
   }
   if (command === 'start') {
@@ -74,19 +78,19 @@ async function main(args) {
     if (!/^\d+$/.test(rawInterval) || Number(rawInterval) < 10) {
       throw new Error('--interval-ms must be an integer of at least 10');
     }
-    print(await startOpsled(home, { intervalMs: Number(rawInterval) }));
+    output(await startOpsled(home, { intervalMs: Number(rawInterval) }));
     return;
   }
   if (command === 'stop') {
-    print(stopOpsled(home));
+    output(stopOpsled(home));
     return;
   }
   if (command === 'upgrade') {
     const release = valueAfter(args, '--release');
     if (!release) throw new Error('upgrade requires --release PATH');
-    const result = await upgradeHostRuntime(home, release);
+    const result = await upgradeHostRuntime(home, release, upgradeOptions);
     const attention = result.repositories.filter((entry) => entry.status === 'ATTENTION').length;
-    print(args.includes('--json') ? result : [
+    output(args.includes('--json') ? result : [
       `Upgraded opsled to ${result.target.runtime_release_id}.`,
       `Repositories: ${result.repositories.length}.`,
       `Healthy: ${result.repositories.length - attention}.`,
@@ -98,7 +102,7 @@ async function main(args) {
     const operationFence = createReleaseFence('opsled');
     assertReleaseFence(operationFence, { role: 'opsled' });
     const repository = resolve(args[1] && !args[1].startsWith('--') ? args[1] : process.cwd());
-    print(command === 'register'
+    output(command === 'register'
       ? registerRepository(home, repository)
       : unregisterRepository(home, repository));
     return;
@@ -106,7 +110,10 @@ async function main(args) {
   throw new Error(`unknown opsled command: ${command}`);
 }
 
-main(process.argv.slice(2)).catch((error) => {
-  process.stderr.write(renderError(error));
-  process.exitCode = 1;
-});
+const entrypoint = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : null;
+if (import.meta.url === entrypoint) {
+  main(process.argv.slice(2)).catch((error) => {
+    process.stderr.write(renderError(error));
+    process.exitCode = 1;
+  });
+}

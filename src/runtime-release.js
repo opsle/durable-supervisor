@@ -74,7 +74,7 @@ export function packagedArtifactDigest(root, manifest) {
   return digest.digest('hex');
 }
 
-function validateManifestShape(manifest) {
+function validateManifestShape(manifest, { requiredHelperRoles = null } = {}) {
   if (manifest?.schema !== RELEASE_MANIFEST_SCHEMA
       || !/^opsle-runtime-[a-z0-9.-]+-[a-f0-9]{16}$/.test(manifest.runtime_release_id ?? '')
       || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(manifest.version ?? '')
@@ -93,21 +93,37 @@ function validateManifestShape(manifest) {
       || !paths.includes('release-manifest.json')) {
     throw new Error('runtime release artifact file inventory is incomplete or noncanonical');
   }
-  const helperPaths = Object.keys(RUNTIME_HELPER_ROLES).sort();
-  if (!Array.isArray(manifest.helpers)
-      || canonicalJson(manifest.helpers.map((entry) => entry.path)) !== canonicalJson(helperPaths)) {
+  if (!Array.isArray(manifest.helpers) || manifest.helpers.length === 0) {
     throw new Error('runtime release helper inventory is incomplete');
   }
+  const helperPaths = manifest.helpers.map((entry) => entry?.path);
+  if (helperPaths.some((helperPath) => typeof helperPath !== 'string' || !helperPath)
+      || new Set(helperPaths).size !== helperPaths.length
+      || canonicalJson(helperPaths) !== canonicalJson([...helperPaths].sort(packagePathCompare))
+      || helperPaths.some((helperPath) => !paths.includes(helperPath))) {
+    throw new Error('runtime release helper inventory is incomplete or noncanonical');
+  }
   for (const helper of manifest.helpers) {
-    if (helper.role !== RUNTIME_HELPER_ROLES[helper.path]
+    if (Object.keys(helper).sort().join(',') !== 'path,role,sha256'
+        || !/^[a-z][a-z0-9-]*$/.test(helper.role ?? '')
         || !/^[a-f0-9]{64}$/.test(helper.sha256 ?? '')) {
       throw new Error(`invalid runtime release helper: ${helper.path}`);
     }
   }
+  if (requiredHelperRoles) {
+    const requiredPaths = Object.keys(requiredHelperRoles).sort(packagePathCompare);
+    if (canonicalJson(helperPaths) !== canonicalJson(requiredPaths)) {
+      throw new Error('runtime release helper inventory is incomplete');
+    }
+    for (const helper of manifest.helpers) {
+      if (helper.role !== requiredHelperRoles[helper.path]) {
+        throw new Error(`invalid runtime release helper: ${helper.path}`);
+      }
+    }
+  }
 }
 
-export function loadRuntimeRelease({ root = packageRoot, verify = true, refresh = false } = {}) {
-  if (!refresh && root === packageRoot && verifiedRelease) return structuredClone(verifiedRelease);
+function readRuntimeRelease({ root, verify, requiredHelperRoles }) {
   const path = join(root, 'release-manifest.json');
   let manifest;
   try {
@@ -117,7 +133,7 @@ export function loadRuntimeRelease({ root = packageRoot, verify = true, refresh 
   } catch (error) {
     throw new Error(`runtime release manifest unavailable or malformed: ${error.message}`);
   }
-  validateManifestShape(manifest);
+  validateManifestShape(manifest, { requiredHelperRoles });
   if (verify) {
     for (const entry of manifest.artifact.files) {
       const target = join(root, entry.path);
@@ -135,8 +151,23 @@ export function loadRuntimeRelease({ root = packageRoot, verify = true, refresh 
       throw new Error(`runtime release artifact digest mismatch: expected ${manifest.packaged_artifact_sha256}, observed ${observed}`);
     }
   }
+  return manifest;
+}
+
+export function loadRuntimeRelease({ root = packageRoot, verify = true, refresh = false } = {}) {
+  if (!refresh && root === packageRoot && verifiedRelease) return structuredClone(verifiedRelease);
+  const manifest = readRuntimeRelease({
+    root,
+    verify,
+    requiredHelperRoles: RUNTIME_HELPER_ROLES,
+  });
   if (root === packageRoot && verify) verifiedRelease = structuredClone(manifest);
   return manifest;
+}
+
+export function loadPriorManagedRelease({ root, verify = true } = {}) {
+  if (!root) throw new Error('prior managed release root is required');
+  return readRuntimeRelease({ root, verify, requiredHelperRoles: null });
 }
 
 export function operationalRootForPath(path) {
@@ -256,6 +287,6 @@ export function completeRuntimeReleaseManifest({ root = packageRoot } = {}) {
   manifest.packaged_artifact_sha256 = packagedArtifactDigest(root, manifest);
   writeFileSync(path, canonicalJson(manifest), { mode: 0o644 });
   chmodSync(path, 0o644);
-  validateManifestShape(manifest);
+  validateManifestShape(manifest, { requiredHelperRoles: RUNTIME_HELPER_ROLES });
   return manifest;
 }
