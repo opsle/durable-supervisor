@@ -177,14 +177,6 @@ async function cleanupDetachedFixture(root) {
       }
     }
   }
-  const dispatcherPath = join(root, '.opsle', 'wake', 'dispatcher.json');
-  if (existsSync(dispatcherPath)) {
-    const pid = readJson(dispatcherPath).process?.pid;
-    if (Number.isSafeInteger(pid) && processAlive(pid)) {
-      try { process.kill(pid, 'SIGTERM'); } catch {}
-      await waitFor(() => !processAlive(pid), 'fixture dispatcher did not exit before cleanup');
-    }
-  }
   rmSync(root, { recursive: true, force: true });
 }
 
@@ -399,26 +391,6 @@ test('task run publishes a durable Runner request without launching a child', as
     assert.equal(existsSync(join(root, '.opsle', 'workers')), false);
   } finally {
     await cleanupDetachedFixture(root);
-  }
-});
-
-test('foreground waiting is available only through the explicit compatibility flag', () => {
-  const root = fixture();
-  try {
-    const task = createTask(root, handoff('task-foreground-fallback', 250));
-    const started = Date.now();
-    const result = runCli(root, ['task', 'run', task.task_id, '--foreground-wait']);
-    const elapsed = Date.now() - started;
-    assert.equal(result.code, 0, result.stderr);
-    assert.ok(result.stdout.trim(), JSON.stringify(result));
-    const value = JSON.parse(result.stdout);
-    assert.equal(value.launch_mode, 'foreground-wait');
-    assert.equal(value.child_state, 'COMPLETED');
-    assert.equal(value.action, undefined);
-    assert.ok(elapsed >= 200);
-    assert.equal(readJson(paths(root).state).supervisor_state, 'ACTIVE');
-  } finally {
-    rmSync(root, { recursive: true, force: true });
   }
 });
 

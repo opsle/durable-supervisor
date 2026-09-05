@@ -16,9 +16,9 @@ the shared registry/future-upgrade primitive.
 wake consumption, claim acquisition/release, delivery commitment, recovery
 adoption, and session-binding adoption. It covers all four requirements
 profiles, both bounded reducer sequences and the durable acquire-through-resume
-state machine, policy-effect enforcement, dispatcher diagnostics, and explicit
+state machine, policy-effect enforcement, and explicit
 test-only generation-only, stale-index, raw-requirement, and metadata-only
-mutants. Historical replay covers stale claim release, drain/resubscribe loss,
+mutants. Historical replay covers stale claim release, queued-wake loss,
 stale session binding, unconsumed delivery, foreign inherited requirements, and
 same-generation wrong-supervisor consumption without rewriting evidence.
 
@@ -29,8 +29,8 @@ packet-only reconstruction.
 
 `wakeup.test.js` covers ephemeral frontend/session/rollout/pane replacement,
 idempotent revisioning, immutable history, v2 migration, ambiguity, detached
-contexts, dual tmux authority, discovery races and recovery, dispatcher
-pre-delivery refresh, resume-packet invalidation, and fenced consumption.
+contexts, discovery races and recovery, wake-worker pre-delivery refresh,
+resume-packet invalidation, and fenced consumption.
 `operator-controls.test.js` proves delivered terminal wakes must be consumed
 before evaluation.
 

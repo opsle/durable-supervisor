@@ -16,7 +16,9 @@ import { canonicalJson, readJson } from '../src/io.js';
 import {
   assertReleaseFence,
   createReleaseFence,
+  loadPriorManagedRelease,
   loadRuntimeRelease,
+  packagedArtifactDigest,
   processStartIdentity,
   releaseIdentity,
   runtimePackageRoot,
@@ -43,7 +45,7 @@ test('immutable release manifest verifies the complete normalized package and ev
   assert.match(release.packaged_artifact_sha256, /^[a-f0-9]{64}$/);
   assert.deepEqual(release.helpers.map((entry) => entry.role).sort(), [
     'cli', 'codex-resume', 'opsled', 'opsled-wake-worker', 'opsled-worker',
-    'runner-worker', 'wake-delivery',
+    'runner-worker',
   ]);
   assert.ok(release.artifact.files.some((entry) => entry.path === 'release-manifest.json'));
   assert.ok(release.artifact.files.some((entry) => entry.path === 'package.json'));
@@ -90,6 +92,71 @@ test('artifact and manifest mismatches fail closed', () => {
         writeFileSync(join(root, 'release-manifest.json'), canonicalJson(manifest));
       }
       assert.throws(() => loadRuntimeRelease({ root }), /digest mismatch/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+function releaseCopy(prefix) {
+  const source = runtimePackageRoot();
+  const release = loadRuntimeRelease();
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  for (const entry of release.artifact.files) {
+    const from = join(source, entry.path);
+    const to = join(root, entry.path);
+    mkdirSync(join(to, '..'), { recursive: true });
+    cpSync(from, to, { preserveTimestamps: true });
+  }
+  return { root, release: structuredClone(release) };
+}
+
+function writeReleaseManifest(root, manifest) {
+  manifest.packaged_artifact_sha256 = '0'.repeat(64);
+  manifest.packaged_artifact_sha256 = packagedArtifactDigest(root, manifest);
+  writeFileSync(join(root, 'release-manifest.json'), canonicalJson(manifest));
+}
+
+test('prior managed releases use their own declared helper inventory', () => {
+  const { root, release } = releaseCopy('opsle-runtime-prior-inventory-');
+  try {
+    release.helpers = release.helpers.slice(1);
+    writeReleaseManifest(root, release);
+    const prior = loadPriorManagedRelease({ root });
+    assert.deepEqual(prior.helpers, release.helpers);
+    assert.throws(
+      () => loadRuntimeRelease({ root }),
+      /runtime release helper inventory is incomplete/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('prior managed release validation fails closed', () => {
+  for (const mutation of [
+    ['missing declared helper', (root, release) => {
+      rmSync(join(root, release.helpers[0].path));
+    }, /runtime release artifact file missing/],
+    ['altered declared helper', (root, release) => {
+      writeFileSync(join(root, release.helpers[0].path), '// tampered helper\n');
+    }, /runtime release helper digest mismatch/],
+    ['bad artifact digest', (root, release) => {
+      release.packaged_artifact_sha256 = 'f'.repeat(64);
+      writeFileSync(join(root, 'release-manifest.json'), canonicalJson(release));
+    }, /runtime release artifact digest mismatch/],
+    ['malformed manifest', (root) => {
+      writeFileSync(join(root, 'release-manifest.json'), '{ malformed\n');
+    }, /runtime release manifest unavailable or malformed/],
+    ['unsupported release format', (root, release) => {
+      release.schema = 'opsle.durable-supervisor.runtime-release/v999';
+      writeFileSync(join(root, 'release-manifest.json'), canonicalJson(release));
+    }, /invalid runtime release manifest/],
+  ]) {
+    const { root, release } = releaseCopy('opsle-runtime-prior-invalid-');
+    try {
+      mutation[1](root, release);
+      assert.throws(() => loadPriorManagedRelease({ root }), mutation[2], mutation[0]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

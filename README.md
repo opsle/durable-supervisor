@@ -10,14 +10,14 @@ production service or a published installable package.
 
 ## Durable does not mean continuously inferring
 
-The supervisor may remain available in a terminal or tmux session, but an open
+The supervisor may remain available in its Herdr workspace, but an open
 session does not imply a running model turn. `task run` now writes an immutable
 repository-local Runner request. The command returns after durable
 request publication; the host opsled validates that exact request and launches
 the transient Runner. Once worker ownership is established, the supervisor is
 logically `DORMANT`. The worker owns the child, heartbeat, timeout, evidence, verification,
 Context Firewall packet, Acceptance, terminal event, claim release, and wake
-queue. `--foreground-wait` is an explicit compatibility fallback.
+queue. There is no foreground or repository-dispatcher execution path.
 
 Task creation and launch require each deterministic and verification command to
 be a nonempty argv array of strings. After the provider process closes, Runner
@@ -37,7 +37,7 @@ Automatic delivery fails closed unless the ephemeral
 `codex-session-binding/v3` current pointer proves the exact repository,
 supervisor generation, Codex session/thread UUID, rollout `session_meta` and
 inode, installed CLI, UID, authoritative Herdr frontend
-process/workspace/pane/terminal, and absence of concurrent tmux authority.
+process/workspace/pane/terminal.
 Status, liveness, reconstruction, and dispatch refresh that pointer from two
 consistent read-only Herdr snapshots, exact pane-process facts, and the unique
 Codex rollout. Replacement is atomic and prior pointers remain immutable. An
@@ -48,7 +48,7 @@ submits immediately even while the bound session has an active turn; Codex owns
 that short-term serialization. The PTY launcher keeps the frontend alive until the bound
 rollout contains one exact accepted message and its matching turn-began record.
 It then terminates the temporary group and proves no new matching frontend
-remains. Normal dispatch never calls tmux input or a Herdr prompt primitive.
+remains. Normal dispatch never calls terminal input or a Herdr prompt primitive.
 
 Before any supported native send, an opsled-owned activation lease fences the
 supervisor generation, service/process, event, expiry, and monotonic token.
@@ -64,11 +64,8 @@ already-evaluated requests are classified obsolete rather than adopted.
 
 Herdr is the authoritative host, but the Herdr adapter remains read-only: it
 never submits prompt or terminal input. `codex resume` is a session transport,
-separate from host input. The tmux host and foreground mechanical wait remain
-explicit fallbacks and are not selected by the normal automatic dispatcher.
-
-tmux is only a convenience for interactive attachment. The authoritative state
-is the structured data under `.opsle/`. If tmux, SSH, the Codex process, or the
+separate from host input. The authoritative state
+is the structured data under `.opsle/`. If SSH, the Codex process, or the
 conversation is lost, a fresh context reconstructs from those files. No pasted
 conversation summary is required.
 
@@ -210,7 +207,7 @@ mutation.
 ## Operate and recover
 
 The [mobile-safe operator runbook](docs/OPERATIONS.md) covers initialization,
-status/watch, pause/resume, objective and policy changes, tmux, recovery, and
+status/watch, pause/resume, objective and policy changes, recovery, and
 evidence inspection. After `/clear` or compaction, `resume-packet generate`
 emits the canonical bounded model-facing reconstruction. A genuine new
 activation uses `resume-packet generate --recover`, reconciling first without
@@ -240,8 +237,8 @@ or production-readiness saving is claimed.
 V0.1 implements narrow local adapters for Gearbox routing, structured
 handoffs, Context Firewall reduction, decision evidence, detached execution,
 generation-fenced queued wakeups, authoritative Herdr session binding, plain
-Codex resume delivery, activation leases, and activation telemetry. Tmux is an
-interactive/compatibility host; Herdr prompt APIs remain unused. Capability
+Codex resume delivery, activation leases, and activation telemetry. Herdr
+prompt APIs remain unused. Capability
 Discovery records the presence and revision of
 related Opsle sibling repositories, but this repository does not import their
 implementations.
@@ -263,15 +260,12 @@ before repository state access. A stopped or upgraded service leaves each
 repository's queued requests intact for restart-safe replay. Repository
 supervisors and Runner workers enqueue terminal requests but never keep wake
 infrastructure alive. Blocking wake transports are transient opsled workers, so
-one repository cannot block another. The old repository dispatcher command
-remains an explicit compatibility surface.
+one repository cannot block another. Historical dispatcher records remain
+readable but cannot become current authority.
 Delivery commitment and consumption recheck the complete ownership vector:
 repository, event, delivery and activation fence, supervisor identity and
 generation, current session/host binding, queue version, opsled owner, and wake
-implementation hash. Rejected consumption leaves all durable bytes unchanged.
-`wake status --json` and verbose wake diagnostics expose the expected and
-observed implementation hashes and their currentness; concise status reports
-only whether the dispatcher as a whole is current.
+worker content digest. Rejected consumption leaves all durable bytes unchanged.
 
 The repository-local transport is deterministically covered for binding refresh,
 rollout confirmation, cleanup, busy-session queueing, uncertainty, fencing, idempotency, and

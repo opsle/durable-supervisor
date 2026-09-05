@@ -58,12 +58,12 @@ path controls how much execution detail enters the next decision.
 | Claims/fencing | One active task claim with a monotonically increasing fence generation. Acquisition requires the canonical task and supervisor identity; release and recovery require exact task, attempt, claim, owner, fence, and claim-index agreement. |
 | Runner | `src/runner.js` defaults to a detached repository-local worker. A durable PID/nonce/fence handshake completes before the launcher returns; the worker enforces the exact snapshotted route, then owns child PID, heartbeat, timeout, evidence, verification, Context Firewall, Acceptance, claim release, pause-after-current, terminal event, and wake creation. |
 | Event-driven wakeup | `src/wakeup.js` queues only terminal/intervention events. One host-level `opsled` drains all registered repository queues; Runner and repository supervisors never own persistent wake infrastructure. Requests have no expiry and never bind a frontend. Stale/evaluated requests are obsolete without byte mutation. Final delivery and consumption revalidate repository, event, delivery/activation fence, supervisor, session/host binding, queue, and implementation identity before mutation. Heartbeat and nonterminal progress remain ineligible. |
-| Supervisor/session boundary | Durable supervisor identity is separate from `codex-session-binding/v3`, which binds repository, generation, Codex UUID, rollout metadata/inode, CLI version, UID, and exact authoritative Herdr process/workspace/pane/terminal facts. A live old tmux authority invalidates the binding. Normal dispatch uses only plain Codex resume; Herdr and tmux input APIs remain unused. |
+| Supervisor/session boundary | Durable supervisor identity is separate from `codex-session-binding/v3`, which binds repository, generation, Codex UUID, rollout metadata/inode, CLI version, UID, and exact authoritative Herdr process/workspace/pane/terminal facts. Normal dispatch uses only plain Codex resume; Herdr input APIs remain unused. |
 | Context Firewall | A mandatory local reducer creates bounded child-result packets with completeness, measured bytes, changed-file scope, verification result, hashes, and raw references. Disabled policy and disabled launch snapshots fail closed before Runner execution. |
 | Authoritative reconstruction | `src/reconstruction.js` reduces current repository-local authority to canonical `resume-packet/v1` JSON. It validates objective, task, attempt, claim/fence, pause, terminal, session-binding, and wake relationships without reading append-only history. The packet is capped at 4,000 bytes/characters and 1,000 clearly estimated tokens; telemetry is separate. |
 | Decision evidence | Completion handoff separates child claims from deterministic observations and unknowns. |
 | Acceptance | Deterministic criteria gate the attempt before a separate supervisor accept/reject decision can advance requirements. |
-| Human controls | Deterministic CLI status/watch, pause/resume, objective revisions, policy changes, evidence display, and tmux helpers. |
+| Human controls | Deterministic CLI status/watch, pause/resume, objective revisions, policy changes, and evidence display. |
 | Telemetry | `src/activation-telemetry.js` and the trajectory tool distinguish terminal-event, human, and wait-induced automatic activations. Missing trajectory evidence stays unknown; legacy polling zeros are untrusted. |
 
 ## State ownership
@@ -106,7 +106,7 @@ child. The host opsled validates the registered repository and the exact
 supervisor/task/attempt/claim decision, launches the independent Node Runner,
 records its PID/start/executable identity, and supervises it. No child process
 or wait remains attached to the initiating supervisor turn.
-`--foreground-wait` deliberately selects the prior blocking compatibility path.
+No CLI compatibility path can launch the child directly.
 
 The detached worker owns the full lifecycle. After process close it persists
 the provider process result first, then verification, raw evidence, the compact
@@ -126,7 +126,7 @@ runs plain `codex resume`, and Codex queues the message behind that turn.
 
 Native delivery is conservative and one-shot after possible acceptance. A
 separate authoritative Herdr session binding must revalidate every exact identity
-fact and the absence of old tmux authority.
+fact.
 The opsled-owned activation lease serializes events and fences generation,
 service process, expiry, and monotonic token. An atomic per-event activation
 decision is created before transport and is never replayed after uncertainty.
@@ -137,8 +137,7 @@ complete raw JSONL line bytes; only then is that group terminated and checked
 for duplicate frontends. Busy output cannot suppress submission or confirmation,
 and the temporary frontend is not terminated while its message remains queued.
 Stale-session rejection fails closed; uncertainty after transport start is not
-automatically replayed. Legacy tmux
-requests remain readable and byte-identical.
+automatically replayed. Legacy requests remain readable and byte-identical.
 
 ## Recovery and duplicate prevention
 
@@ -172,9 +171,6 @@ recorded processes are dead. It durably commits `runner_outcome=FAILED` and
 `child_outcome=UNKNOWN` before releasing the exact claim as `FAILED`. Repeated
 execution preserves the original commit and claim completion time.
 
-tmux provides a predictable interactive session name and attach/start helpers.
-It is not an ownership lock or a state store.
-
 ## Runtime release and version-skew boundary
 
 `release-manifest.json` is canonical release authority for the local runtime.
@@ -199,12 +195,10 @@ Long-lived helpers are fenced by the verified release ID, complete artifact
 digest, runtime epoch, exact helper role, and PID/start/executable identity.
 Runner and opsled launch records establish that fence before helper
 ownership. Resume transport evidence records the corresponding helper fence
-before transport. Wake receipts carry the dispatcher release fence, while the
-existing implementation hash remains independently checked for transition and
-historical replay. A historical dispatcher record with no release-fence field
-is accepted only through the exact-current implementation-hash transition path;
-helper ownership itself and every newly launched record require the full
-release fence.
+before transport. Wake receipts carry the transient worker release identity and
+implementation digest. Historical dispatcher records remain readable but are
+never accepted as current authority; every new record requires the current
+helper release fence.
 
 ## Host-level opsled
 
@@ -288,8 +282,7 @@ exclusion, generation fence, request-deduplication, and Opsle-receipt-coupling
 transaction. The Herdr adapter is authoritative but read-only: discovery rejects
 any missing, duplicate, or mismatched binding fact, and commit performs no prompt
 or pane send call. Session delivery is delegated exclusively to the separately
-fenced plain Codex resume transport. The tmux host implementation remains
-explicit compatibility code, not the normal automatic dispatcher transport.
+fenced plain Codex resume transport. No tmux execution path remains.
 
 This architecture is an experimental single-host vertical slice, not a
 production-readiness claim.

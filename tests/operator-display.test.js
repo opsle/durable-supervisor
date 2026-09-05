@@ -131,16 +131,14 @@ test('lifecycle labels derive INITIALIZED, ACTIVE, IDLE, PAUSED, COMPLETE, and A
   }).supervisor, 'ATTENTION');
 });
 
-test('authoritative Herdr liveness does not depend on tmux', () => {
+test('authoritative Herdr liveness depends only on current Herdr evidence', () => {
   assert.deepEqual(deriveSupervisorLiveness({
     authorityStatus: 'AUTHORITATIVE',
     herdr: { valid: true, classification: 'bound-authoritative-herdr' },
-    tmuxAlive: false,
   }), { classification: 'alive', authority: 'herdr', reason: null });
   assert.deepEqual(deriveSupervisorLiveness({
     authorityStatus: 'AUTHORITATIVE',
     herdr: { valid: false, classification: 'stale', reasons: ['rollout-missing'] },
-    tmuxAlive: false,
   }), { classification: 'unknown', authority: null, reason: 'rollout-missing' });
 });
 
@@ -174,7 +172,6 @@ test('wake selection uses current authority and timestamps rather than array pos
 test('uncertain wake state and its actionable reason are prominent', () => {
   const output = renderWakeStatus({
     supervisor_generation: 3,
-    dispatcher: null,
     session_binding: { classification: 'stale', valid: false },
     requests: [{
       event_id: 'event-uncertain',

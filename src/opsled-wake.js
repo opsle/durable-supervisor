@@ -10,7 +10,7 @@ import {
   createReleaseFence,
   processStartIdentity,
 } from './runtime-release.js';
-import { classifyQueuedWake, deliverWake, wakeQueueStatus } from './wakeup.js';
+import { classifyQueuedWake, deliverWake } from './wakeup.js';
 import { validateRepositoryMapping } from './opsled-registry.js';
 import { sameProcessIdentity } from './host-lock.js';
 
@@ -327,23 +327,5 @@ export function launchRepositoryWakeTransports(mapping, options = {}) {
     scanned: results.length,
     delivered: results.filter((item) => item.delivered === true).length,
     results,
-  };
-}
-
-export function repositoryWakeSummary(mapping, {
-  releaseFence,
-  processIdentity,
-  bindingDependencies = {},
-} = {}) {
-  assertOpsledRepositoryAccess(mapping, releaseFence, { processIdentity });
-  const status = wakeQueueStatus(mapping.repository_realpath, { bindingDependencies });
-  const pending = status.requests.filter((item) => !['duplicate', 'obsolete'].includes(item.classification));
-  return {
-    repository_id: mapping.repository_id,
-    queued: pending.filter((item) => item.classification === 'queued').length,
-    ready: pending.filter((item) => item.classification === 'native-ready').length,
-    awaiting_consumption: pending.filter((item) => item.classification === 'awaiting-consumption').length,
-    session: status.session_binding.classification,
-    requests: status.requests,
   };
 }

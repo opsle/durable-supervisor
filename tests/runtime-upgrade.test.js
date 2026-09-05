@@ -15,6 +15,7 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
+import { main as runOpsledCommand } from '../bin/opsled.js';
 import { fileSha256, readJson, writeJson } from '../src/io.js';
 import {
   registerRepository,
@@ -26,15 +27,82 @@ import {
   assertRuntimeStartAllowed,
   inventoryManagedRuntime,
   readCurrentRuntime,
+  runtimeHostPaths,
   upgradeHostRuntime,
 } from '../src/runtime-upgrade.js';
-import { processStartIdentity } from '../src/runtime-release.js';
+import { defaultOpsledHome } from '../src/opsled.js';
+import {
+  loadPriorManagedRelease,
+  loadRuntimeRelease,
+  processStartIdentity,
+} from '../src/runtime-release.js';
 import { initialize } from '../src/state.js';
 
 const sourceRoot = resolve(dirname(new URL(import.meta.url).pathname), '..');
-const sep2Runtime = process.env.OPSLE_SEP2_RUNTIME
-  ?? '/home/deploy/.npm-global/lib/node_modules/@opsle/durable-supervisor';
-const sep2WakeupSha256 = 'e4c6cdc6da82904c363b934b9be1e764555377b909fae7ccad5a2ccf410e511a';
+
+// The prior-runtime takeover proof needs a real managed runtime that still
+// carries the historical wake dispatcher helper. Resolve it from canonical
+// host state so no caller has to know a machine-specific install path, and
+// derive its implementation identity from the artifact actually selected
+// rather than from a hardcoded digest that goes stale on every release.
+const REQUIRED_PRIOR_HELPER_FILES = [
+  join('bin', 'opsle.js'),
+  join('bin', 'opsle-wake-delivery.js'),
+  join('src', 'wakeup.js'),
+];
+
+function resolvePriorRuntime() {
+  const override = process.env.OPSLE_PRIOR_RUNTIME;
+  if (override) return { root: override, source: 'OPSLE_PRIOR_RUNTIME' };
+  // Read the canonical managed runtime pointer directly. readCurrentRuntime()
+  // validates the pointer against the *current* runtime's expectations, which a
+  // prior release is not required to satisfy, so it cannot resolve a checkpoint.
+  const pointerPath = runtimeHostPaths(defaultOpsledHome()).current;
+  if (existsSync(pointerPath)) {
+    try {
+      const pointer = readJson(pointerPath);
+      if (typeof pointer?.release_root === 'string') {
+        return { root: pointer.release_root, source: 'managed-host-runtime-pointer' };
+      }
+    } catch {
+      // Unreadable pointer: treated as no managed prior runtime.
+    }
+  }
+  return { root: null, source: null };
+}
+
+function priorRuntimeProof() {
+  const { root, source } = resolvePriorRuntime();
+  if (!root) {
+    return { available: false, reason: 'no OPSLE_PRIOR_RUNTIME and no managed current runtime on this host' };
+  }
+  if (!existsSync(root)) {
+    return { available: false, reason: `prior runtime ${source} path does not exist: ${root}` };
+  }
+  const missing = REQUIRED_PRIOR_HELPER_FILES.filter((name) => !existsSync(join(root, name)));
+  if (missing.length > 0) {
+    return {
+      available: false,
+      reason: `prior runtime ${root} lacks the historical managed helper: ${missing.join(', ')}`,
+    };
+  }
+  const wakeupPath = join(root, 'src', 'wakeup.js');
+  const wakeupSha256 = fileSha256(wakeupPath);
+  const expected = process.env.OPSLE_PRIOR_WAKEUP_SHA256;
+  if (expected && expected !== wakeupSha256) {
+    return {
+      available: false,
+      reason: `prior runtime wakeup digest ${wakeupSha256} does not match OPSLE_PRIOR_WAKEUP_SHA256 ${expected}`,
+    };
+  }
+  return { available: true, root, source, wakeupPath, wakeupSha256 };
+}
+
+// Release verification sets OPSLE_REQUIRE_PRIOR_RUNTIME_PROOF so that an
+// unavailable artifact, or a proof that never ran, fails instead of skipping.
+const requirePriorRuntimeProof = process.env.OPSLE_REQUIRE_PRIOR_RUNTIME_PROOF === '1';
+const priorRuntime = priorRuntimeProof();
+let priorRuntimeProofRan = false;
 
 async function waitFor(check, message, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
@@ -154,20 +222,54 @@ test('host runtime upgrade installs by digest, migrates managed repositories, an
   }
 });
 
-test('takeover retires an already-running managed Sep-2 helper before release B becomes current', {
-  skip: !existsSync(join(sep2Runtime, 'bin', 'opsle-wake-delivery.js')),
+test('takeover retires an already-running managed prior helper before release B becomes current', {
+  skip: (!priorRuntime.available && !requirePriorRuntimeProof)
+    ? `prior-runtime takeover proof unavailable: ${priorRuntime.reason}`
+    : false,
   timeout: 30000,
 }, async () => {
+  assert.equal(priorRuntime.available, true, priorRuntime.reason);
   const hostRoot = mkdtempSync(join(tmpdir(), 'opsle-runtime-prior-helper-'));
   const root = repository('prior-helper');
-  const installedWakeup = join(sep2Runtime, 'src', 'wakeup.js');
+  const productionHost = defaultOpsledHome();
+  const productionCurrentPath = runtimeHostPaths(productionHost).current;
+  const productionServicePath = registryPaths(productionHost).service;
+  const productionCurrentBytes = existsSync(productionCurrentPath)
+    ? readFileSync(productionCurrentPath, 'utf8') : null;
+  const productionService = existsSync(productionServicePath)
+    ? readJson(productionServicePath) : null;
+  const productionIdentity = productionService?.process ?? null;
+  const installedWakeup = priorRuntime.wakeupPath;
+  const priorWakeupSha256 = priorRuntime.wakeupSha256;
   let priorIdentity = null;
+  let priorOpsledIdentity = null;
+  let priorStarted = null;
   let targetStarted = null;
   let sawQuiescedLaunchGate = false;
   try {
-    assert.equal(fileSha256(installedWakeup), sep2WakeupSha256);
+    assert.notEqual(resolve(hostRoot), resolve(productionHost));
+    assert.equal(fileSha256(installedWakeup), priorWakeupSha256);
+    const priorManifest = loadPriorManagedRelease({ root: priorRuntime.root });
+    assert.ok(priorManifest.helpers.some((entry) => entry.path === 'bin/opsle-wake-delivery.js'));
+    const targetManifest = loadRuntimeRelease({ refresh: true });
+    assert.equal(targetManifest.helpers.some((entry) => entry.path === 'bin/opsle-wake-delivery.js'), false);
+
+    registerRepository(hostRoot, root);
+    const priorUpgradeUrl = pathToFileURL(join(priorRuntime.root, 'src', 'runtime-upgrade.js'));
+    priorUpgradeUrl.searchParams.set('proof', hostRoot);
+    const priorUpgrade = await import(priorUpgradeUrl.href);
+    const installedPrior = await priorUpgrade.upgradeHostRuntime(hostRoot, priorRuntime.root, {
+      startTarget: async (releaseRoot, targetHost) => {
+        priorStarted = await startInstalledOpsled(releaseRoot, targetHost);
+      },
+    });
+    assert.equal(installedPrior.status, 'COMPLETED');
+    assert.equal(installedPrior.target.packaged_artifact_sha256, priorManifest.packaged_artifact_sha256);
+    priorOpsledIdentity = priorStarted.started.service.process;
+    assert.ok(processStartIdentity(priorOpsledIdentity.pid));
+
     const launched = spawnSync(process.execPath, [
-      join(sep2Runtime, 'bin', 'opsle.js'), 'wake', 'start',
+      join(priorRuntime.root, 'bin', 'opsle.js'), 'wake', 'start',
     ], { cwd: root, encoding: 'utf8' });
     assert.equal(launched.status, 0, launched.stderr);
     const dispatcherPath = join(root, '.opsle', 'wake', 'dispatcher.json');
@@ -178,24 +280,31 @@ test('takeover retires an already-running managed Sep-2 helper before release B 
     priorIdentity = dispatcher.process;
     assert.ok(processStartIdentity(priorIdentity.pid));
 
-    registerRepository(hostRoot, root);
-    const upgraded = await upgradeHostRuntime(hostRoot, sourceRoot, {
-      signal: (pid, signal) => {
-        assert.throws(
-          () => assertRuntimeStartAllowed(hostRoot, { root: sourceRoot }),
-          (error) => error.classification === 'BUSY',
-        );
-        sawQuiescedLaunchGate = true;
-        process.kill(pid, signal);
-      },
-      startTarget: async (releaseRoot, targetHost) => {
-        assert.equal(sawQuiescedLaunchGate, true);
-        assert.equal(processStartIdentity(priorIdentity.pid), null);
-        targetStarted = await startInstalledOpsled(releaseRoot, targetHost);
+    const output = [];
+    await runOpsledCommand(['upgrade', '--release', sourceRoot, '--json'], {
+      home: hostRoot,
+      output: (value) => output.push(value),
+      upgradeOptions: {
+        signal: (pid, signal) => {
+          assert.throws(
+            () => assertRuntimeStartAllowed(hostRoot, { root: sourceRoot }),
+            (error) => error.classification === 'BUSY',
+          );
+          sawQuiescedLaunchGate = true;
+          process.kill(pid, signal);
+        },
+        startTarget: async (releaseRoot, targetHost) => {
+          assert.equal(sawQuiescedLaunchGate, true);
+          assert.equal(processStartIdentity(priorIdentity.pid), null);
+          assert.equal(processStartIdentity(priorOpsledIdentity.pid), null);
+          targetStarted = await startInstalledOpsled(releaseRoot, targetHost);
+        },
       },
     });
+    const [upgraded] = output;
 
     assert.equal(upgraded.status, 'COMPLETED');
+    assert.equal(upgraded.target.packaged_artifact_sha256, targetManifest.packaged_artifact_sha256);
     const retired = upgraded.retired_processes.find((entry) => (
       entry.kind === 'repository-wake-dispatcher'
       && entry.process.pid === priorIdentity.pid
@@ -205,6 +314,7 @@ test('takeover retires an already-running managed Sep-2 helper before release B 
     assert.ok(retired);
     assert.equal(retired.verified_absent, true);
     assert.equal(processStartIdentity(priorIdentity.pid), null);
+    assert.equal(processStartIdentity(priorOpsledIdentity.pid), null);
     assert.equal(readCurrentRuntime(hostRoot).release_root, upgraded.target.release_root);
     await waitFor(() => {
       const status = targetStarted.runtime.opsledStatus(hostRoot);
@@ -213,12 +323,32 @@ test('takeover retires an already-running managed Sep-2 helper before release B 
         ? status
         : null;
     }, 'release B did not own normal repository operation');
-    assert.equal(fileSha256(installedWakeup), sep2WakeupSha256);
+    assert.equal(fileSha256(installedWakeup), priorWakeupSha256);
+    priorRuntimeProofRan = true;
   } finally {
     await stopInstalledOpsled(targetStarted, hostRoot);
+    if (priorOpsledIdentity && processStartIdentity(priorOpsledIdentity.pid)?.start_time_ticks
+        === priorOpsledIdentity.start_time_ticks) {
+      process.kill(priorOpsledIdentity.pid, 'SIGTERM');
+    }
     if (priorIdentity && processStartIdentity(priorIdentity.pid)?.start_time_ticks
         === priorIdentity.start_time_ticks) {
       process.kill(priorIdentity.pid, 'SIGTERM');
+    }
+    assert.equal(
+      existsSync(productionCurrentPath) ? readFileSync(productionCurrentPath, 'utf8') : null,
+      productionCurrentBytes,
+    );
+    const currentProductionService = existsSync(productionServicePath)
+      ? readJson(productionServicePath) : null;
+    assert.equal(currentProductionService?.service_id ?? null, productionService?.service_id ?? null);
+    assert.deepEqual(currentProductionService?.process ?? null, productionIdentity);
+    assert.equal(
+      currentProductionService?.release_fence?.packaged_artifact_sha256 ?? null,
+      productionService?.release_fence?.packaged_artifact_sha256 ?? null,
+    );
+    if (productionIdentity) {
+      assert.deepEqual(processStartIdentity(productionIdentity.pid), productionIdentity);
     }
     rmSync(root, { recursive: true, force: true });
     rmSync(hostRoot, { recursive: true, force: true });
@@ -401,4 +531,15 @@ test('corrupt-neighbor upgrade quarantines B while A and C remain serviceable', 
     roots.forEach((root) => rmSync(root, { recursive: true, force: true }));
     rmSync(hostRoot, { recursive: true, force: true });
   }
+});
+
+// Release verification must never report PASS while silently omitting the real
+// prior-runtime takeover proof.
+test('REQUIRED mode proves the real prior-runtime takeover actually ran', {
+  skip: requirePriorRuntimeProof
+    ? false
+    : 'set OPSLE_REQUIRE_PRIOR_RUNTIME_PROOF=1 to require the real prior-runtime proof',
+}, () => {
+  assert.equal(priorRuntime.available, true, priorRuntime.reason ?? 'prior runtime unavailable');
+  assert.equal(priorRuntimeProofRan, true, 'the prior-runtime takeover proof did not run');
 });

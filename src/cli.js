@@ -1,7 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import {
-  basename,
   dirname,
   join,
   relative,
@@ -39,7 +38,6 @@ import {
   releaseClaim,
   routeTask,
 } from './pipeline.js';
-import { launchDetachedAttempt, runAttempt } from './runner.js';
 import { createRunnerRequest } from './opsled-runner.js';
 import {
   loadSelectedSupervisorSkillInstructions,
@@ -49,7 +47,6 @@ import {
 import { activationSummary } from './activation-telemetry.js';
 import {
   deriveDisplayState,
-  deriveSupervisorLiveness,
   renderModels,
   renderPolicy,
   renderSession,
@@ -64,12 +61,9 @@ import {
 } from './reconstruction.js';
 import {
   adoptCodexSessionBinding,
-  adoptQueuedWakes,
   applyWakeEvent,
   bindCodexSession,
   consumeWakeDelivery,
-  drainWakeQueue,
-  ensureWakeDispatcher,
   refreshCodexSessionBinding,
   unconsumedDeliveredWakes,
   wakeDeliveryConsumptionStatus,
@@ -109,23 +103,20 @@ commands:
   models status [--verbose|--json]
   models enable|disable [PROVIDER]
   task create --input FILE
-  task run TASK_ID [--pause-after-current] [--foreground-wait] [--json]
+  task run TASK_ID [--pause-after-current] [--json]
   task evaluate TASK_ID --accept|--reject --rationale TEXT
   task show TASK_ID
   requirements [--json]
   evidence show ATTEMPT_ID
   events consume EVENT_ID [--delivery ID --generation N]
-  wake start
   wake status [--verbose|--json]
-  wake drain
   wake reconcile-transport-not-started EVENT_ID
   session bind --session UUID --rollout PATH --sessions-root PATH
     --host-pid PID --workspace-id ID --workspace-cwd PATH
-    --pane-id ID --terminal-id ID [--legacy-tmux-session NAME]
+    --pane-id ID --terminal-id ID
   session status [--verbose|--json]
   session adopt
   telemetry import-activation-profile --input FILE
-  supervisor session-name|start|attach
   supervisor is-alive [--verbose|--json]
   supervisor route select --input FILE
   supervisor route show DECISION_ID
@@ -218,7 +209,6 @@ export function sessionCommand(root, subcommand, args, { dependencies = {} } = {
     workspaceCwd: valueAfter(args, '--workspace-cwd'),
     paneId: valueAfter(args, '--pane-id'),
     terminalId: valueAfter(args, '--terminal-id'),
-    legacyTmuxSession: valueAfter(args, '--legacy-tmux-session'),
   }, { dependencies });
 }
 
@@ -468,8 +458,6 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
       state: state.supervisor_state,
       phase: state.phase,
       pause: state.pause,
-      tmux_session: supervisor.session_id,
-      tmux_alive: supervisor.session_id ? tmuxAlive(supervisor.session_id) : false,
     },
     objective: objective.history.find((item) => item.revision === objective.current_revision) ?? null,
     session_binding: sessionBinding,
@@ -536,14 +524,6 @@ async function watchStatus(root, args) {
     }
     if (iteration < iterations) await sleep(intervalMs);
   }
-}
-
-function tmuxName(root) {
-  return `opsle-${basename(root).replace(/[^A-Za-z0-9_-]/g, '-')}`;
-}
-
-function tmuxAlive(name) {
-  return spawnSync('tmux', ['has-session', '-t', name]).status === 0;
 }
 
 function processAlive(pid) {
@@ -739,8 +719,6 @@ export function reconcileRunnerFailure(root, {
 
 export function recover(root, {
   isProcessAlive = processAlive,
-  startWakeDispatcher = null,
-  dispatcherOptions = {},
 } = {}) {
   const p = paths(root);
   const supervisor = readJson(p.supervisor);
@@ -792,16 +770,12 @@ export function recover(root, {
           supervisor,
           isProcessAlive,
         });
-        const foregroundOwned = !runner
-          && exactAttemptClaimOwner({ state, task, attempt, claim, index, supervisor })
-          && Number.isInteger(attempt.pid)
-          && isProcessAlive(attempt.pid);
-        if (detachedOwned || foregroundOwned) reconciliation = {
+        if (detachedOwned) reconciliation = {
           classification: 'known_running',
           action: 'preserve_claim_and_wait',
           pid: attempt.pid,
           runner_pid: runner?.worker_pid ?? null,
-          lifecycle_owner: detachedOwned ? 'detached-runner-worker' : 'foreground-child',
+          lifecycle_owner: 'detached-runner-worker',
         };
         else {
           attempt.child_state = 'UNKNOWN';
@@ -809,9 +783,7 @@ export function recover(root, {
             task_id: attempt.task_id,
             attempt_id: attempt.attempt_id,
             wait_id: attempt.attempt_id,
-            reason: runner
-              ? 'exact detached Runner owner is absent without terminal evidence'
-              : 'active foreground child PID is absent without terminal evidence',
+            reason: 'exact detached Runner owner is absent without terminal evidence',
           });
           if (attempt.wait_registration) {
             attempt.wait_registration = applyWakeEvent(attempt.wait_registration, {
@@ -843,16 +815,10 @@ export function recover(root, {
   supervisor.recovered_at = now();
   writeJson(p.supervisor, supervisor);
   emit(root, 'SUPERVISOR_RECOVERED', { reconciliation });
-  const adopted_wake_event_ids = adoptQueuedWakes(root);
-  const wake_dispatcher = typeof startWakeDispatcher === 'function'
-    ? startWakeDispatcher(root, dispatcherOptions)
-    : { started: false, reason: 'opsled-owns-persistent-wake-dispatch' };
   return {
     supervisor,
     state: readJson(p.state),
     reconciliation,
-    adopted_wake_event_ids,
-    wake_dispatcher,
   };
 }
 
@@ -1207,29 +1173,12 @@ export async function main(args) {
     } else if (subcommand === 'run') {
       const state = readJson(paths(root).state);
       if (state.pause.active) throw new Error('automatic progression is paused');
-      const foregroundWait = rest.includes('--foreground-wait');
       const pauseAfterCurrent = rest.includes('--pause-after-current');
-      if (foregroundWait && pauseAfterCurrent) {
-        throw new Error('--pause-after-current requires canonical detached task execution');
-      }
       const task = readJson(join(paths(root).tasks, `${rest[0]}.json`));
       const gearbox = routeTask(root, task);
       emit(root, 'GEARBOX_ROUTED', { task_id: task.task_id, decision_id: gearbox.decision_id, route: gearbox.selected_route, rationale: gearbox.rationale });
       const { attempt, claim } = createAttempt(root, task, gearbox);
-      if (foregroundWait) {
-        const result = await runAttempt(root, task, attempt, claim);
-        print({
-          launch_mode: 'foreground-wait',
-          task_id: task.task_id,
-          attempt_id: result.attempt.attempt_id,
-          child_state: result.attempt.child_state,
-          acceptance: result.attempt.acceptance,
-          compact_packet: result.attempt.compact_packet,
-          completion_handoff: result.attempt.completion_handoff,
-          completion_event_id: result.completion_event.event_id,
-        });
-      } else {
-        if (pauseAfterCurrent) {
+      if (pauseAfterCurrent) {
           const reason = valueAfter(rest, '--reason', 'task run requested pause after current');
           updateState(root, {
             pause: { active: true, after_current: true, reason, changed_at: now() },
@@ -1240,9 +1189,9 @@ export async function main(args) {
             attempt_id: attempt.attempt_id,
             reason,
           });
-        }
-        const request = createRunnerRequest(root, task, attempt, claim);
-        const queued = {
+      }
+      const request = createRunnerRequest(root, task, attempt, claim);
+      const queued = {
           launch_mode: 'opsled-request',
           action: 'REQUEST_SUBMITTED',
           task_id: task.task_id,
@@ -1251,12 +1200,11 @@ export async function main(args) {
           child_state: attempt.child_state,
           monitoring_owner: 'OPSLED',
           pause_after_current: pauseAfterCurrent,
-        };
-        print(rest.includes('--json') ? queued : [
-          `Runner request ${request.request_id} queued for ${task.task_id}.`,
-          'Opsled owns launch and supervision.',
-        ].join('\n'));
-      }
+      };
+      print(rest.includes('--json') ? queued : [
+        `Runner request ${request.request_id} queued for ${task.task_id}.`,
+        'Opsled owns launch and supervision.',
+      ].join('\n'));
     } else if (subcommand === 'evaluate') {
       const taskId = rest[0];
       const accept = rest.includes('--accept');
@@ -1286,9 +1234,7 @@ export async function main(args) {
     return;
   }
   if (command === 'wake') {
-    if (subcommand === 'start') {
-      print(ensureWakeDispatcher(root));
-    } else if (subcommand === 'status') {
+    if (subcommand === 'status') {
       const mode = outputMode(rest);
       const wake = wakeQueueStatus(root);
       const selected = selectWakeRecords(wake.requests);
@@ -1299,12 +1245,10 @@ export async function main(args) {
         authoritative_count: selected.authoritative_count,
       };
       print(mode.json ? wake : renderWakeStatus(wake, mode));
-    } else if (subcommand === 'drain') {
-      print(drainWakeQueue(root));
     } else if (subcommand === 'reconcile-transport-not-started') {
       if (!rest[0]) throw new Error('wake reconciliation requires event ID');
       print(reconcileWakeTransportNotStarted(root, rest[0]));
-    } else throw new Error('wake requires start, status, or drain');
+    } else throw new Error('wake requires status or reconcile-transport-not-started');
     return;
   }
   if (command === 'session') {
@@ -1353,64 +1297,37 @@ export async function main(args) {
       }
       return;
     }
-    const name = tmuxName(root);
-    if (subcommand === 'session-name') print(name);
-    else if (subcommand === 'is-alive') {
+    if (subcommand === 'is-alive') {
       const mode = outputMode(rest);
       const supervisor = readJson(paths(root).supervisor);
       const herdr = codexSessionBindingStatus(root);
-      const tmux = { session: name, alive: tmuxAlive(name) };
-      const liveness = deriveSupervisorLiveness({
-        authorityStatus: supervisor.authority_status,
-        herdr,
-        tmuxAlive: tmux.alive,
-      });
-      const { classification, authority } = liveness;
+      const alive = supervisor.authority_status === 'AUTHORITATIVE'
+        && herdr.valid === true
+        && herdr.classification === 'bound-authoritative-herdr';
+      const classification = alive ? 'alive' : 'unknown';
+      const authority = alive ? 'herdr' : null;
       const result = {
         classification,
         authority,
         supervisor_id: supervisor.supervisor_id,
         supervisor_generation: supervisor.generation,
         herdr,
-        tmux,
-        reason: liveness.reason,
+        reason: alive ? null : (herdr.reasons?.[0] ?? herdr.classification),
       };
       if (mode.json) print(result);
       else if (mode.verbose) {
         print([
           `Supervisor: ${classification.toUpperCase()}${authority ? ` — ${authority}` : ' — current process authority is unproven'}`,
           renderSession(herdr, { verbose: true }),
-          `Tmux fallback: ${name} (${tmux.alive ? 'available' : 'unavailable'})`,
           `Identity: ${supervisor.supervisor_id}`,
           `Generation: ${supervisor.generation}`,
         ].join('\n'));
       } else {
         print(classification === 'alive'
-          ? `Supervisor: ALIVE — ${authority === 'herdr' ? 'authoritative Herdr session is current' : 'tmux compatibility fallback is live'}`
+          ? 'Supervisor: ALIVE — authoritative Herdr session is current'
           : `Supervisor: UNKNOWN — ${herdr.reasons?.join(', ') || herdr.classification}`);
       }
       if (classification !== 'alive') process.exitCode = 1;
-    } else if (subcommand === 'start') {
-      if (tmuxAlive(name)) throw new Error(`tmux session already exists: ${name}`);
-      const supervisor = readJson(paths(root).supervisor);
-      const prompt = 'Read AGENTS.md and .opsle authoritative state. Run ./bin/opsle.js status and ./bin/opsle.js validate, reconcile ownership, then remain the interactive repository supervisor. Do not create a second supervisor identity.';
-      const policy = readJson(paths(root).policy);
-      const codex = policy.providers.codex;
-      if (!codex.enabled) throw new Error('Codex provider is disabled by operator policy');
-      const result = spawnSync('tmux', [
-        'new-session', '-d', '-s', name, '-c', root,
-        'codex', '-C', root, '--model', codex.model,
-        '-c', `model_reasoning_effort="${codex.reasoning_effort}"`, prompt,
-      ], { encoding: 'utf8' });
-      if (result.status !== 0) throw new Error(result.stderr.trim() || 'tmux start failed');
-      supervisor.session_id = name;
-      writeJson(paths(root).supervisor, supervisor);
-      emit(root, 'CONTROLLED_SESSION_HANDOFF', { actor: 'operator-cli', tmux_session: name, authority_identity: supervisor.supervisor_id });
-      print(name);
-    } else if (subcommand === 'attach') {
-      if (!tmuxAlive(name)) throw new Error(`tmux session not running: ${name}`);
-      const result = spawnSync('tmux', ['attach-session', '-t', name], { stdio: 'inherit' });
-      process.exitCode = result.status ?? 1;
     } else throw new Error('unknown supervisor command');
     return;
   }

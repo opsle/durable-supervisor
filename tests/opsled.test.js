@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { canonicalJson, sha256, writeJson } from '../src/io.js';
 import {
@@ -52,6 +52,8 @@ import {
   validateOpsledRunnerRecord,
 } from '../src/opsled-runner.js';
 import { launchRepositoryWakeTransports } from '../src/opsled-wake.js';
+
+const sourceRootForSeam = join(dirname(new URL(import.meta.url).pathname), '..');
 
 function repository(name = 'repository') {
   const root = mkdtempSync(join(tmpdir(), `opsled-${name}-`));
@@ -931,6 +933,60 @@ test('status has concise OPSLED and REPOSITORIES sections with JSON detail', () 
     assert.doesNotMatch(output, /generation=|service=/);
     assert.equal(status.repositories.length, 1);
     assert.equal(status.repositories[0].repository_realpath, realpathSync(root));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(hostRoot, { recursive: true, force: true });
+  }
+});
+
+// D3: dispatchRepositoryWakes/nativeTransport is a deterministic test seam.
+// It must stay reachable only by explicit injection, never by any shipped
+// production entrypoint, so it can never become a second wake authority.
+test('nativeTransport is a test-only seam that no shipped entrypoint can select', async () => {
+  const hostRoot = host();
+  const root = repository('native-transport-seam');
+  try {
+    register(hostRoot, root);
+    const service = stageService(hostRoot);
+    const observed = [];
+    const result = await runOpsledService(hostRoot, service, {
+      intervalMs: 10,
+      maxCycles: 1,
+      processIdentity: processStartIdentity(),
+      processRepository: async (mapping, options) => {
+        observed.push(options);
+        return { repository_id: mapping.repository_id };
+      },
+    });
+    assert.equal(result.status, 'OWNED');
+    assert.equal(observed.length, 1);
+    // Normal service operation never injects the seam, so processOpsledRepository
+    // takes the launchRepositoryWakeTransports branch.
+    assert.equal('nativeTransport' in observed[0], false);
+    assert.equal(observed[0].nativeTransport ?? null, null);
+
+    // No shipped CLI, worker, or library entrypoint mentions the seam, so no
+    // production caller can pass it through runOpsledCycle's repositoryOptions.
+    const shipped = [
+      join('bin', 'opsle.js'),
+      join('bin', 'opsled.js'),
+      join('bin', 'opsled-worker.js'),
+      join('bin', 'opsled-wake-worker.js'),
+      join('bin', 'opsle-runner-worker.js'),
+      join('bin', 'opsle-wake-delivery.js'),
+      join('bin', 'opsle-codex-resume.js'),
+      join('src', 'cli.js'),
+    ];
+    for (const relative of shipped) {
+      const path = join(sourceRootForSeam, relative);
+      if (!existsSync(path)) continue;
+      const source = readFileSync(path, 'utf8');
+      assert.equal(
+        /nativeTransport|repositoryOptions|dispatchRepositoryWakes/.test(source),
+        false,
+        `${relative} must not reference the nativeTransport test seam`,
+      );
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(hostRoot, { recursive: true, force: true });

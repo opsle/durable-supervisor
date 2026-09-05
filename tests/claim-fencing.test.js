@@ -12,8 +12,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
-import { recover } from '../src/cli.js';
-import { readJson, writeJson } from '../src/io.js';
+import { readJson } from '../src/io.js';
 import {
   acquireClaim,
   createAttempt,
@@ -253,39 +252,6 @@ test('release/acquire interleaving cannot create duplicate authority or restore 
     assert.deepEqual(readFileSync(join(paths(root).claims, `${first.claim_id}.json`)), firstHistoryBeforeReplay);
     assert.throws(() => acquireClaim(root, task, 'attempt-003'), /claim conflict/);
     assert.equal(authoritativeSummary(root, task.task_id).duplicate_active_claims, false);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('recovery preserves the exact newer claim and fence after stale release replay', () => {
-  const root = fixture();
-  try {
-    const task = createTask(root, handoff('task-claim-recovery'));
-    const decision = routeTask(root, task);
-    const first = createAttempt(root, task, decision);
-    releaseClaim(root, first.claim, 'FAILED');
-    const second = createAttempt(root, task, decision);
-    second.attempt.child_state = 'RUNNING';
-    second.attempt.pid = 424242;
-    writeJson(join(paths(root).attempts, `${second.attempt.attempt_id}.json`), second.attempt);
-    releaseClaim(root, first.claim, 'FAILED');
-    const indexBeforeRecovery = readFileSync(join(paths(root).claims, 'index.json'));
-
-    const recovered = recover(root, {
-      isProcessAlive: (pid) => pid === second.attempt.pid,
-      startWakeDispatcher: () => ({ started: false, reason: 'fixture-disabled' }),
-    });
-
-    assert.equal(recovered.reconciliation.classification, 'known_running');
-    assert.equal(recovered.reconciliation.action, 'preserve_claim_and_wait');
-    assert.deepEqual(readFileSync(join(paths(root).claims, 'index.json')), indexBeforeRecovery);
-    assert.equal(indexedClaim(root, task.task_id).claim_id, second.claim.claim_id);
-    assert.equal(indexedClaim(root, task.task_id).fence_generation, second.claim.fence_generation);
-    assert.equal(readJson(join(paths(root).claims, `${first.claim.claim_id}.json`)).status, 'FAILED');
-    assert.equal(readJson(join(paths(root).claims, `${second.claim.claim_id}.json`)).status, 'ACTIVE');
-    assert.equal(authoritativeSummary(root, task.task_id).duplicate_active_claims, false);
-    assert.ok(second.claim.fence_generation > first.claim.fence_generation);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

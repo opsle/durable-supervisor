@@ -6,13 +6,10 @@ import {
   readdirSync,
   realpathSync,
   statSync,
-  unlinkSync,
-  watch,
 } from 'node:fs';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { setTimeout as sleep } from 'node:timers/promises';
 import {
   boundRolloutActivity,
   codexExecutableEvidence,
@@ -35,7 +32,6 @@ import {
 import { emit, paths, updateState } from './state.js';
 import {
   assertReleaseFence,
-  createReleaseFence,
   releaseIdentity,
 } from './runtime-release.js';
 
@@ -43,15 +39,22 @@ const WAIT_SCHEMA = 'opsle.durable-supervisor.wait-registration/v1';
 const WAKE_REQUEST_SCHEMA = 'opsle.durable-supervisor.host-wake-request/v1';
 const NATIVE_WAKE_REQUEST_SCHEMA = 'opsle.durable-supervisor.native-wake-request/v2';
 const DELIVERY_SCHEMA = 'opsle.durable-supervisor.host-wake-delivery/v1';
-const DISPATCHER_SCHEMA = 'opsle.durable-supervisor.host-wake-dispatcher/v1';
+// Historical durable evidence remains schema-readable. These identifiers carry
+// no current authority: nothing constructs a host adapter, a legacy host
+// binding, or a repository wake dispatcher. They stay declared because the
+// durable schema fingerprint stamped into every managed repository covers this
+// identifier set, and because managed runtime takeover must still recognize an
+// actual old dispatcher record in order to retire it.
+export const HISTORICAL_SCHEMAS = Object.freeze({
+  hostAdapter: 'opsle.durable-supervisor.host-adapter/v1',
+  hostBinding: 'opsle.durable-supervisor.host-binding/v1',
+  wakeDispatcher: 'opsle.durable-supervisor.host-wake-dispatcher/v1',
+  wakeDispatcherImplementation: 'opsle.durable-supervisor.wake-dispatcher-implementation/v1',
+});
 const WAKEUP_SOURCE_PATH = fileURLToPath(import.meta.url);
-const DEFAULT_DISPATCHER_SCRIPT = fileURLToPath(
-  new URL('../bin/opsle-wake-delivery.js', import.meta.url),
-);
-export const WAKE_DISPATCHER_IMPLEMENTATION_SHA256 = sha256(canonicalJson({
-  schema: 'opsle.durable-supervisor.wake-dispatcher-implementation/v1',
+export const WAKE_WORKER_IMPLEMENTATION_SHA256 = sha256(canonicalJson({
+  schema: 'opsle.wake-worker-implementation/v1',
   wakeup_source_sha256: fileSha256(WAKEUP_SOURCE_PATH),
-  dispatcher_entrypoint_sha256: fileSha256(DEFAULT_DISPATCHER_SCRIPT),
 }));
 export const CODEX_SESSION_BINDING_SCHEMA = 'opsle.durable-supervisor.codex-session-binding/v3';
 export const LEGACY_CODEX_SESSION_BINDING_SCHEMA = 'opsle.durable-supervisor.codex-session-binding/v2';
@@ -151,9 +154,6 @@ function wakePaths(root) {
     base,
     requests: join(base, 'requests'),
     deliveries: join(base, 'deliveries'),
-    busy: join(base, 'busy.json'),
-    dispatcher: join(base, 'dispatcher.json'),
-    dispatcherLock: join(base, 'dispatcher.lock'),
     sessionBinding: join(base, 'codex-session-binding.json'),
     sessionBindingHistory: join(base, 'session-binding-history'),
     consumptions: join(base, 'consumptions'),
@@ -177,10 +177,6 @@ function directories(root) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
   }
   return value;
-}
-
-function removeIfPresent(path) {
-  try { unlinkSync(path); } catch (error) { if (error.code !== 'ENOENT') throw error; }
 }
 
 function requestPath(root, eventId) {
@@ -208,6 +204,8 @@ function deliveryReceiptFence(receipt) {
     dispatcher_generation: receipt?.dispatcher_generation,
     dispatcher_implementation_sha256: receipt?.dispatcher_implementation_sha256,
     dispatcher_release_fence: receipt?.dispatcher_release_fence ?? null,
+    wake_worker_implementation_sha256: receipt?.wake_worker_implementation_sha256,
+    wake_owner: receipt?.wake_owner,
     activation_lease_id: receipt?.activation_lease_id,
     activation_fencing_token: receipt?.activation_fencing_token,
     activation_decision_id: receipt?.activation_decision_id,
@@ -327,32 +325,10 @@ function sessionCandidates(sessionsRoot, sessionId) {
   return matches.sort();
 }
 
-function tmuxPaneIdentity(sessionName, paneId, run = spawnSync) {
-  const format = '#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}';
-  const result = run('tmux', ['display-message', '-p', '-t', paneId, format], { encoding: 'utf8' });
-  if (result.status !== 0) return null;
-  const [session, pane, panePid, paneTty] = result.stdout.trim().split('\t');
-  if (session !== sessionName || pane !== paneId || !/^%\d+$/.test(pane)) return null;
-  return {
-    session_name: session,
-    pane_id: pane,
-    pane_pid: Number(panePid),
-    pane_tty: paneTty,
-  };
-}
-
 function installedCodexVersion(run = spawnSync) {
   const result = run('codex', ['--version'], { encoding: 'utf8' });
   if (result.status !== 0) return null;
   return `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().split('\n')[0] || null;
-}
-
-function legacyTmuxAuthority(sessionName, run = spawnSync) {
-  if (typeof sessionName !== 'string' || !sessionName) return false;
-  const result = run('tmux', [
-    'display-message', '-p', '-t', sessionName, '#{session_name}',
-  ], { encoding: 'utf8' });
-  return result.status === 0 && result.stdout.trim() === sessionName;
 }
 
 function bindingDependencies(overrides = {}) {
@@ -364,7 +340,6 @@ function bindingDependencies(overrides = {}) {
     sessionCandidates: overrides.sessionCandidates ?? sessionCandidates,
     codexVersion: overrides.codexVersion ?? installedCodexVersion,
     uid: overrides.uid ?? (() => process.getuid?.() ?? null),
-    legacyTmuxAuthority: overrides.legacyTmuxAuthority ?? legacyTmuxAuthority,
     environment: overrides.environment ?? (() => process.env),
     herdrSnapshot: overrides.herdrSnapshot ?? (() => {
       const result = spawnSync('herdr', ['api', 'snapshot'], { encoding: 'utf8' });
@@ -555,9 +530,7 @@ function validateSessionBindingShape(binding) {
       || typeof binding.host?.workspace_id !== 'string'
       || binding.host?.workspace_cwd !== binding.repository_realpath
       || typeof binding.host?.pane_id !== 'string'
-      || typeof binding.host?.terminal_id !== 'string'
-      || (binding.authority_fence?.legacy_tmux_session !== null
-        && typeof binding.authority_fence?.legacy_tmux_session !== 'string')) {
+      || typeof binding.host?.terminal_id !== 'string') {
     throw new Error('incomplete Codex session binding');
   }
   if (binding.native_wake?.supported !== true
@@ -578,7 +551,6 @@ export function createCodexSessionBinding(root, {
   workspaceCwd,
   paneId,
   terminalId,
-  legacyTmuxSession = null,
   bindingRevision = null,
   discoveryEvidence = null,
 }, dependencyOverrides = {}) {
@@ -593,7 +565,6 @@ export function createCodexSessionBinding(root, {
   const hostProcess = deps.processIdentity(Number(hostPid));
   const cliVersion = deps.codexVersion();
   const uid = deps.uid();
-  const fencedTmuxSession = legacyTmuxSession;
   if (!hostProcess || !cliVersion || !Number.isSafeInteger(uid)) {
     throw new Error('session binding probes did not produce exact Herdr process, CLI, and UID facts');
   }
@@ -609,9 +580,6 @@ export function createCodexSessionBinding(root, {
   }
   if (workspaceCwd !== repositoryRealpath) {
     throw new Error('Herdr workspace CWD must equal the repository realpath');
-  }
-  if (deps.legacyTmuxAuthority(fencedTmuxSession)) {
-    throw new Error('old tmux supervisor authority is still live');
   }
   const oldPath = wakePaths(root).sessionBinding;
   const supersedes = existsSync(oldPath) ? fileSha256(oldPath) : null;
@@ -670,11 +638,6 @@ export function createCodexSessionBinding(root, {
       process: hostProcess,
       discovery: discoveryEvidence,
     },
-    authority_fence: {
-      legacy_tmux_session: fencedTmuxSession,
-      legacy_tmux_fallback_configured: typeof fencedTmuxSession === 'string' && fencedTmuxSession.length > 0,
-      legacy_tmux_absent_at_bind: true,
-    },
     native_wake: {
       supported: true,
       transport: 'plain-codex-resume',
@@ -732,9 +695,6 @@ export function refreshCodexSessionBinding(root, {
   try {
     const repositoryRealpath = deps.realpath(root);
     const supervisor = readJson(paths(root).supervisor);
-    if (deps.legacyTmuxAuthority(supervisor.session_id)) {
-      throw new Error('concurrent live tmux supervisor authority detected');
-    }
     const environment = deps.environment();
     const priorBinding = readOptional(wake.sessionBinding);
     const firstRaw = deps.herdrSnapshot();
@@ -765,7 +725,7 @@ export function refreshCodexSessionBinding(root, {
     if (allowEnvironmentMismatch
         && !sessionReference(frontend.pane)
         && !exactProcess(priorBinding?.host?.process, frontendProcess)) {
-      throw new Error('dispatcher cannot infer a changed Herdr frontend session identity');
+      throw new Error('wake owner cannot infer a changed Herdr frontend session identity');
     }
     const sessionsRoot = dependencies.sessionsRoot
       ? dependencies.sessionsRoot(environment)
@@ -809,7 +769,6 @@ export function refreshCodexSessionBinding(root, {
       workspaceCwd: repositoryRealpath,
       paneId: frontend.pane.pane_id,
       terminalId: frontend.pane.terminal_id,
-      legacyTmuxSession: supervisor.session_id ?? null,
       discoveryEvidence: {
         source: 'herdr-api-snapshot-and-pane-process-info',
         protocol: first.protocol ?? null,
@@ -896,9 +855,6 @@ export function codexSessionBindingStatus(root, {
   if (!exactProcess(record.host.process, deps.processIdentity(record.host.process.pid))) {
     reasons.push('herdr-host-process-dead-or-reused');
   }
-  if (deps.legacyTmuxAuthority(record.authority_fence.legacy_tmux_session)) {
-    reasons.push('old-tmux-authority-live');
-  }
   let rolloutRealpath = null;
   try { rolloutRealpath = deps.realpath(record.rollout.realpath); } catch { reasons.push('rollout-missing'); }
   if (rolloutRealpath && rolloutRealpath !== record.rollout.realpath) reasons.push('rollout-realpath-mismatch');
@@ -973,13 +929,8 @@ function activationDecisionPath(root, eventId) {
   return join(wakePaths(root).activationDecisions, `${eventId}.json`);
 }
 
-function leaseOwner(dispatcher, activationOwner = null) {
-  if (activationOwner) return structuredClone(activationOwner);
-  return {
-    dispatcher_id: dispatcher?.dispatcher_id ?? 'explicit-provider-free-dispatcher',
-    dispatcher_generation: dispatcher?.dispatcher_generation ?? 1,
-    process: dispatcher?.process ?? processIdentity(process.pid),
-  };
+function leaseOwner(activationOwner) {
+  return activationOwner ? structuredClone(activationOwner) : null;
 }
 
 function sameActivationOwner(left, right) {
@@ -1009,7 +960,6 @@ function leaseExpired(lease, nowMs) {
 }
 
 export function acquireActivationLease(root, eventId, {
-  dispatcher = null,
   activationOwner = null,
   ttlMs = ACTIVATION_LEASE_TTL_MS,
   nowMs = Date.now(),
@@ -1019,12 +969,9 @@ export function acquireActivationLease(root, eventId, {
   if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) throw new Error('activation lease requires positive TTL');
   const wake = directories(root);
   const supervisor = readJson(paths(root).supervisor);
-  if (dispatcher && !dispatcherFence(root, dispatcher).current) {
-    return { acquired: false, classification: 'stale-dispatcher', reason: 'dispatcher-fence-no-longer-current' };
-  }
-  const owner = leaseOwner(dispatcher, activationOwner);
+  const owner = leaseOwner(activationOwner);
   if (!activationOwnerCurrent(owner, getProcessIdentity)) {
-    return { acquired: false, classification: 'stale-dispatcher', reason: 'activation-owner-process-dead-or-reused' };
+    return { acquired: false, classification: 'stale-owner', reason: 'opsled-wake-owner-process-dead-or-reused' };
   }
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const current = readOptional(wake.activationLease);
@@ -1143,7 +1090,7 @@ export function claimActivationDecision(root, eventId, lease, {
   const path = activationDecisionPath(root, eventId);
   if (atomicCreateJson(path, decision)) return { claimed: true, duplicate: false, decision };
   const current = readJson(path);
-  if (['BUSY', 'TRANSPORT_NOT_STARTED'].includes(current.status)
+  if (current.status === 'TRANSPORT_NOT_STARTED'
       && decisionFenceCurrent(root, lease)) {
     const expected = sha256(canonicalJson(current));
     decision.prior_attempts = [
@@ -1219,7 +1166,7 @@ export function classifyQueuedWake(root, request, supervisor = readJson(paths(ro
   }
   if (existsSync(activationDecisionPath(root, request.event_id))) {
     const decision = readJson(activationDecisionPath(root, request.event_id));
-    if (['BUSY', 'TRANSPORT_NOT_STARTED'].includes(decision.status)) {
+    if (decision.status === 'TRANSPORT_NOT_STARTED') {
       return {
         classification: 'queued',
         reason: 'awaiting-supported-native-transport',
@@ -1365,107 +1312,6 @@ export function enqueueTerminalWake(root, completionEvent, { hostBinding = null 
   return request;
 }
 
-function sameDispatcher(left, right) {
-  return left && right
-    && left.dispatcher_id === right.dispatcher_id
-    && left.dispatcher_generation === right.dispatcher_generation
-    && left.implementation_sha256 === right.implementation_sha256
-    && canonicalJson(left.release_fence ?? null) === canonicalJson(right.release_fence ?? null)
-    && left.supervisor_id === right.supervisor_id
-    && left.supervisor_generation === right.supervisor_generation
-    && sameProcess(left.process, right.process);
-}
-
-function dispatcherFence(root, expected) {
-  if (!expected) return { current: true, record: null };
-  const record = readOptional(directories(root).dispatcher);
-  const supervisor = readJson(paths(root).supervisor);
-  if (record?.schema !== DISPATCHER_SCHEMA
-      || record.status !== 'OWNED'
-      || !sameDispatcher(record, expected)
-      || record.supervisor_id !== supervisor.supervisor_id
-      || record.supervisor_generation !== supervisor.generation) {
-    return { current: false, record };
-  }
-  return { current: true, record };
-}
-
-export function classifyWakeDelivery({
-  request,
-  supervisor,
-  busy,
-  evidence,
-  dispatcher = null,
-  binding = request?.target?.host_binding ?? null,
-}) {
-  if (![WAKE_REQUEST_SCHEMA, NATIVE_WAKE_REQUEST_SCHEMA].includes(request?.schema)) {
-    return { classification: 'queued', reason: 'invalid-wake-request' };
-  }
-  if (!Number.isSafeInteger(request.queue_version) || request.queue_version < 1) {
-    return { classification: 'queued', reason: 'invalid-queue-version' };
-  }
-  if (request.target.supervisor_id !== supervisor.supervisor_id
-      || request.target.supervisor_generation !== supervisor.generation) {
-    return { classification: 'stale-generation', reason: 'wake-target-does-not-match-current-supervisor' };
-  }
-  if (binding && (binding.supervisor_id !== request.target.supervisor_id
-      || binding.supervisor_generation !== request.target.supervisor_generation)) {
-    return { classification: 'stale-generation', reason: 'wake-host-binding-generation-mismatch' };
-  }
-  if (dispatcher && (dispatcher.supervisor_id !== supervisor.supervisor_id
-      || dispatcher.supervisor_generation !== supervisor.generation)) {
-    return { classification: 'stale-generation', reason: 'dispatcher-supervisor-generation-mismatch' };
-  }
-  const nativeResume = request.schema === NATIVE_WAKE_REQUEST_SCHEMA;
-  if (!nativeResume && busy) {
-    return { classification: 'busy', reason: 'active-delivery-or-supervisor-busy-marker' };
-  }
-  if (binding && evidence?.host_kind && evidence.host_kind !== binding.host) {
-    return { classification: 'unavailable', reason: 'stale-or-mismatched-host-adapter' };
-  }
-  if (binding?.authority === 'candidate-only' || evidence?.delivery_authorized === false) {
-    return {
-      classification: 'candidate-only',
-      reason: evidence?.reason ?? 'host-adapter-does-not-authorize-prompt-delivery',
-    };
-  }
-  if (!evidence?.available || !evidence.session_alive || evidence.pane_dead) {
-    return { classification: 'unavailable', reason: evidence?.reason ?? 'tmux-unavailable' };
-  }
-  if (nativeResume) {
-    return {
-      classification: 'native-ready',
-      reason: 'plain-codex-resume-does-not-require-idle-supervisor',
-    };
-  }
-  if (evidence.attached_clients?.length) {
-    return { classification: 'human-interacting', reason: 'tmux-client-attached' };
-  }
-  const tmuxSession = binding?.host === 'tmux' ? binding.session_id : request.target.tmux_session;
-  if (tmuxSession !== evidence.session_name
-      || typeof evidence.pane_id !== 'string'
-      || !Number.isSafeInteger(evidence.pane_pid)) {
-    return { classification: 'unavailable', reason: 'tmux-session-or-pane-identity-mismatch' };
-  }
-  if (!evidence.codex_process) {
-    return { classification: 'unavailable', reason: 'authoritative-codex-process-unavailable' };
-  }
-  if (evidence.prompt_state === 'busy') {
-    return { classification: 'busy', reason: evidence.reason ?? 'codex-busy' };
-  }
-  if (evidence.prompt_state === 'human-composer' || evidence.composer_text) {
-    return { classification: 'human-interacting', reason: 'nonempty-human-composer' };
-  }
-  if (evidence.prompt_state !== 'idle'
-      || evidence.prompt_idle !== true
-      || evidence.composer_empty !== true
-      || evidence.composer_text !== ''
-      || !/^[a-f0-9]{64}$/.test(evidence.capture_sha256 ?? '')) {
-    return { classification: 'ambiguous-composer', reason: evidence.reason ?? 'empty-codex-composer-not-directly-observed' };
-  }
-  return { classification: 'prompt-idle', reason: 'current-generation-live-codex-empty-composer-and-idle-prompt' };
-}
-
 function readOptional(path) {
   return existsSync(path) ? readJson(path) : null;
 }
@@ -1549,7 +1395,7 @@ export function plainCodexResumeTransport({
   };
 }
 
-function validateDeliveryFence(root, eventId, expected, dispatcher, activationOwner = null) {
+function validateDeliveryFence(root, eventId, expected, activationOwner = null) {
   const request = readJson(requestPath(root, eventId));
   const supervisor = readJson(paths(root).supervisor);
   if (supervisor.repository !== root
@@ -1581,11 +1427,7 @@ function validateDeliveryFence(root, eventId, expected, dispatcher, activationOw
       return { current: false, reason: 'session-binding-revision-changed' };
     }
   }
-  const dispatcherDecision = dispatcherFence(root, dispatcher);
-  if (!dispatcherDecision.current) {
-    return { current: false, reason: 'dispatcher-fence-no-longer-current' };
-  }
-  if (activationOwner && !activationOwnerCurrent(activationOwner)) {
+  if (!activationOwnerCurrent(activationOwner)) {
     return { current: false, reason: 'opsled-owner-fence-no-longer-current' };
   }
   return { current: true, request, supervisor };
@@ -1600,18 +1442,7 @@ function commitDeliveredReceipt(root, request, receipt) {
   const decision = readJson(activationDecisionPath(root, request.event_id));
   let bindingValid = true;
   try { validateSessionBindingShape(binding); } catch { bindingValid = false; }
-  const dispatcherCurrent = receipt.dispatcher_id == null || dispatcherFence(root, {
-    schema: DISPATCHER_SCHEMA,
-    dispatcher_id: receipt.dispatcher_id,
-    dispatcher_generation: receipt.dispatcher_generation,
-    implementation_sha256: receipt.dispatcher_implementation_sha256,
-    release_fence: receipt.dispatcher_release_fence,
-    supervisor_id: receipt.supervisor_id,
-    supervisor_generation: receipt.supervisor_generation,
-    process: receipt.dispatcher_process,
-  }).current;
-  const wakeOwnerCurrent = receipt.wake_owner == null
-    || activationOwnerCurrent(receipt.wake_owner);
+  const wakeOwnerCurrent = activationOwnerCurrent(receipt.wake_owner);
   if (supervisor.repository !== root
       || request.target?.repository !== supervisor.repository
       || receipt.repository !== supervisor.repository
@@ -1622,8 +1453,7 @@ function commitDeliveredReceipt(root, request, receipt) {
       || request.target.supervisor_generation !== supervisor.generation
       || receipt.supervisor_id !== supervisor.supervisor_id
       || receipt.supervisor_generation !== supervisor.generation
-      || receipt.dispatcher_implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
-      || !dispatcherCurrent
+      || receipt.wake_worker_implementation_sha256 !== WAKE_WORKER_IMPLEMENTATION_SHA256
       || !wakeOwnerCurrent
       || !bindingValid
       || binding.repository_realpath !== realpathSync(root)
@@ -1738,11 +1568,6 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
   const binding = readJson(wake.sessionBinding);
   const decision = readJson(activationDecisionPath(repositoryRoot, evidence.event_id));
   const lease = readJson(wake.activationLease);
-  const expectedDispatcher = evidence.dispatcher ? {
-    ...evidence.dispatcher,
-    supervisor_id: evidence.supervisor?.supervisor_id,
-    supervisor_generation: evidence.supervisor?.generation,
-  } : null;
   const message = evidence.canonical_argv?.[3];
   const baselineOrdinal = evidence.transport?.baseline_ordinal;
   const currentConfirmation = exactRolloutConfirmation(confirmation);
@@ -1760,7 +1585,7 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
     requestSha256: evidence.request?.sha256,
     supervisorId: evidence.supervisor?.supervisor_id,
     supervisorGeneration: evidence.supervisor?.generation,
-  }, expectedDispatcher, evidence.wake_owner ?? null);
+  }, evidence.wake_owner ?? null);
   const fencesCurrent = deliveryFence.current
     && Number.isFinite(nowMs)
     && decisionFenceCurrent(repositoryRoot, lease, { nowMs })
@@ -1769,13 +1594,8 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
     && evidence.request?.queue_version === request.queue_version
     && evidence.supervisor?.supervisor_id === supervisor.supervisor_id
     && evidence.supervisor?.generation === supervisor.generation
-    && ((expectedDispatcher
-      && evidence.dispatcher?.dispatcher_id === lease.owner?.dispatcher_id
-      && evidence.dispatcher?.dispatcher_generation === lease.owner?.dispatcher_generation
-      && sameProcess(evidence.dispatcher?.process, lease.owner?.process))
-      || (!expectedDispatcher
-        && sameActivationOwner(evidence.wake_owner, lease.owner)
-        && activationOwnerCurrent(lease.owner)))
+    && sameActivationOwner(evidence.wake_owner, lease.owner)
+    && activationOwnerCurrent(lease.owner)
     && evidence.activation?.lease_id === lease.lease_id
     && evidence.activation?.fencing_token === lease.fencing_token
     && decision.status === 'CLAIMED'
@@ -1815,12 +1635,8 @@ export function commitConfirmedWakeReceipt(root, evidencePath, confirmation, {
     queue_version: request.queue_version,
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
-    dispatcher_id: evidence.dispatcher?.dispatcher_id ?? null,
-    dispatcher_generation: evidence.dispatcher?.dispatcher_generation ?? null,
-    dispatcher_implementation_sha256: evidence.dispatcher?.implementation_sha256
-      ?? WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-    dispatcher_release_fence: evidence.dispatcher?.release_fence ?? null,
-    dispatcher_process: evidence.dispatcher?.process ?? evidence.wake_owner?.process ?? null,
+    wake_worker_implementation_sha256: WAKE_WORKER_IMPLEMENTATION_SHA256,
+    wake_worker_process: evidence.wake_owner?.process ?? null,
     wake_owner: evidence.wake_owner ?? null,
     activation_lease_id: lease.lease_id,
     activation_fencing_token: lease.fencing_token,
@@ -1964,7 +1780,7 @@ function transportCleanupEvidenceComplete(cleanup) {
     && cleanup.authoritative_host_continuity_proven === true;
 }
 
-function reconcileLateConfirmation(root, request, deliveryFence, bindingStatus, dispatcher) {
+function reconcileLateConfirmation(root, request, deliveryFence, bindingStatus, activationOwner) {
   const decisionPath = activationDecisionPath(root, request.event_id);
   const decision = readOptional(decisionPath);
   if (!['CLAIMED', 'UNCERTAIN', 'DELIVERED'].includes(decision?.status)
@@ -1987,14 +1803,11 @@ function reconcileLateConfirmation(root, request, deliveryFence, bindingStatus, 
       || evidence.session?.rollout?.device !== binding.rollout.device
       || evidence.session?.rollout?.inode !== binding.rollout.inode
       || !transportCleanupEvidenceComplete(evidence.cleanup)) return null;
-  if (!dispatcher
-      || evidence.dispatcher?.dispatcher_id !== dispatcher.dispatcher_id
-      || evidence.dispatcher?.dispatcher_generation !== dispatcher.dispatcher_generation
-      || !sameProcess(evidence.dispatcher?.process, dispatcher.process)
-      || !dispatcherFence(root, dispatcher).current) {
+  if (!sameActivationOwner(evidence.wake_owner, activationOwner)
+      || !activationOwnerCurrent(activationOwner)) {
     return {
       classification: 'stale-generation',
-      reason: 'late-confirmation-dispatcher-fence-not-current',
+      reason: 'late-confirmation-opsled-owner-fence-not-current',
       delivered: false,
       replayed: false,
     };
@@ -2036,7 +1849,7 @@ function reconcileLateConfirmation(root, request, deliveryFence, bindingStatus, 
     root,
     request.event_id,
     deliveryFence,
-    dispatcher,
+    activationOwner,
   );
   if (!currentFence.current) {
     return {
@@ -2096,11 +1909,9 @@ function reconcileLateConfirmation(root, request, deliveryFence, bindingStatus, 
     queue_version: request.queue_version,
     supervisor_id: binding.supervisor_id,
     supervisor_generation: binding.supervisor_generation,
-    dispatcher_id: evidence.dispatcher.dispatcher_id,
-    dispatcher_generation: evidence.dispatcher.dispatcher_generation,
-    dispatcher_implementation_sha256: evidence.dispatcher.implementation_sha256,
-    dispatcher_release_fence: evidence.dispatcher.release_fence,
-    dispatcher_process: evidence.dispatcher.process,
+    wake_worker_implementation_sha256: WAKE_WORKER_IMPLEMENTATION_SHA256,
+    wake_worker_process: evidence.wake_owner.process,
+    wake_owner: evidence.wake_owner,
     activation_lease_id: evidence.activation.lease_id,
     activation_fencing_token: evidence.activation.fencing_token,
     activation_decision_id: evidence.activation.decision_id,
@@ -2146,7 +1957,6 @@ function reconcileLateConfirmation(root, request, deliveryFence, bindingStatus, 
 export function deliverWake(root, eventId, {
   nativeTransport = null,
   bindingDependencies = {},
-  dispatcher = null,
   activationOwner = null,
   expectedQueueVersion = null,
   getActivationNowMs = Date.now,
@@ -2154,16 +1964,6 @@ export function deliverWake(root, eventId, {
   const wake = directories(root);
   const request = readJson(requestPath(root, eventId));
   const queueVersion = expectedQueueVersion ?? request.queue_version;
-  if (dispatcher && !dispatcherFence(root, dispatcher).current) {
-    const decision = readOptional(activationDecisionPath(root, eventId));
-    return {
-      classification: 'stale-generation',
-      reason: decision?.status === 'UNCERTAIN'
-        ? 'late-confirmation-dispatcher-fence-not-current'
-        : 'dispatcher-fence-no-longer-current',
-      delivered: false,
-    };
-  }
   const existingPath = receiptPath(root, eventId);
   if (existsSync(existingPath)) {
     let existing;
@@ -2182,8 +1982,7 @@ export function deliverWake(root, eventId, {
   }
   const refreshOptions = {
     dependencies: bindingDependencies,
-    allowEnvironmentMismatch: Boolean(dispatcher)
-      || ['opsled', 'opsled-wake-worker'].includes(activationOwner?.kind),
+    allowEnvironmentMismatch: ['opsled', 'opsled-wake-worker'].includes(activationOwner?.kind),
   };
   const bindingStatus = refreshCodexSessionBinding(root, refreshOptions);
   const deliveryFence = {
@@ -2199,7 +1998,7 @@ export function deliverWake(root, eventId, {
       request,
       deliveryFence,
       bindingStatus,
-      dispatcher,
+      activationOwner,
     );
     if (reconciled) return reconciled;
   }
@@ -2247,22 +2046,16 @@ export function deliverWake(root, eventId, {
       delivered: false,
     };
   }
-  const currentDispatcher = dispatcher ? dispatcherFence(root, dispatcher) : { current: true };
-  if (!currentDispatcher.current) {
-    return { classification: 'stale-generation', reason: 'dispatcher-fence-no-longer-current', delivered: false };
-  }
   const fence = validateDeliveryFence(
     root,
     eventId,
     deliveryFence,
-    dispatcher,
     activationOwner,
   );
   if (!fence.current) {
     return { classification: 'stale-generation', reason: fence.reason, event_id: eventId, delivered: false };
   }
   const leaseResult = acquireActivationLease(root, eventId, {
-    dispatcher,
     activationOwner,
     nowMs: getActivationNowMs(),
   });
@@ -2313,12 +2106,8 @@ export function deliverWake(root, eventId, {
     queue_version: queueVersion,
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
-    dispatcher_id: dispatcher?.dispatcher_id ?? null,
-    dispatcher_generation: dispatcher?.dispatcher_generation ?? null,
-    dispatcher_implementation_sha256: dispatcher?.implementation_sha256
-      ?? WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-    dispatcher_release_fence: dispatcher?.release_fence ?? null,
-    dispatcher_process: dispatcher?.process ?? lease.owner.process,
+    wake_worker_implementation_sha256: WAKE_WORKER_IMPLEMENTATION_SHA256,
+    wake_worker_process: lease.owner.process,
     wake_owner: activationOwner ? structuredClone(activationOwner) : null,
     activation_lease_id: lease.lease_id,
     activation_fencing_token: lease.fencing_token,
@@ -2352,15 +2141,6 @@ export function deliverWake(root, eventId, {
       wait_id: request.wait_id,
     },
     delivery_id: deliveryId,
-    dispatcher: dispatcher ? {
-      dispatcher_id: dispatcher?.dispatcher_id ?? lease.owner.dispatcher_id,
-      dispatcher_generation: dispatcher?.dispatcher_generation
-        ?? lease.owner.dispatcher_generation,
-      implementation_sha256: dispatcher?.implementation_sha256
-        ?? WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-      release_fence: dispatcher?.release_fence ?? null,
-      process: dispatcher?.process ?? lease.owner.process,
-    } : null,
     wake_owner: activationOwner ? structuredClone(activationOwner) : null,
     supervisor: {
       supervisor_id: supervisor.supervisor_id,
@@ -2402,7 +2182,6 @@ export function deliverWake(root, eventId, {
     root,
     eventId,
     deliveryFence,
-    dispatcher,
     activationOwner,
   );
   const finalLeaseFenceCurrent = decisionFenceCurrent(root, lease, {
@@ -2425,7 +2204,6 @@ export function deliverWake(root, eventId, {
     root,
     eventId,
     deliveryFence,
-    dispatcher,
     activationOwner,
   );
   const preDeliveryBindingReady = preDeliveryBinding.valid
@@ -2602,7 +2380,6 @@ export function deliverWake(root, eventId, {
       root,
       eventId,
       deliveryFence,
-      dispatcher,
       activationOwner,
     );
     const leaseFenceCurrent = decisionFenceCurrent(root, lease, {
@@ -2690,7 +2467,7 @@ export function consumeWakeDelivery(root, eventId, { deliveryId = null, generati
     throw new Error('stale session binding cannot consume wake event');
   }
   if (receipt.queue_version !== request.queue_version
-      || receipt.dispatcher_implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
+      || receipt.wake_worker_implementation_sha256 !== WAKE_WORKER_IMPLEMENTATION_SHA256
       || receipt.codex_session_binding_sha256 !== fileSha256(bindingPath)
       || receipt.codex_session_uuid !== binding.codex_session_uuid
       || receipt.host_kind !== binding.host.kind
@@ -2710,7 +2487,6 @@ export function consumeWakeDelivery(root, eventId, { deliveryId = null, generati
       || decision.message_sha256 !== receipt.message_sha256) {
     throw new Error('wake delivery receipt fence mismatch');
   }
-  const wake = directories(root);
   const consumption = {
     schema: WAKE_CONSUMPTION_SCHEMA,
     consumption_id: `wake-consumption-${sha256(canonicalJson({
@@ -2720,7 +2496,7 @@ export function consumeWakeDelivery(root, eventId, { deliveryId = null, generati
       supervisor_id: supervisor.supervisor_id,
       supervisor_generation: supervisor.generation,
       codex_session_binding_sha256: receipt.codex_session_binding_sha256,
-      dispatcher_implementation_sha256: receipt.dispatcher_implementation_sha256,
+      wake_worker_implementation_sha256: receipt.wake_worker_implementation_sha256,
       delivery_receipt_fence_sha256: deliveryReceiptFence(receipt),
     }))}`,
     event_id: eventId,
@@ -2731,7 +2507,7 @@ export function consumeWakeDelivery(root, eventId, { deliveryId = null, generati
     supervisor_id: supervisor.supervisor_id,
     supervisor_generation: supervisor.generation,
     codex_session_binding_sha256: receipt.codex_session_binding_sha256,
-    dispatcher_implementation_sha256: receipt.dispatcher_implementation_sha256,
+    wake_worker_implementation_sha256: receipt.wake_worker_implementation_sha256,
     request_sha256: fileSha256(exactRequestPath),
     delivery_receipt_fence_sha256: deliveryReceiptFence(receipt),
     consumed_at: now(),
@@ -2746,13 +2522,11 @@ export function consumeWakeDelivery(root, eventId, { deliveryId = null, generati
       || durable.supervisor_id !== supervisor.supervisor_id
       || durable.supervisor_generation !== supervisor.generation
       || durable.codex_session_binding_sha256 !== receipt.codex_session_binding_sha256
-      || durable.dispatcher_implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
+      || durable.wake_worker_implementation_sha256 !== WAKE_WORKER_IMPLEMENTATION_SHA256
       || durable.request_sha256 !== consumption.request_sha256
       || durable.delivery_receipt_fence_sha256 !== consumption.delivery_receipt_fence_sha256) {
     throw new Error('wake consumption evidence fence mismatch');
   }
-  const busy = readOptional(wake.busy);
-  if (busy?.delivery_id === receipt.delivery_id) removeIfPresent(wake.busy);
   return { duplicate: !created, receipt, consumption: durable };
 }
 
@@ -2773,7 +2547,13 @@ export function wakeDeliveryConsumptionStatus(root, eventId) {
     && consumption.supervisor_id === receipt.supervisor_id
     && consumption.supervisor_generation === receipt.supervisor_generation
     && consumption.codex_session_binding_sha256 === receipt.codex_session_binding_sha256
-    && consumption.dispatcher_implementation_sha256 === receipt.dispatcher_implementation_sha256
+    && (
+      consumption.wake_worker_implementation_sha256 === receipt.wake_worker_implementation_sha256
+      || (
+        receipt.wake_worker_implementation_sha256 == null
+        && consumption.dispatcher_implementation_sha256 === receipt.dispatcher_implementation_sha256
+      )
+    )
     && request
     && consumption.task_id === request.task_id
     && consumption.attempt_id === request.attempt_id
@@ -2796,18 +2576,9 @@ export function unconsumedDeliveredWakes(root, taskId, attemptId) {
 
 export function wakeQueueStatus(root, {
   bindingDependencies = {},
-  getProcessIdentity = processIdentity,
 } = {}) {
   const wake = directories(root);
   const supervisor = readJson(paths(root).supervisor);
-  const busy = readOptional(wake.busy);
-  const dispatcher = readOptional(wake.dispatcher);
-  const dispatcherCurrent = dispatcherIsCurrent(dispatcher, supervisor, getProcessIdentity);
-  const implementationFence = {
-    expected_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-    observed_sha256: dispatcher?.implementation_sha256 ?? null,
-    current: dispatcher?.implementation_sha256 === WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-  };
   const bindingStatus = refreshCodexSessionBinding(root, { dependencies: bindingDependencies });
   const requests = readdirSync(wake.requests).filter((name) => name.endsWith('.json')).sort().map((name) => {
     const request = readJson(join(wake.requests, name));
@@ -2864,436 +2635,7 @@ export function wakeQueueStatus(root, {
   });
   return {
     supervisor_generation: supervisor.generation,
-    dispatcher: dispatcher ? {
-      ...dispatcher,
-      current: dispatcherCurrent,
-      implementation_fence: implementationFence,
-    } : null,
     session_binding: bindingStatus,
-    busy,
     requests,
   };
-}
-
-export function adoptQueuedWakes(root) {
-  // Wake requests are immutable historical evidence. Generation advancement
-  // makes old requests obsolete; it never rewrites or adopts their bytes.
-  directories(root);
-  return [];
-}
-
-export function drainWakeQueue(root, options = {}) {
-  const wake = directories(root);
-  return readdirSync(wake.requests).filter((name) => name.endsWith('.json')).sort()
-    .map((name) => {
-      const request = readJson(join(wake.requests, name));
-      return deliverWake(root, request.event_id, {
-        ...options,
-        expectedQueueVersion: request.queue_version,
-      });
-    });
-}
-
-function dispatcherIsCurrent(
-  record,
-  supervisor,
-  getProcessIdentity,
-  statuses = ['LAUNCHED', 'OWNED'],
-  implementationSha256 = WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-) {
-  const releaseCurrent = record?.release_fence == null
-    ? record?.implementation_sha256 === implementationSha256
-    : (() => {
-      try {
-        assertReleaseFence(record.release_fence, {
-          role: 'wake-delivery',
-          processIdentity: getProcessIdentity(record.process?.pid),
-        });
-        return true;
-      } catch { return false; }
-    })();
-  return record?.schema === DISPATCHER_SCHEMA
-    && statuses.includes(record.status)
-    && record.implementation_sha256 === implementationSha256
-    && releaseCurrent
-    && record.supervisor_id === supervisor.supervisor_id
-    && record.supervisor_generation === supervisor.generation
-    && sameProcess(record.process, getProcessIdentity(record.process?.pid));
-}
-
-function acquireDispatcherLaunchLock(path, getProcessIdentity) {
-  const attempt = () => {
-    const owner = processIdentity(process.pid);
-    if (atomicCreateJson(path, { owner, acquired_at: now() })) return true;
-    let lock = null;
-    try { lock = readJson(path); } catch { return false; }
-    if (lock.owner && !sameProcess(lock.owner, getProcessIdentity(lock.owner.pid))) {
-      removeIfPresent(path);
-      return attempt();
-    }
-    return false;
-  };
-  return attempt();
-}
-
-export function ensureWakeDispatcher(root, {
-  spawnProcess = spawn,
-  getProcessIdentity = processIdentity,
-  dispatcherScript = DEFAULT_DISPATCHER_SCRIPT,
-  implementationSha256 = WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
-} = {}) {
-  const wake = directories(root);
-  const supervisor = readJson(paths(root).supervisor);
-  let existing = readOptional(wake.dispatcher);
-  if (dispatcherIsCurrent(
-    existing,
-    supervisor,
-    getProcessIdentity,
-    undefined,
-    implementationSha256,
-  )) {
-    return { started: false, reason: 'current-dispatcher-already-live', dispatcher: existing };
-  }
-  const lock = acquireDispatcherLaunchLock(wake.dispatcherLock, getProcessIdentity);
-  if (!lock) {
-    return { started: false, reason: 'dispatcher-launch-already-in-progress', dispatcher: existing };
-  }
-  try {
-    existing = readOptional(wake.dispatcher);
-    if (dispatcherIsCurrent(
-      existing,
-      supervisor,
-      getProcessIdentity,
-      undefined,
-      implementationSha256,
-    )) {
-      return { started: false, reason: 'current-dispatcher-already-live', dispatcher: existing };
-    }
-    const record = {
-      schema: DISPATCHER_SCHEMA,
-      dispatcher_id: id('wake-dispatcher'),
-      dispatcher_generation: (Number(existing?.dispatcher_generation) || 0) + 1,
-      implementation_sha256: implementationSha256,
-      expected_release: releaseIdentity('wake-delivery'),
-      release_fence: null,
-      supervisor_id: supervisor.supervisor_id,
-      supervisor_generation: supervisor.generation,
-      queue_generation: supervisor.generation,
-      launch_nonce: id('wake-dispatcher-launch'),
-      process: null,
-      status: 'LAUNCHING',
-      launched_at: now(),
-      owned_at: null,
-      last_observed_at: null,
-      last_result: null,
-      failure: null,
-    };
-    writeJson(wake.dispatcher, record);
-    try {
-      const child = spawnProcess(process.execPath, [
-        dispatcherScript,
-        '--root', root,
-        '--dispatcher', record.dispatcher_id,
-        '--dispatcher-generation', String(record.dispatcher_generation),
-        '--launch-nonce', record.launch_nonce,
-      ], { cwd: root, detached: true, stdio: 'ignore' });
-      if (!Number.isSafeInteger(child.pid)) throw new Error('dispatcher did not receive a process ID');
-      record.process = getProcessIdentity(child.pid);
-      if (!record.process) throw new Error('dispatcher process-start identity was unavailable');
-      record.release_fence = createReleaseFence('wake-delivery', record.process);
-      record.status = 'LAUNCHED';
-      writeJson(wake.dispatcher, record);
-      child.unref?.();
-      emit(root, 'HOST_WAKE_DISPATCHER_LAUNCHED', {
-        dispatcher_id: record.dispatcher_id,
-        dispatcher_generation: record.dispatcher_generation,
-        dispatcher_pid: record.process.pid,
-        dispatcher_start_time_ticks: record.process.start_time_ticks,
-        target_supervisor_generation: record.supervisor_generation,
-      });
-      return { started: true, reason: 'dispatcher-launched', dispatcher: record };
-    } catch (error) {
-      record.status = 'FAILED';
-      record.failure = error.message;
-      writeJson(wake.dispatcher, record);
-      return { started: false, reason: 'dispatcher-launch-failed', dispatcher: record };
-    }
-  } finally {
-    removeIfPresent(wake.dispatcherLock);
-  }
-}
-
-export function registerWakeObservation(root, { watchFactory = watch } = {}) {
-  const wake = directories(root);
-  const watchers = [];
-  let settled = false;
-  let resolveSignal;
-  const signal = new Promise((resolve) => { resolveSignal = resolve; });
-  const finish = (value) => {
-    if (settled) return;
-    settled = true;
-    for (const watcher of watchers.splice(0)) watcher.close();
-    resolveSignal(value);
-  };
-  const binding = readOptional(wake.sessionBinding);
-  const observedDirectories = [...new Set([
-    wake.base,
-    wake.requests,
-    binding?.rollout?.realpath ? dirname(binding.rollout.realpath) : null,
-  ].filter(Boolean))];
-  for (const directory of observedDirectories) {
-    if (settled) break;
-    try {
-      const watcher = watchFactory(directory, () => finish({ type: 'filesystem-event', directory }));
-      watcher.on?.('error', (error) => finish({ type: 'watch-error', error: error.message }));
-      if (settled) watcher.close();
-      else watchers.push(watcher);
-    } catch (error) {
-      finish({ type: 'watch-error', error: error.message });
-    }
-  }
-  return {
-    wait: () => signal,
-    close: () => finish({ type: 'observation-closed' }),
-  };
-}
-
-function boundRolloutState(root, { statFile = statSync } = {}) {
-  const binding = readOptional(directories(root).sessionBinding);
-  if (typeof binding?.rollout?.realpath !== 'string') return null;
-  try {
-    const stats = statFile(binding.rollout.realpath);
-    return {
-      path: binding.rollout.realpath,
-      device: stats.dev,
-      inode: stats.ino,
-      size_bytes: stats.size,
-    };
-  } catch {
-    return null;
-  }
-}
-
-export function registerBoundRolloutOpportunity(root, baseline, {
-  watchFactory = watch,
-  state = boundRolloutState,
-} = {}) {
-  let settled = false;
-  let watcher;
-  let resolveSignal;
-  const signal = new Promise((resolve) => { resolveSignal = resolve; });
-  const finish = (value) => {
-    if (settled) return;
-    settled = true;
-    watcher?.close();
-    resolveSignal(value);
-  };
-  const inspect = () => {
-    const current = state(root);
-    if (current
-        && current.path === baseline?.path
-        && current.device === baseline.device
-        && current.inode === baseline.inode
-        && current.size_bytes > baseline.size_bytes) {
-      finish({
-        type: 'bound-rollout-state-change',
-        path: current.path,
-        previous_size_bytes: baseline.size_bytes,
-        size_bytes: current.size_bytes,
-      });
-    }
-  };
-  if (!baseline) {
-    finish({ type: 'bound-rollout-unavailable' });
-  } else {
-    try {
-      watcher = watchFactory(dirname(baseline.path), (_event, filename) => {
-        if (filename == null || String(filename) === baseline.path.split('/').at(-1)) inspect();
-      });
-      watcher.on?.('error', (error) => finish({ type: 'watch-error', error: error.message }));
-      if (settled) watcher.close();
-      // Close the baseline-to-subscription race, including a change made by
-      // watchFactory while the watcher is being registered.
-      else inspect();
-    } catch (error) {
-      finish({ type: 'watch-error', error: error.message });
-    }
-  }
-  return {
-    wait: () => signal,
-    close: () => finish({ type: 'observation-closed' }),
-  };
-}
-
-export function waitForWakeSignal(root, options = {}) {
-  const observation = registerWakeObservation(root, options);
-  return observation.wait().finally(() => observation.close());
-}
-
-function receiptFreeRequests(root) {
-  const wake = directories(root);
-  return readdirSync(wake.requests).filter((name) => name.endsWith('.json')).sort()
-    .map((name) => readJson(join(wake.requests, name)))
-    .filter((request) => !existsSync(receiptPath(root, request.event_id)));
-}
-
-export async function runWakeDispatcher(root, {
-  dispatcherId,
-  dispatcherGeneration,
-  launchNonce,
-  pid = process.pid,
-  nativeTransport = null,
-  bindingDependencies = {},
-  getProcessIdentity = processIdentity,
-  registerObservation = registerWakeObservation,
-  observeBoundRollout = registerBoundRolloutOpportunity,
-  readBoundRolloutState = boundRolloutState,
-  delay = sleep,
-  handshakeTimeoutMs = 5000,
-  maxCycles = Number.POSITIVE_INFINITY,
-} = {}) {
-  const wake = directories(root);
-  const processRecord = getProcessIdentity(pid);
-  if (!processRecord) throw new Error('dispatcher cannot establish its process-start identity');
-  let record;
-  const handshakeDeadline = Date.now() + handshakeTimeoutMs;
-  while (Date.now() <= handshakeDeadline) {
-    record = readJson(wake.dispatcher);
-    if (record.dispatcher_id !== dispatcherId
-        || record.dispatcher_generation !== dispatcherGeneration
-        || record.launch_nonce !== launchNonce) {
-      return { status: 'STALE', reason: 'dispatcher-launch-fence-mismatch' };
-    }
-    if (sameProcess(record.process, processRecord)) break;
-    await delay(10);
-  }
-  const supervisor = readJson(paths(root).supervisor);
-  try {
-    assertReleaseFence(record.release_fence, {
-      role: 'wake-delivery',
-      processIdentity: processRecord,
-    });
-  } catch {
-    return { status: 'STALE', reason: 'dispatcher-runtime-release-fence-mismatch' };
-  }
-  if (record.schema !== DISPATCHER_SCHEMA
-      || record.status !== 'LAUNCHED'
-      || record.implementation_sha256 !== WAKE_DISPATCHER_IMPLEMENTATION_SHA256
-      || record.dispatcher_id !== dispatcherId
-      || record.dispatcher_generation !== dispatcherGeneration
-      || record.launch_nonce !== launchNonce
-      || !sameProcess(record.process, processRecord)
-      || record.supervisor_id !== supervisor.supervisor_id
-      || record.supervisor_generation !== supervisor.generation) {
-    return { status: 'STALE', reason: 'dispatcher-launch-fence-mismatch' };
-  }
-  record.status = 'OWNED';
-  record.owned_at = now();
-  writeJson(wake.dispatcher, record);
-  emit(root, 'HOST_WAKE_DISPATCHER_OWNED', {
-    dispatcher_id: record.dispatcher_id,
-    dispatcher_generation: record.dispatcher_generation,
-    dispatcher_pid: record.process.pid,
-    dispatcher_start_time_ticks: record.process.start_time_ticks,
-    supervisor_generation: record.supervisor_generation,
-  });
-
-  for (let cycle = 0; cycle < maxCycles; cycle += 1) {
-    let current;
-    try { current = readJson(wake.dispatcher); } catch {
-      return { status: 'RETIRED', reason: 'dispatcher-state-unavailable' };
-    }
-    const currentSupervisor = readJson(paths(root).supervisor);
-    if (!dispatcherIsCurrent(current, currentSupervisor, getProcessIdentity, ['OWNED'])
-        || !sameDispatcher(current, record)) {
-      return { status: 'RETIRED', reason: 'dispatcher-superseded-or-generation-changed' };
-    }
-    // Establish observation before the receipt-free scan. An event created
-    // after registration is either present in this scan or wakes the already
-    // registered observation, so there is no queue-check/subscription gap.
-    const observation = registerObservation(root);
-    let queued;
-    try {
-      queued = receiptFreeRequests(root);
-    } catch (error) {
-      observation.close();
-      throw error;
-    }
-    if (queued.length === 0) {
-      current.last_observed_at = now();
-      current.last_result = { classification: 'idle', queued: 0 };
-      writeJson(wake.dispatcher, current);
-      if (cycle + 1 >= maxCycles) {
-        observation.close();
-        return { status: 'OWNED', reason: 'test-cycle-limit', results: [] };
-      }
-      try { await observation.wait(); } finally { observation.close(); }
-      continue;
-    }
-    // Capture the exact bound-rollout state while the pre-scan observation is
-    // still open, then subscribe before delivery. The watcher's immediate
-    // check closes the baseline-to-subscription race without observing Opsle's
-    // own wake-file writes.
-    const rolloutBaseline = readBoundRolloutState(root);
-    const opportunity = observeBoundRollout(root, rolloutBaseline);
-    observation.close();
-    const results = queued.map((request) => deliverWake(root, request.event_id, {
-      nativeTransport,
-      bindingDependencies,
-      dispatcher: record,
-      expectedQueueVersion: request.queue_version,
-    }));
-    current.last_observed_at = now();
-    current.last_result = {
-      classification: 'drain',
-      queued: queued.length,
-      results: results.map((result) => ({
-        event_id: result.event_id ?? result.receipt?.event_id ?? null,
-        classification: result.classification,
-        reason: result.reason,
-        delivered: result.delivered === true,
-      })),
-    };
-    if (sameDispatcher(readOptional(wake.dispatcher), current)) writeJson(wake.dispatcher, current);
-    if (results.some((result) => result.classification === 'stale-generation')) {
-      opportunity.close();
-      return { status: 'RETIRED', reason: 'dispatcher-delivery-fence-changed', results };
-    }
-    if (cycle + 1 >= maxCycles) {
-      opportunity.close();
-      return { status: 'OWNED', reason: 'test-cycle-limit', results };
-    }
-    if (results.some((result) => result.delivered)) {
-      opportunity.close();
-      continue;
-    }
-    if (results.some((result) => (
-      result.classification === 'uncertain'
-      || result.reason?.includes('uncertain')
-    ))) {
-      let signal;
-      try { signal = await opportunity.wait(); } finally { opportunity.close(); }
-      if (signal.type !== 'bound-rollout-state-change') {
-        return { status: 'OWNED', reason: 'late-confirmation-observation-unavailable', results };
-      }
-      continue;
-    }
-    opportunity.close();
-    // Replace observation before rescanning so a request created during the
-    // drain is either found now or signals the already registered watcher.
-    const nextObservation = registerObservation(root);
-    let nextQueued;
-    try {
-      nextQueued = receiptFreeRequests(root);
-    } catch (error) {
-      nextObservation.close();
-      throw error;
-    }
-    if (nextQueued.length > 0) {
-      nextObservation.close();
-      continue;
-    }
-    try { await nextObservation.wait(); } finally { nextObservation.close(); }
-  }
-  return { status: 'OWNED', reason: 'dispatcher-loop-ended' };
 }

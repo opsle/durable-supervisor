@@ -35,7 +35,7 @@ import {
   validateContextPacketMeasurement,
 } from '../src/runner.js';
 import { profileCodexActivations } from '../src/activation-telemetry.js';
-import { WAKE_DISPATCHER_IMPLEMENTATION_SHA256 } from '../src/wakeup.js';
+import { WAKE_WORKER_IMPLEMENTATION_SHA256 } from '../src/wakeup.js';
 
 const sourceRoot = resolve(new URL('..', import.meta.url).pathname);
 const cliPath = join(sourceRoot, 'bin', 'opsle.js');
@@ -372,7 +372,6 @@ test('task evaluation fails closed until its delivered terminal wake is explicit
           tty: '/dev/pts/7', command_line_sha256: 'c'.repeat(64),
         },
       },
-      authority_fence: { legacy_tmux_session: null },
       native_wake: {
         supported: true, transport: 'plain-codex-resume',
         confirmation: 'bound-rollout-exact-message-and-turn-began', reason: null,
@@ -416,9 +415,7 @@ test('task evaluation fails closed until its delivered terminal wake is explicit
       queue_version: 1,
       supervisor_id: supervisor.supervisor_id,
       supervisor_generation: supervisor.generation,
-      dispatcher_id: null,
-      dispatcher_generation: null,
-      dispatcher_implementation_sha256: WAKE_DISPATCHER_IMPLEMENTATION_SHA256,
+      wake_worker_implementation_sha256: WAKE_WORKER_IMPLEMENTATION_SHA256,
       activation_lease_id: activation.lease_id,
       activation_fencing_token: activation.fencing_token,
       activation_decision_id: activation.decision_id,
@@ -701,7 +698,7 @@ test('operator status commands separate concise, verbose, and JSON output', asyn
     assert.equal(verbose.code, 0, verbose.stderr);
     assert.match(verbose.stdout, /SUPERVISOR DIAGNOSTICS/);
     assert.match(verbose.stdout, new RegExp(`Repository: ${root.replaceAll('/', '\\/')}`));
-    assert.match(verbose.stdout, /Tmux fallback: .*unavailable/);
+    assert.doesNotMatch(verbose.stdout, /tmux/i);
 
     const structured = await runCli(root, ['status', '--json']);
     assert.equal(structured.code, 0, structured.stderr);

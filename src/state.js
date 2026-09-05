@@ -354,7 +354,6 @@ export function initialize(root, { actor = 'bootstrap-codex', objectiveText = nu
       node: commandIdentity('node'),
       git: commandIdentity('git'),
       codex: commandIdentity('codex'),
-      tmux: commandIdentity('tmux', ['-V']),
     },
     inspected_at: now(),
     actor,
