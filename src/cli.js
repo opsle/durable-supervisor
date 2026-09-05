@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   appendEvent,
+  atomicCompareAndSwapJson,
   atomicCreateJson,
   canonicalJson,
   fileSha256,
@@ -19,6 +20,7 @@ import {
   sha256,
   writeJson,
 } from './io.js';
+import { acquireHostLock } from './host-lock.js';
 import {
   NEXT_UNSATISFIED_REQUIREMENT_ACTION,
   REVIEW_MODES,
@@ -823,8 +825,263 @@ export function recover(root, {
   };
 }
 
+function evaluationEventId(decisionId, type) {
+  const digest = sha256(`${decisionId}\0${type}`);
+  return `event-${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
+}
+
+function jsonLines(path) {
+  if (!existsSync(path)) return [];
+  return readFileSync(path, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+}
+
+function reconcileJsonProjection(path, project, boundary) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const current = readJson(path);
+    const projected = project(structuredClone(current));
+    if (canonicalJson(projected) === canonicalJson(current)) return current;
+    const result = atomicCompareAndSwapJson(path, sha256(canonicalJson(current)), projected);
+    if (result.swapped) {
+      boundary?.();
+      return projected;
+    }
+  }
+  throw new Error(`BUSY: evaluation projection did not converge: ${path}`);
+}
+
+function reconcileDecisionLog(path, decision, boundary) {
+  const matches = jsonLines(path).filter((entry) => entry.decision_id === decision.decision_id);
+  if (matches.length > 1) throw new Error(`duplicate supervisor decision projection: ${decision.decision_id}`);
+  if (matches.length === 1) {
+    if (canonicalJson(matches[0]) !== canonicalJson(decision)) {
+      throw new Error(`conflicting supervisor decision projection: ${decision.decision_id}`);
+    }
+    return;
+  }
+  appendEvent(path, decision);
+  boundary?.();
+}
+
+function evaluationEvent(root, decision, type, details) {
+  const supervisor = readJson(paths(root).supervisor);
+  return {
+    schema: 'opsle.durable-supervisor.event/v1',
+    event_id: evaluationEventId(decision.decision_id, type),
+    type,
+    time: decision.time,
+    actor: 'durable-supervisor',
+    supervisor_id: supervisor.supervisor_id,
+    supervisor_generation: decision.supervisor_generation,
+    ...details,
+  };
+}
+
+function eventMatchesProjection(event, expected) {
+  if (typeof event.event_id !== 'string' || typeof event.time !== 'string') return false;
+  return canonicalJson(event) === canonicalJson({
+    ...expected,
+    event_id: event.event_id,
+    time: event.time,
+  });
+}
+
+function reconcileEvaluationEvent(root, expected, afterLog, afterFile) {
+  const p = paths(root);
+  const events = jsonLines(p.eventsLog);
+  const matches = events.filter((entry) => (
+    entry.type === expected.type
+    && entry.decision_id === expected.decision_id
+    && entry.task_id === expected.task_id
+    && entry.attempt_id === expected.attempt_id
+  ));
+  if (matches.length > 1) {
+    throw new Error(`duplicate evaluation event projection: ${expected.type} ${expected.decision_id}`);
+  }
+  const identityConflicts = events.filter((entry) => (
+    entry.event_id === expected.event_id && !matches.includes(entry)
+  ));
+  if (identityConflicts.length > 0) {
+    throw new Error(`conflicting evaluation event identity: ${expected.event_id}`);
+  }
+  let event = matches[0] ?? null;
+  if (event && !eventMatchesProjection(event, expected)) {
+    throw new Error(`conflicting evaluation event projection: ${expected.type} ${expected.decision_id}`);
+  }
+  const deterministicPath = join(p.events, `${expected.event_id}.json`);
+  if (!event && existsSync(deterministicPath)) {
+    event = readJson(deterministicPath);
+    if (canonicalJson(event) !== canonicalJson(expected)) {
+      throw new Error(`conflicting evaluation event file: ${expected.event_id}`);
+    }
+  }
+  event ??= expected;
+  if (!matches.length) {
+    appendEvent(p.eventsLog, event);
+    afterLog?.();
+  }
+  const eventPath = join(p.events, `${event.event_id}.json`);
+  if (existsSync(eventPath)) {
+    if (canonicalJson(readJson(eventPath)) !== canonicalJson(event)) {
+      throw new Error(`conflicting evaluation event file: ${event.event_id}`);
+    }
+  } else {
+    if (!atomicCreateJson(eventPath, event)) {
+      if (canonicalJson(readJson(eventPath)) !== canonicalJson(event)) {
+        throw new Error(`conflicting evaluation event file: ${event.event_id}`);
+      }
+    } else {
+      afterFile?.();
+    }
+  }
+  return event;
+}
+
+function reconcileAcceptedRequirements(root, task, decision, boundary) {
+  if (decision.decision !== 'ACCEPT' || task.requirement_ids.length === 0) return;
+  const p = paths(root);
+  const evidence = decision.evidence_references;
+  reconcileJsonProjection(p.requirements, (matrix) => {
+    for (const requirementId of task.requirement_ids) {
+      const requirement = matrix.requirements.find((entry) => entry.id === requirementId);
+      if (!requirement) throw new Error(`unknown requirement: ${requirementId}`);
+      const laterState = ['VERIFIED', 'DEFERRED_WITH_JUSTIFICATION', 'NOT_APPLICABLE_WITH_JUSTIFICATION']
+        .includes(requirement.state);
+      const wasImplemented = requirement.state === 'IMPLEMENTED';
+      if (!laterState) {
+        requirement.state = 'IMPLEMENTED';
+        requirement.justification = null;
+      }
+      const nextEvidence = [...new Set([...(requirement.evidence ?? []), ...evidence])];
+      const evidenceChanged = canonicalJson(nextEvidence) !== canonicalJson(requirement.evidence ?? []);
+      if (evidenceChanged) {
+        requirement.evidence = nextEvidence;
+      }
+      if (!laterState && (!wasImplemented || evidenceChanged)) {
+        requirement.updated_at = decision.time;
+      }
+    }
+    return matrix;
+  }, boundary);
+}
+
+function reconcileEvaluation(root, taskId, attemptId, decision, afterProjection) {
+  const p = paths(root);
+  const projection = (name) => () => afterProjection?.(name, decision);
+  const lock = acquireHostLock(
+    join(p.attempts, 'supervisor-evaluations', `${attemptId}.projection.lock`),
+    { attempts: 400, retryDelayMs: 5 },
+  );
+  try {
+    const committed = readJson(join(p.attempts, 'supervisor-evaluations', `${attemptId}.json`));
+    if (canonicalJson(committed) !== canonicalJson(decision)) {
+      throw new Error(`immutable supervisor evaluation changed: ${attemptId}`);
+    }
+    reconcileDecisionLog(p.decisionsLog, decision, projection('decision-log'));
+
+    const attempt = reconcileJsonProjection(join(p.attempts, `${attemptId}.json`), (current) => {
+      const expected = {
+        decision_id: decision.decision_id,
+        decision: decision.decision,
+        rationale: decision.rationale,
+        evaluated_at: decision.time,
+      };
+      if (current.supervisor_evaluation
+          && canonicalJson(current.supervisor_evaluation) !== canonicalJson(expected)) {
+        throw new Error(`conflicting attempt evaluation projection: ${attemptId}`);
+      }
+      current.supervisor_evaluation = expected;
+      return current;
+    }, projection('attempt'));
+
+    const terminalTaskState = decision.decision === 'ACCEPT' ? 'ACCEPTED' : 'REJECTED';
+    const task = reconcileJsonProjection(join(p.tasks, `${taskId}.json`), (current) => {
+      if (![terminalTaskState, 'AWAITING_SUPERVISOR', 'COMPLETED'].includes(current.state)) {
+        throw new Error(`conflicting terminal task projection: ${taskId} is ${current.state}`);
+      }
+      current.state = terminalTaskState;
+      return current;
+    }, projection('task'));
+
+    reconcileAcceptedRequirements(root, task, decision, projection('requirements'));
+
+    const supervisorDecisionEvent = evaluationEvent(root, decision, 'SUPERVISOR_DECISION', {
+      task_id: taskId,
+      attempt_id: attemptId,
+      decision_id: decision.decision_id,
+      decision: decision.decision,
+    });
+    reconcileEvaluationEvent(
+      root,
+      supervisorDecisionEvent,
+      projection('supervisor-decision-event-log'),
+      projection('supervisor-decision-event-file'),
+    );
+
+    reconcileJsonProjection(p.state, (current) => {
+      const ownsActiveTask = current.active_task_id === taskId
+        && current.active_attempt_id === attemptId;
+      if (!ownsActiveTask) return current;
+      const applyPause = current.pause?.active === true
+        && (current.pause.after_current === true
+          || current.pause.applied_decision_id === decision.decision_id);
+      const next = {
+        ...current,
+        supervisor_state: applyPause ? 'PAUSED' : current.supervisor_state,
+        pause: applyPause ? {
+          ...current.pause,
+          after_current: false,
+          applied_at: current.pause.applied_at ?? decision.time,
+          applied_decision_id: decision.decision_id,
+        } : current.pause,
+        active_task_id: null,
+        active_attempt_id: null,
+        latest_accepted_task_id: decision.decision === 'ACCEPT'
+          ? taskId
+          : current.latest_accepted_task_id,
+        latest_unresolved_issue: decision.decision === 'ACCEPT'
+          ? null
+          : `Supervisor rejected ${taskId}: ${decision.rationale}`,
+      };
+      next.pending_next_action = decision.decision === 'ACCEPT'
+        ? derivePendingNextAction(
+          next,
+          effectiveRequirementMatrix(root, { state: next }),
+          NEXT_UNSATISFIED_REQUIREMENT_ACTION,
+        )
+        : `Create corrective work for ${taskId}.`;
+      next.updated_at = decision.time;
+      return next;
+    }, projection('lifecycle-state'));
+
+    const state = readJson(p.state);
+    if (state.pause?.applied_decision_id === decision.decision_id) {
+      const pauseEvent = evaluationEvent(root, decision, 'PAUSE_AFTER_CURRENT_APPLIED', {
+        task_id: taskId,
+        attempt_id: attemptId,
+        decision_id: decision.decision_id,
+        terminal_task_state: terminalTaskState,
+        reason: state.pause.reason,
+      });
+      reconcileEvaluationEvent(
+        root,
+        pauseEvent,
+        projection('pause-event-log'),
+        projection('pause-event-file'),
+      );
+    }
+    return {
+      decision,
+      task: readJson(join(p.tasks, `${taskId}.json`)),
+      attempt: readJson(join(p.attempts, `${attemptId}.json`)),
+    };
+  } finally {
+    lock.release();
+  }
+}
+
 export function evaluateTask(root, taskId, accept, rationale, {
   afterEvaluationCommit = null,
+  afterProjection = null,
 } = {}) {
   const p = paths(root);
   // Authority is preflighted before decision, task, attempt, requirement, or
@@ -840,99 +1097,53 @@ export function evaluateTask(root, taskId, accept, rationale, {
   if (unconsumed.length > 0) {
     throw new Error(`delivered terminal wake must be consumed before evaluation: ${unconsumed.join(', ')}`);
   }
-  if (attempt.supervisor_evaluation) return { idempotent: true, task, attempt };
   const evaluationPath = join(p.attempts, 'supervisor-evaluations', `${attemptId}.json`);
+  let decision;
+  let created = false;
   if (existsSync(evaluationPath)) {
-    return {
-      idempotent: true,
-      decision: readJson(evaluationPath),
-      task: readJson(taskPath),
-      attempt: readJson(attemptPath),
+    decision = readJson(evaluationPath);
+  } else {
+    if (attempt.supervisor_evaluation) {
+      throw new Error(`attempt evaluation projection exists without immutable authority: ${attemptId}`);
+    }
+    if (accept && attempt.acceptance?.state !== 'SATISFIED') {
+      throw new Error('supervisor cannot accept a task rejected by the Acceptance gate without a durable correction');
+    }
+    decision = {
+      schema: 'opsle.durable-supervisor.decision/v1',
+      decision_id: id('decision'),
+      question: `Should ${taskId} advance the objective?`,
+      decision: accept ? 'ACCEPT' : 'REJECT',
+      rationale,
+      evidence_references: [attempt.compact_packet, attempt.completion_handoff],
+      time: now(),
+      supervisor_generation: readJson(p.supervisor).generation,
+      task_id: taskId,
+      objective_id: task.parent_objective_id,
     };
   }
-  if (accept && attempt.acceptance?.state !== 'SATISFIED') {
-    throw new Error('supervisor cannot accept a task rejected by the Acceptance gate without a durable correction');
-  }
-  const decision = {
-    schema: 'opsle.durable-supervisor.decision/v1',
-    decision_id: id('decision'),
-    question: `Should ${taskId} advance the objective?`,
-    decision: accept ? 'ACCEPT' : 'REJECT',
-    rationale,
-    evidence_references: [attempt.compact_packet, attempt.completion_handoff],
-    time: now(),
-    supervisor_generation: readJson(p.supervisor).generation,
-    task_id: taskId,
-    objective_id: task.parent_objective_id,
-  };
   // This immutable record is the evaluation commit boundary. It is durable
   // before any mutable projection, so concurrent or interrupted evaluators can
   // preserve the first decision without appending or applying it again.
-  if (!atomicCreateJson(evaluationPath, decision)) {
-    return {
-      idempotent: true,
-      decision: readJson(evaluationPath),
-      task: readJson(taskPath),
-      attempt: readJson(attemptPath),
-    };
+  if (!existsSync(evaluationPath)) {
+    created = atomicCreateJson(evaluationPath, decision);
+    if (!created) decision = readJson(evaluationPath);
   }
-  afterEvaluationCommit?.(decision);
-  appendEvent(p.decisionsLog, decision);
-  attempt.supervisor_evaluation = {
-    decision_id: decision.decision_id,
-    decision: decision.decision,
-    rationale,
-    evaluated_at: decision.time,
-  };
-  writeJson(attemptPath, attempt);
-  task.state = accept ? 'ACCEPTED' : 'REJECTED';
-  writeJson(taskPath, task);
-  if (accept) setRequirements(root, task.requirement_ids, 'IMPLEMENTED', [attempt.compact_packet, attempt.completion_handoff]);
-  const currentState = readJson(p.state);
-  const applyPauseAfterCurrent = currentState.pause?.active === true
-    && currentState.pause.after_current === true;
-  const nextState = {
-    ...currentState,
-    active_task_id: null,
-    active_attempt_id: null,
-    pending_next_action: accept
-      ? NEXT_UNSATISFIED_REQUIREMENT_ACTION
-      : `Create corrective work for ${taskId}.`,
-  };
-  emit(root, 'SUPERVISOR_DECISION', {
-    task_id: taskId,
-    attempt_id: attemptId,
-    decision_id: decision.decision_id,
-    decision: decision.decision,
-  });
-  updateState(root, {
-    supervisor_state: applyPauseAfterCurrent ? 'PAUSED' : currentState.supervisor_state,
-    pause: applyPauseAfterCurrent ? {
-      ...currentState.pause,
-      after_current: false,
-      applied_at: now(),
-    } : currentState.pause,
-    active_task_id: nextState.active_task_id,
-    active_attempt_id: nextState.active_attempt_id,
-    latest_accepted_task_id: accept ? taskId : currentState.latest_accepted_task_id,
-    latest_unresolved_issue: accept ? null : `Supervisor rejected ${taskId}: ${rationale}`,
-    pending_next_action: accept
-      ? derivePendingNextAction(
-        nextState,
-        effectiveRequirementMatrix(root, { state: nextState }),
-      )
-      : nextState.pending_next_action,
-  });
-  if (applyPauseAfterCurrent) {
-    emit(root, 'PAUSE_AFTER_CURRENT_APPLIED', {
-      task_id: taskId,
-      attempt_id: attemptId,
-      decision_id: decision.decision_id,
-      terminal_task_state: task.state,
-      reason: currentState.pause.reason,
-    });
+  if (decision.schema !== 'opsle.durable-supervisor.decision/v1'
+      || typeof decision.decision_id !== 'string'
+      || !['ACCEPT', 'REJECT'].includes(decision.decision)
+      || typeof decision.rationale !== 'string'
+      || !Array.isArray(decision.evidence_references)
+      || typeof decision.time !== 'string'
+      || !Number.isSafeInteger(decision.supervisor_generation)
+      || decision.task_id !== taskId
+      || decision.objective_id !== task.parent_objective_id
+      || decision.question !== `Should ${taskId} advance the objective?`) {
+    throw new Error(`invalid immutable supervisor evaluation authority: ${attemptId}`);
   }
-  return { decision, task, attempt };
+  if (created) afterEvaluationCommit?.(decision);
+  const result = reconcileEvaluation(root, taskId, attemptId, decision, afterProjection);
+  return { ...result, idempotent: !created };
 }
 
 export function consumeEvent(root, eventId, { deliveryId = null, generation = null } = {}) {
