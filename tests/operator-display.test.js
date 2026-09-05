@@ -6,9 +6,81 @@ import {
   deriveSupervisorLiveness,
   formatDuration,
   formatRelativeTime,
+  renderModelChildReceipt,
+  renderSupervisorStatus,
   renderWakeStatus,
   selectWakeRecords,
 } from '../src/operator-display.js';
+
+test('model child receipt rendering is compact, deterministic, and keeps unavailable counts nonnumeric', () => {
+  const receipt = {
+    kind: 'model-child-receipt',
+    version: 1,
+    attempt_id: 'task-visible-attempt-001',
+    child: {
+      provider: 'codex', model: 'gpt-fixture', reasoning_effort: 'high', evidence_class: 'MEASURED',
+    },
+    route: {
+      name: 'codex', execution_class: 'bounded_implementation', selected_tool: 'none', evidence_class: 'MEASURED',
+    },
+    why: { value: 'Bounded implementation judgment is required.', evidence_class: 'MEASURED' },
+    context: {
+      raw_bytes: { value: 4000, unit: 'bytes', evidence_class: 'MEASURED' },
+      retained_bytes: { value: 1000, unit: 'bytes', evidence_class: 'MEASURED' },
+      serialized_packet_bytes: { value: 1250, unit: 'bytes', evidence_class: 'MEASURED' },
+      reduction_bytes: { value: 3000, unit: 'bytes', evidence_class: 'DERIVED' },
+      reduction_ratio: { value: 0.75, unit: 'ratio', evidence_class: 'DERIVED' },
+      raw_tokens: { value: null, unit: 'tokens', evidence_class: 'UNAVAILABLE' },
+      retained_tokens: { value: null, unit: 'tokens', evidence_class: 'UNAVAILABLE' },
+    },
+    provenance: {
+      gearbox_decision: {
+        decision_id: 'gearbox-fixture',
+        locator: '.opsle/children/task-visible-attempt-001.json#/policy_snapshot/gearbox_decision',
+      },
+      context_firewall: {
+        locator: '.opsle/evidence/compact/task-visible-attempt-001.json',
+      },
+    },
+  };
+  const first = renderModelChildReceipt(receipt);
+  assert.equal(renderModelChildReceipt(receipt), first);
+  assert.match(first, /Child: task-visible-attempt-001 — codex\/gpt-fixture; reasoning high \[MEASURED\]/);
+  assert.match(first, /Route: codex; bounded implementation; tool none \[MEASURED\]/);
+  assert.match(first, /Why: Bounded implementation judgment is required\. \[MEASURED\]/);
+  assert.match(first, /Context raw to retained: 4000 bytes \[MEASURED\] -> 1000 bytes \[MEASURED\]/);
+  assert.match(first, /Reduction: 3000 bytes \[DERIVED\] \(75\.00% \[DERIVED\]\)/);
+  assert.match(first, /Serialized packet: 1250 bytes \[MEASURED\]/);
+  assert.match(first, /Tokens: raw unavailable \[UNAVAILABLE\]; retained unavailable \[UNAVAILABLE\]/);
+  assert.doesNotMatch(first, /Tokens:.*\b0\b/);
+  assert.match(first, /Provenance: Gearbox gearbox-fixture at \.opsle\/children\//);
+
+  const status = renderSupervisorStatus({
+    supervisor: {
+      identity: 'supervisor-fixture', phase: 'SELF_HOSTED', pause: { active: false },
+    },
+    objective: { revision: 1 },
+    session_binding: {
+      valid: true,
+      classification: 'bound-authoritative-herdr',
+      binding: { host: { workspace_id: 'workspace-fixture', pane_id: 'pane-fixture' } },
+    },
+    wake: { current: null },
+    operator_state: { child: { label: 'COMPLETED' }, attention: false, reasons: [] },
+    active_work: {
+      task_id: 'task-visible',
+      attempt_id: receipt.attempt_id,
+      claim_id: 'claim-visible',
+      description: 'Expose the receipt',
+      child_state: 'COMPLETED',
+      completion: '2026-09-05T00:00:00.000Z',
+      child_receipt: receipt,
+    },
+    progress: { pending_next_action: 'Evaluate.', requirements: {} },
+  }, { referenceTime: Date.parse('2026-09-05T00:00:01.000Z') });
+  assert.match(status, /Work: Completed/);
+  assert.match(status, /CHILD RECEIPT\nChild:/);
+});
 
 test('human durations and relative times stay concise without hiding unknown values', () => {
   assert.equal(formatDuration(null), 'unknown');

@@ -245,6 +245,25 @@ function measuredElapsedMs(attempt) {
   return Number.isFinite(started) ? Math.max(0, Date.now() - started) : null;
 }
 
+function readModelChildReceipt(root, attempt) {
+  if (attempt?.child_receipt_reference == null) return null;
+  const expectedReference = `${attempt.completion_handoff}#/child_receipt`;
+  const expectedPath = join(paths(root).compact, `${attempt.attempt_id}.completion.json`);
+  if (attempt.gearbox_route !== 'codex'
+      || attempt.child_receipt_reference !== expectedReference
+      || resolve(root, attempt.completion_handoff) !== expectedPath) {
+    throw new Error('invalid model child receipt reference');
+  }
+  const receipt = readJson(expectedPath).child_receipt;
+  if (receipt?.kind !== 'model-child-receipt'
+      || receipt.version !== 1
+      || receipt.task_id !== attempt.task_id
+      || receipt.attempt_id !== attempt.attempt_id) {
+    throw new Error('invalid model child receipt identity');
+  }
+  return receipt;
+}
+
 function updatePolicy(root, mutate, actor = 'operator-cli') {
   const p = paths(root);
   const policy = readJson(p.policy);
@@ -405,6 +424,7 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
     ? join(p.opsle, 'workers', `${attempt.attempt_id}.json`)
     : null;
   const runner = runnerPath && existsSync(runnerPath) ? readJson(runnerPath) : null;
+  const childReceipt = readModelChildReceipt(root, attempt);
   const sessionBinding = codexSessionBindingStatus(root);
   const selectedWake = lifecycleWakeAttention(root, supervisor, state);
   const operatorState = deriveDisplayState({
@@ -480,6 +500,7 @@ function status(root, { json = false, verbose = false, referenceTime = Date.now(
       last_heartbeat: attempt?.heartbeat_at ?? null,
       completion: attempt?.completed_at ?? null,
       elapsed_ms: measuredElapsedMs(attempt),
+      child_receipt: childReceipt,
       telemetry: {
         execution_duration_ms: attemptTelemetry.execution_duration_ms ?? null,
         verification_duration_ms: attemptTelemetry.verification_duration_ms ?? null,
@@ -1458,7 +1479,12 @@ export async function main(args) {
   if (command === 'evidence' && subcommand === 'show') {
     const attemptId = rest[0];
     const attempt = readJson(join(paths(root).attempts, `${attemptId}.json`));
-    print({ attempt, packet: readJson(join(root, attempt.compact_packet)), completion: readJson(join(root, attempt.completion_handoff)) });
+    print({
+      attempt,
+      packet: readJson(join(root, attempt.compact_packet)),
+      completion: readJson(join(root, attempt.completion_handoff)),
+      child_receipt: readModelChildReceipt(root, attempt),
+    });
     return;
   }
   if (command === 'events' && subcommand === 'consume') {

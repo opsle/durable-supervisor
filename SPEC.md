@@ -135,6 +135,29 @@ attempt status, actual artifacts, verification receipt, findings, unresolved
 issues, warnings, provenance, raw and compact references, policy snapshot, and
 claim/fence identity.
 
+For a model-routed completion, that same durable completion handoff MUST contain
+exactly one versioned model-child receipt. The receipt MUST project the actual
+`policy_snapshot.gearbox_decision` route and rationale and the already-produced
+Context Firewall packet; it MUST NOT reconstruct either source after completion.
+It reports child identity, provider model and reasoning effort, execution class
+and selected tool, raw-to-retained bytes, reduction bytes and ratio, evidence
+classes, and compact source locators. Raw and retained byte counts are
+`MEASURED`; reduction amount and ratio are `DERIVED`. Unsupported values are
+null and `UNAVAILABLE`, never zero, and bytes MUST NOT be converted into measured
+token counts. `ESTIMATED` is a permitted evidence class only when an estimator
+and its basis are explicitly recorded. Deterministic-command executions MUST
+NOT fabricate a model-child receipt.
+
+Retained bytes use the packet's
+`canonical-json-utf8-with-derived-measurement-fields-null` basis. Serialized
+packet bytes are a separate `MEASURED` value and MUST NOT replace retained bytes.
+
+Normal status rendering MUST show the model-child receipt without requiring raw
+artifact inspection. Exact receipt data remains inspectable through
+`evidence show`. Repeated construction and rendering over identical source
+artifacts MUST be deterministic. This contract evaluates DS-V0.1-01 only;
+DS-V0.1-02 and savings claims remain outside this boundary.
+
 `complete_for_decision` means the packet is sufficient for the predeclared
 Acceptance decision. It is not a claim of general correctness. Child completion
 also does not equal task acceptance or objective completion.

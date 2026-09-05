@@ -451,6 +451,90 @@ export function validateContextPacketMeasurement(packet, serializedBytes) {
   return true;
 }
 
+function receiptMeasurement(value, unit, evidenceClass) {
+  if (value == null) {
+    return { value: null, unit, evidence_class: 'UNAVAILABLE' };
+  }
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`invalid ${evidenceClass.toLowerCase()} child receipt measurement`);
+  }
+  return { value, unit, evidence_class: evidenceClass };
+}
+
+export function buildModelChildReceipt(attempt, packet, {
+  attemptReference = `.opsle/children/${attempt?.attempt_id}.json`,
+  contextPacketReference = attempt?.compact_packet
+    ?? `.opsle/evidence/compact/${attempt?.attempt_id}.json`,
+} = {}) {
+  if (attempt?.gearbox_route !== 'codex') return null;
+  const decision = attempt.policy_snapshot?.gearbox_decision;
+  const route = decision?.selected_route_config;
+  if (attempt.provider !== 'codex'
+      || attempt.model !== route?.provider?.model
+      || decision?.schema !== 'opsle.durable-supervisor.gearbox-decision/v3'
+      || decision.selected_route !== 'codex'
+      || route?.schema !== 'opsle.durable-supervisor.exact-child-route/v2'
+      || route.provider?.name !== 'codex'
+      || canonicalJson(route) !== canonicalJson(attempt.policy_snapshot?.selected_route)
+      || typeof decision.rationale !== 'string'
+      || !decision.rationale
+      || packet?.schema !== CONTEXT_PACKET_SCHEMA
+      || packet.task_id !== attempt.task_id
+      || packet.attempt_id !== attempt.attempt_id) {
+    throw new Error('model child receipt requires exact Gearbox and Context Firewall evidence');
+  }
+  return {
+    kind: 'model-child-receipt',
+    version: 1,
+    task_id: attempt.task_id,
+    attempt_id: attempt.attempt_id,
+    child: {
+      provider: route.provider.name,
+      model: route.provider.model,
+      reasoning_effort: route.provider.reasoning_effort,
+      evidence_class: 'MEASURED',
+    },
+    route: {
+      name: decision.selected_route,
+      execution_class: route.execution_class,
+      selected_tool: route.selected_tool,
+      evidence_class: 'MEASURED',
+    },
+    why: {
+      value: decision.rationale,
+      evidence_class: 'MEASURED',
+    },
+    context: {
+      raw_bytes: receiptMeasurement(packet.raw_bytes, 'bytes', 'MEASURED'),
+      retained_bytes: receiptMeasurement(packet.retained_bytes, 'bytes', 'MEASURED'),
+      serialized_packet_bytes: receiptMeasurement(
+        packet.serialized_packet_bytes == null ? null : Number(packet.serialized_packet_bytes),
+        'bytes',
+        'MEASURED',
+      ),
+      reduction_bytes: receiptMeasurement(packet.suppressed_bytes, 'bytes', 'DERIVED'),
+      reduction_ratio: receiptMeasurement(packet.reduction_ratio, 'ratio', 'DERIVED'),
+      raw_tokens: receiptMeasurement(null, 'tokens', 'UNAVAILABLE'),
+      retained_tokens: receiptMeasurement(null, 'tokens', 'UNAVAILABLE'),
+      measurement_basis: structuredClone(packet.byte_measurement),
+    },
+    provenance: {
+      gearbox_decision: {
+        decision_id: decision.decision_id,
+        locator: `${attemptReference}#/policy_snapshot/gearbox_decision`,
+        operator_policy_sha256: decision.operator_policy_sha256,
+      },
+      exact_route: {
+        locator: `${attemptReference}#/policy_snapshot/gearbox_decision/selected_route_config`,
+      },
+      context_firewall: {
+        locator: contextPacketReference,
+        source_sha256: packet.source_sha256,
+      },
+    },
+  };
+}
+
 function contextPacket({ task, attempt, result, verification, changed, unexpected, rawRefs, lastMessagePath }) {
   const rawBytes = rawRefs.reduce((total, item) => total + item.bytes, 0);
   const rawOutputBytes = rawRefs
@@ -967,6 +1051,10 @@ export async function runAttempt(root, task, attempt, claim, {
   const packetPath = join(p.compact, `${attempt.attempt_id}.json`);
   writeJson(packetPath, packet);
   validateContextPacketMeasurement(packet, statSync(packetPath).size);
+  const childReceipt = buildModelChildReceipt(attempt, packet, {
+    attemptReference: relative(root, attemptPath),
+    contextPacketReference: relative(root, packetPath),
+  });
   const executionSucceeded = result.code === 0 && !result.timed_out;
   const changeExpectationSatisfied = task.expects_changes ? changed.length > 0 : changed.length === 0;
   const acceptanceSatisfied = packet.completeness === 'complete_for_decision'
@@ -989,6 +1077,7 @@ export async function runAttempt(root, task, attempt, claim, {
     provenance: { source_sha256: packet.source_sha256, completed_at: now() },
     raw_evidence_references: rawRefs,
     compact_evidence_reference: relative(root, packetPath),
+    child_receipt: childReceipt,
     policy_snapshot: attempt.policy_snapshot,
     claim: { claim_id: claim.claim_id, fence_generation: claim.fence_generation },
     evidence_distinction: {
@@ -1005,6 +1094,9 @@ export async function runAttempt(root, task, attempt, claim, {
   attempt.raw_evidence = rawRefs;
   attempt.compact_packet = relative(root, packetPath);
   attempt.completion_handoff = relative(root, completionPath);
+  attempt.child_receipt_reference = childReceipt
+    ? `${relative(root, completionPath)}#/child_receipt`
+    : null;
   attempt.telemetry = {
     execution_duration_ms: result.duration_ms,
     verification_duration_ms: verification?.duration_ms ?? null,
@@ -1068,6 +1160,7 @@ export async function runAttempt(root, task, attempt, claim, {
     suppressed_bytes: attempt.telemetry.suppressed_bytes,
     retained_ratio: attempt.telemetry.retained_ratio,
     reduction_ratio: attempt.telemetry.reduction_ratio,
+    child_receipt_reference: attempt.child_receipt_reference,
     output_tokens: null,
     cost: null,
     terminal_type: wakeType,
@@ -1117,6 +1210,7 @@ export async function runAttempt(root, task, attempt, claim, {
     attempt,
     packet,
     completion,
+    child_receipt: childReceipt,
     completion_event: completionEvent,
     wake_request: wakeRequest,
   };

@@ -309,6 +309,10 @@ test('accepted task cannot recreate an automatic next action after terminal comp
     const decision = routeTask(root, task);
     const { attempt, claim } = createAttempt(root, task, decision);
     const completed = await runAttempt(root, task, attempt, claim);
+
+    assert.equal(completed.child_receipt, null);
+    assert.equal(completed.attempt.child_receipt_reference, null);
+    assert.equal(completed.completion.child_receipt, null);
     assert.equal(completed.packet.completeness, 'complete_for_decision');
 
     const evaluated = await runCli(root, [
@@ -589,6 +593,7 @@ test('bounded status watch is read-only and measured telemetry uses durable fact
     assert.ok(status.stdout, JSON.stringify(status));
     const value = JSON.parse(status.stdout);
     assert.equal(value.active_work.route, 'deterministic');
+    assert.equal(value.active_work.child_receipt, null);
     assert.equal(value.active_work.telemetry.execution_duration_ms, completed.attempt.telemetry.execution_duration_ms);
     assert.equal(value.active_work.telemetry.raw_output_bytes, completed.packet.raw_output_bytes);
     assert.equal(value.active_work.telemetry.raw_evidence_bytes, completed.packet.raw_bytes);
@@ -609,6 +614,10 @@ test('bounded status watch is read-only and measured telemetry uses durable fact
     });
     assert.equal(value.telemetry.model_polling_turns, null);
     assert.equal(value.telemetry.legacy_polling_field_trusted, false);
+
+    const evidence = await runCli(root, ['evidence', 'show', completed.attempt.attempt_id]);
+    assert.equal(evidence.code, 0, evidence.stderr);
+    assert.equal(JSON.parse(evidence.stdout).child_receipt, null);
 
     const profile = profileCodexActivations([
       {
