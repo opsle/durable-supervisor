@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   appendEvent,
+  atomicCreateJson,
   canonicalJson,
   fileSha256,
   id,
@@ -822,7 +823,9 @@ export function recover(root, {
   };
 }
 
-export function evaluateTask(root, taskId, accept, rationale) {
+export function evaluateTask(root, taskId, accept, rationale, {
+  afterEvaluationCommit = null,
+} = {}) {
   const p = paths(root);
   // Authority is preflighted before decision, task, attempt, requirement, or
   // lifecycle evidence can be mutated.
@@ -838,6 +841,15 @@ export function evaluateTask(root, taskId, accept, rationale) {
     throw new Error(`delivered terminal wake must be consumed before evaluation: ${unconsumed.join(', ')}`);
   }
   if (attempt.supervisor_evaluation) return { idempotent: true, task, attempt };
+  const evaluationPath = join(p.attempts, 'supervisor-evaluations', `${attemptId}.json`);
+  if (existsSync(evaluationPath)) {
+    return {
+      idempotent: true,
+      decision: readJson(evaluationPath),
+      task: readJson(taskPath),
+      attempt: readJson(attemptPath),
+    };
+  }
   if (accept && attempt.acceptance?.state !== 'SATISFIED') {
     throw new Error('supervisor cannot accept a task rejected by the Acceptance gate without a durable correction');
   }
@@ -853,6 +865,18 @@ export function evaluateTask(root, taskId, accept, rationale) {
     task_id: taskId,
     objective_id: task.parent_objective_id,
   };
+  // This immutable record is the evaluation commit boundary. It is durable
+  // before any mutable projection, so concurrent or interrupted evaluators can
+  // preserve the first decision without appending or applying it again.
+  if (!atomicCreateJson(evaluationPath, decision)) {
+    return {
+      idempotent: true,
+      decision: readJson(evaluationPath),
+      task: readJson(taskPath),
+      attempt: readJson(attemptPath),
+    };
+  }
+  afterEvaluationCommit?.(decision);
   appendEvent(p.decisionsLog, decision);
   attempt.supervisor_evaluation = {
     decision_id: decision.decision_id,
