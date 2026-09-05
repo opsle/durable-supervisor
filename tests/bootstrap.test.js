@@ -122,6 +122,35 @@ test('Runner waits, retains raw evidence, reduces a packet, and gates acceptance
   }
 });
 
+test('read-only acceptance records canonical zero tracked-file changes', async () => {
+  const root = fixture();
+  try {
+    const task = createTask(root, handoff({
+      task_id: 'task-read-only-clean-worktree',
+      objective: 'Inspect without changing tracked files.',
+      authorization: {
+        may: ['inspect repository'],
+        may_modify: [],
+        may_not: ['modify tracked files', 'invoke a provider'],
+      },
+      expected_deliverable: 'Canonical tracked-file change count.',
+      expected_evidence: ['tracked files changed = 0'],
+      acceptance_criteria: ['tracked files changed = 0'],
+      deterministic_command: [process.execPath, '-e', 'process.exit(0)'],
+      verification_command: null,
+      expects_changes: false,
+    }));
+    const decision = routeTask(root, task);
+    const { attempt, claim } = createAttempt(root, task, decision);
+    const result = await runAttempt(root, task, attempt, claim);
+    assert.equal(result.attempt.acceptance.state, 'SATISFIED');
+    assert.deepEqual(result.packet.actual_changed_artifacts, []);
+    assert.ok(result.packet.important_facts.includes('tracked files changed = 0'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('Runner timeout publishes a terminal wake and fails acceptance', async () => {
   const root = fixture();
   try {

@@ -326,6 +326,9 @@ test('tool-none Codex launch is isolated and prompt is route-scoped', (t) => {
       'selected_tool_instructions',
     ]);
     assert.deepEqual(payload.selected_tool_instructions, []);
+    assert.match(prompt, /Tracked files changed: N/);
+    assert.match(prompt, /never use a negatively phrased yes\/no field/);
+    assert.doesNotMatch(prompt, /No tracked files changed: Yes\|No/);
     assert.doesNotMatch(prompt, /graphify/i);
     assert.doesNotMatch(prompt, /sibling_components|permitted_capabilities|policy_snapshot/);
     assert.doesNotMatch(prompt, /source-codex-home|global-skill|global-plugin/);

@@ -163,6 +163,7 @@ export function childPrompt(task, attempt) {
     'The structured route-scoped handoff below is authoritative. Do only this task.',
     'Inspect current repository state first and preserve existing work.',
     'Return a concise final report with changed files, verification, and unresolved issues.',
+    'When repository cleanliness is requested, report `Tracked files changed: N` with a non-negative integer; never use a negatively phrased yes/no field.',
     '',
     JSON.stringify({
       bounded_task: {
@@ -461,7 +462,7 @@ function contextPacket({ task, attempt, result, verification, changed, unexpecte
   const importantFacts = [
     `execution exit code ${result.code}`,
     `execution timed out ${result.timed_out}`,
-    `${changed.length} files changed`,
+    `tracked files changed = ${changed.length}`,
     `${unexpected.length} unexpected files changed`,
     verification ? `verification exit code ${verification.code}` : 'verification not requested',
   ];
